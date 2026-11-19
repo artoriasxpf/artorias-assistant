@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Artorias Assistant</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+    <script type="module" src="/static/js/app.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>Artorias <small>个人助理</small></h1>
+      <nav>
+        <select id="sessions" aria-label="会话"></select>
+        <button id="new">新会话</button>
+        <select id="spaces" aria-label="工作空间"></select>
+        <button id="switchSpace">切换空间</button>
+        <button id="addSpace">添加空间</button>
+        <button id="files">项目文件</button>
+        <button id="changes">变更记录</button>
+      </nav>
+      <p><small>聊天 · 本地文件 · Python 编码（Docker 隔离执行）。文件直接保存在绑定目录，修改前自动备份。</small></p>
+      <p id="workspace"></p>
+      <section id="log" aria-live="polite"></section>
+      <textarea id="input" aria-label="需求" placeholder="描述需求，例如：创建 hello.py 并运行"></textarea>
+      <p>
+        <button id="send">发送</button>
+        <button id="cancel">停止</button>
+        <span id="status" role="status"></span>
+      </p>
+      <section id="panel"></section>
+    </main>
+  </body>
+</html>

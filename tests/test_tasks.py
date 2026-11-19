@@ -1,0 +1,81 @@
+from artorias_device.storage.journal import SQLiteWorkspaceJournal
+import asyncio
+import json
+import pytest
+from artorias_server.storage.sqlite import Store
+from artorias_server.tasks.service import TaskRepository, ContextBuilder, TaskRuntime, Plan, Item
+
+def setup(tmp_path):
+    db=Store(tmp_path/'app.sqlite');sid=db.session();db.submit(sid,'创建框架并写说明','one');return db,db.claim()
+
+def test_validation_atomic(tmp_path):
+    db,r=setup(tmp_path);repo=TaskRepository(db)
+    for items in [[Item(key='a',goal='x',depends_on=['b'])], [Item(key='a',goal='x',relation='continue',task_id='foreign')]]:
+        with pytest.raises(ValueError):repo.install(r,Plan(kind='tasks',items=items),[])
+    assert not db.query('SELECT * FROM task_plans')
+
+def test_resume_dependencies_and_original_input(tmp_path):
+    db,r=setup(tmp_path);calls=[]
+    async def planner(payload):return Plan(kind='tasks',items=[Item(key='b',goal='说明',depends_on=['a']),Item(key='a',goal='框架')])
+    class Engine:
+        async def execute(self, run):
+            calls.append(run)
+            if run['thread_id'].endswith(':b') and not run.get('decision'):
+                yield 'approval.requested',{'requests':[]};return
+            yield 'assistant.final',{'text':run['task_context']['execution_scope']['goal']}
+    runtime=TaskRuntime(tmp_path,db,Engine(),planner)
+    async def collect(run):return [e async for e in runtime.execute(run)]
+    first=asyncio.run(collect(r));assert first[-1][0]=='approval.requested'
+    assert calls[0]['input']==r['input']
+    assert calls[1]['task_context']['dependency_results']==[{'key':'a','result':'框架'}]
+    db.finish(r,'waiting');db.decide(r['id'],'approve')
+    second=asyncio.run(collect(db.claim()))
+    assert second[-1][1]['text']=='框架\n\n说明'
+    assert len(calls)==3
+    assert all(x['status']=='needs_review' for x in db.query('SELECT * FROM business_tasks'))
+    assert len(db.query('SELECT * FROM context_snapshots'))==2
+
+def test_refine_reuses_goal_and_context_budget(tmp_path):
+    db,r=setup(tmp_path);repo=TaskRepository(db)
+    repo.install(r,Plan(kind='tasks',items=[Item(key='a',goal='设计整个项目')]),[])
+    task=db.query('SELECT * FROM business_tasks')[0]
+    db.finish(r,'completed','框架已设计')
+    db.submit(r['session'],'细化各模块','two');r2=db.claim()
+    repo.install(r2,Plan(kind='tasks',items=[Item(key='b',goal='细化模块',relation='refine',task_id=task['id'])]),repo.candidates(r['session'],'细化各模块'))
+    step=db.query('SELECT * FROM task_steps WHERE run=?',(r2['id'],))[0]
+    body=ContextBuilder(repo).build(r2,step)
+    assert body['task']['goal']=='设计整个项目'
+    assert body['execution_scope']['goal']=='细化模块'
+    assert body['history']
+    assert len(db.query('SELECT * FROM business_tasks'))==1
+    assert repo.candidates(db.session(),'项目')==[]
+
+def test_two_tasks_with_actual_deepagents(tmp_path, monkeypatch):
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    from langchain_core.messages import AIMessage
+    import artorias_server.runtime.service as module
+    from artorias_device.workspace.local_workspace import LocalWorkspace
+    class Model(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):return self
+    model=Model(disable_streaming=True,messages=iter([
+        AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'a.txt','content':'A'},'id':'a','type':'tool_call'}]),
+        AIMessage(content='A written'),
+        AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'b.txt','content':'B'},'id':'b','type':'tool_call'}]),
+        AIMessage(content='B written')]))
+    monkeypatch.setattr(module,'create_model',lambda:model)
+    db,r=setup(tmp_path)
+    async def planner(payload):return Plan(kind='tasks',items=[Item(key='a',goal='写 A'),Item(key='b',goal='写 B',depends_on=['a'])])
+    from artorias_local_app.bootstrap import create_engine
+    runtime=TaskRuntime(tmp_path,db,engine=create_engine(tmp_path,db),planner=planner)
+    async def collect():return [event async for event in runtime.execute(r)]
+    events=asyncio.run(collect())
+    assert events[-1][1]['text']=='A written\n\nB written'
+    ws=LocalWorkspace(tmp_path/'blobs',SQLiteWorkspaceJournal(db.path),r['session'],r['id'])
+    assert ws.read('a.txt')=='A' and ws.read('b.txt')=='B'
+
+def test_essential_budget_fails_without_snapshot(tmp_path):
+    db,r=setup(tmp_path);repo=TaskRepository(db)
+    repo.install(r,Plan(kind='tasks',items=[Item(key='a',goal='goal')]),[])
+    step=db.query('SELECT * FROM task_steps')[0]
+    with pytest.raises(ValueError):ContextBuilder(repo,budget=10).build(r,step)
+    assert not db.query('SELECT * FROM context_snapshots')
