@@ -3,7 +3,9 @@ let token;
 export async function bootstrap() {
   const response = await fetch('/bootstrap');
   if (!response.ok) throw Error(await response.text());
-  token = (await response.json()).token;
+  const settings = await response.json();
+  token = settings.token;
+  return settings;
 }
 
 export function headers() {
@@ -16,6 +18,11 @@ export async function api(path, body) {
     headers: headers(),
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!response.ok) throw Error(await response.text());
+  if (!response.ok) {
+    const message = await response.text();
+    let detail;
+    try { detail = JSON.parse(message).detail; } catch { /* Non-JSON response */ }
+    throw Error(typeof detail === 'string' ? detail : message);
+  }
   return response.json();
 }

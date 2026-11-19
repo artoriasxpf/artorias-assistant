@@ -4,69 +4,147 @@ const $ = id => document.getElementById(id);
 
 export async function showWorkspace(sessionId, current) {
   const workspace = await api(`sessions/${sessionId}/workspace`);
-  if (sessionId === current()) {
-    $('workspace').textContent = `工作空间：${workspace.name} [${workspace.kind}] ${workspace.root}`;
-  }
+  if (sessionId !== current()) return;
+  const button = $('workspace');
+  const location = workspace.kind === 'device_fs' ? '本机' : '云端';
+  button.textContent = `工作空间 · ${location} · ${workspace.root}`;
+  button.title = button.textContent;
+  button.disabled = false;
 }
 
-export async function loadSpaces(sessionId) {
-  const spaces = await api('workspaces');
-  $('spaces').replaceChildren();
-  for (const workspace of spaces) {
-    $('spaces').add(new Option(`${workspace.name} [${workspace.kind}]`, workspace.id));
-  }
-  if (sessionId) $('spaces').value = (await api(`sessions/${sessionId}/workspace`)).id;
-}
+export function setupWorkspace(current, handle, nativePicker) {
+  const dialog = $('workspaceDialog');
+  const kind = $('spaceKind');
+  const local = $('localRoot');
+  const manual = $('manualRoot');
+  const cloud = $('cloudRoot');
+  const localInput = nativePicker ? local : manual;
+  let spaces, sessionId;
+  let busy = false;
 
-export function setupWorkspace(current, handle) {
-  $('switchSpace').onclick = handle(async () => {
-    const sessionId = current();
-    if (!sessionId) return;
-    await api(`sessions/${sessionId}/workspace`, { workspace_id: $('spaces').value });
-    await showWorkspace(sessionId, current);
+  function updateDialog() {
+    const isLocal = kind.value === 'device_fs';
+    $('localDirectory').hidden = !isLocal || !nativePicker;
+    manual.hidden = !isLocal || nativePicker;
+    cloud.hidden = isLocal;
+    $('spaceRootLabel').htmlFor = isLocal ? localInput.id : 'cloudRoot';
+    $('workspaceHint').textContent = isLocal
+      ? (nativePicker ? '选择或新建本机文件夹。' : '输入本机文件夹的绝对路径。') + '使用新目录时会授予助手持续读写权限。'
+      : '输入云端逻辑目录，例如 personal/reports。';
+    $('saveWorkspace').disabled = busy || !(isLocal ? localInput.value.trim() : cloud.value.trim());
+  }
+
+  function showError(message) {
+    $('workspaceError').textContent = message;
+    $('workspaceError').hidden = !message;
+  }
+
+  async function withDialogAction(action) {
+    if (busy) return;
+    busy = true;
+    const controls = [kind, localInput, cloud, $('pickFolder'), $('closeWorkspace')];
+    for (const control of controls) control.disabled = true;
+    updateDialog();
+    showError('');
+    try {
+      await action();
+    } catch (error) {
+      showError(error.message);
+    } finally {
+      busy = false;
+      for (const control of controls) control.disabled = false;
+      updateDialog();
+    }
+  }
+
+  $('workspace').onclick = handle(async () => {
+    const id = current();
+    const [available, selected] = await Promise.all([api('workspaces'), api(`sessions/${id}/workspace`)]);
+    if (id !== current() || dialog.open) return;
+    sessionId = id;
+    spaces = available;
+    local.replaceChildren(new Option('请选择文件夹', ''));
+    $('localRoots').replaceChildren();
+    $('cloudRoots').replaceChildren();
+    for (const workspace of spaces) {
+      if (workspace.kind === 'device_fs') {
+        local.add(new Option(workspace.root, workspace.root));
+        $('localRoots').append(new Option(workspace.root, workspace.root));
+      }
+      else $('cloudRoots').append(new Option(workspace.root, workspace.root));
+    }
+    kind.value = selected.kind;
+    localInput.value = selected.kind === 'device_fs' ? selected.root : '';
+    cloud.value = selected.kind === 'cloud_storage' ? selected.root : '';
+    showError('');
+    updateDialog();
+    dialog.showModal();
   });
-  $('addSpace').onclick = handle(async () => {
-    const kind = prompt('空间类型：device_fs（本机）或 cloud_storage（云端逻辑空间）', 'device_fs');
-    if (!kind) return;
-    const root = prompt(kind === 'device_fs' ? '本机绝对目录（添加即持续授权读写）' : '云端逻辑目录，例如 personal', '');
+
+  kind.onchange = local.onchange = manual.oninput = cloud.oninput = updateDialog;
+  $('closeWorkspace').onclick = () => dialog.close();
+  dialog.oncancel = event => { if (busy) event.preventDefault(); };
+  $('pickFolder').onclick = () => withDialogAction(async () => {
+    const { root } = await api('workspaces/pick-folder', {});
     if (!root) return;
-    const name = prompt('空间名称', root);
-    if (!name) return;
-    await api('workspaces', { kind, root, name });
-    await loadSpaces(current());
+    if (![...local.options].some(option => option.value === root)) local.add(new Option(root, root));
+    local.value = root;
   });
-  $('files').onclick = handle(async () => {
-    const sessionId = current();
-    if (!sessionId) return;
-    const files = await api(`sessions/${sessionId}/files`);
-    if (sessionId !== current()) return;
+  $('workspaceForm').onsubmit = event => {
+    event.preventDefault();
+    void withDialogAction(async () => {
+      const isLocal = kind.value === 'device_fs';
+      const root = isLocal ? (nativePicker ? local.value : manual.value.trim()) : cloud.value.trim().replace(/^\/+|\/+$/g, '');
+      if (isLocal && !root.startsWith('/')) throw Error('请选择或输入本机绝对路径');
+      if (!root) throw Error('请选择或输入文件夹');
+      const existing = spaces.find(space => space.kind === kind.value && space.root === root);
+      const workspace = existing ?? await api('workspaces', {
+        kind: kind.value, root, name: root.split('/').filter(Boolean).pop() || root,
+      });
+      await api(`sessions/${sessionId}/workspace`, { workspace_id: workspace.id });
+      await showWorkspace(sessionId, current);
+      dialog.close();
+    });
+  };
+
+  function openPanel(title, empty) {
+    $('projectTitle').textContent = title;
     $('panel').replaceChildren();
+    if (empty) $('panel').textContent = empty;
+    if (!$('projectDialog').open) $('projectDialog').showModal();
+  }
+
+  $('files').onclick = handle(async () => {
+    const id = current();
+    if (!id) return;
+    const files = await api(`sessions/${id}/files`);
+    if (id !== current()) return;
+    openPanel('项目文件', files.length ? '' : '工作空间内暂无文件。');
+    const pre = document.createElement('pre');
     for (const file of files) {
       const button = document.createElement('button');
       button.textContent = file.path;
       button.onclick = handle(async () => {
-        const result = await api(`sessions/${sessionId}/file?path=${encodeURIComponent(file.path)}`);
-        if (sessionId !== current()) return;
-        const pre = document.createElement('pre');
-        pre.textContent = result.content;
-        $('panel').append(pre);
+        const result = await api(`sessions/${id}/file?path=${encodeURIComponent(file.path)}`);
+        if (id === current()) pre.textContent = result.content;
       });
       $('panel').append(button);
     }
+    $('panel').append(pre);
   });
   $('changes').onclick = handle(async () => {
-    const sessionId = current();
-    if (!sessionId) return;
-    const changes = await api(`sessions/${sessionId}/changes`);
-    if (sessionId !== current()) return;
-    $('panel').replaceChildren();
+    const id = current();
+    if (!id) return;
+    const changes = await api(`sessions/${id}/changes`);
+    if (id !== current()) return;
+    openPanel('变更记录', changes.length ? '' : '暂无变更。');
     for (const change of changes) {
       const paragraph = document.createElement('p');
       paragraph.textContent = `${change.path} ${change.id.slice(0, 8)} `;
       const button = document.createElement('button');
       button.textContent = '撤销';
       button.onclick = handle(async () => {
-        await api(`sessions/${sessionId}/changes/${change.id}/revert`, {});
+        await api(`sessions/${id}/changes/${change.id}/revert`, {});
         button.disabled = true;
       });
       paragraph.append(button);

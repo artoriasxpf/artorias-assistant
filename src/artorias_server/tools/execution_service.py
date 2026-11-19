@@ -149,7 +149,7 @@ class ExecutionService:
         shutil.rmtree(self.root/plan['id'],ignore_errors=True)
         return result
 
-    async def execute(self,ws,plan,emit):
+    async def execute(self,ws,plan):
         eid=plan['id'];root=self.root/eid;row=self.repo.get(eid)
         if row['status'] in ('completed','failed','cancelled','rejected'):return row['result']
         if row['status']=='collected':return self.publish(ws,plan,row['result'])
@@ -167,7 +167,8 @@ class ExecutionService:
             for name in ('inputs','app','seed'):shutil.rmtree(root/name,ignore_errors=True)
             return result
         if not self.repo.transition(eid,'awaiting_approval','running'):raise ValueError('执行已被其他调用领取')
-        emit('execution.started',{'execution_id':eid,'mode':plan['request']['mode']})
+        # Execution lifecycle detail travels inside the run_python tool result; no
+        # separate execution.* events are written to the session event table.
         try:
             result=await self.backend.run(plan,root)
             result=dict(result,execution_id=eid,publish_status='not_requested',artifacts=[],published=[],conflicts=[])
@@ -197,7 +198,6 @@ class ExecutionService:
                     artifact=root/'artifacts'/item['id'];shutil.copyfile(root/item['source']/item['path'],artifact)
                 result['artifacts'].append(item)
             self.repo.save(eid,'collected',result)
-            emit('execution.finished',{'execution_id':eid,'execution_status':result['execution_status'],'exit_code':result.get('exit_code')})
             return self.publish(ws,plan,result)
         except asyncio.CancelledError:
             result={'execution_id':eid,'execution_status':'cancelled','publish_status':'not_requested'}

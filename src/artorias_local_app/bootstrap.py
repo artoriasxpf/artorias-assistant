@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import os
+import sys
 from pathlib import Path
 from contextlib import asynccontextmanager
 from functools import partial
@@ -71,5 +72,7 @@ def create_app(data=None, runtime_factory=None):
             with contextlib.suppress(asyncio.CancelledError):
                 await worker
     import artorias_web
+    from artorias_device.folder_picker import pick_folder
     return create_http_app(data, store, scheduler, workspace_registry=registry,
-        web_root=Path(artorias_web.__file__).parent, lifespan=lifespan)
+        web_root=Path(artorias_web.__file__).parent, lifespan=lifespan,
+        folder_picker=pick_folder if sys.platform == 'darwin' else None)

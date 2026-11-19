@@ -70,21 +70,42 @@ class Store:
                 decision=c.execute('SELECT value FROM decisions WHERE run=?',(row['id'],)).fetchone()
                 if decision:result['decision']=decision[0]
                 return result
-    def finish(self,run,status,text=None):
+    def finish(self,run,status,text=None,*,approval=None):
         with self.tx() as c:
             c.execute('UPDATE runs SET status=? WHERE id=?',(status,run['id']))
             c.execute("UPDATE jobs SET status='done' WHERE run=?",(run['id'],))
             if text is not None:c.execute('INSERT INTO messages(id,session,run,role,content) VALUES(?,?,?,?,?)',(uid(),run['session'],run['id'],'assistant',text))
+            if approval is not None:
+                c.execute("INSERT INTO events(session,run,kind,payload) VALUES(?,?,'approval.requested',?)",
+                          (run['session'],run['id'],json.dumps(approval,ensure_ascii=False)))
     def recover(self):
         # Never replay an uncertain side effect after a process crash.
         for run in self.query("SELECT * FROM runs WHERE status='running'"):
             self.finish(run,'interrupted')
             self.emit(run['session'],run['id'],'run.interrupted',{'reason':'进程中断；请核对已产生的文件，再发送新消息继续。'})
 
-    def decide(self,rid,value):
+    def decide(self,rid,value,request_seq=None):
         with self.tx() as c:
-            row=c.execute('SELECT status FROM runs WHERE id=?',(rid,)).fetchone()
-            if not row or row[0]!='waiting':raise ValueError('审批已处理或不存在')
+            row=c.execute('SELECT session,status FROM runs WHERE id=?',(rid,)).fetchone()
+            if not row or row['status']!='waiting':raise ValueError('审批已处理或不存在')
+            request=c.execute(
+                "SELECT seq,payload FROM events WHERE session=? AND run=? AND kind='approval.requested' ORDER BY seq DESC LIMIT 1",
+                (row['session'],rid),
+            ).fetchone()
+            if request_seq is not None and (not request or request['seq']!=request_seq):
+                raise ValueError('审批请求已更新，请处理最新请求')
+            pending=json.loads(request['payload']) if request else {}
+            decision={
+                'decision':value,
+                'task_id':pending.get('task_id'),
+                'request_seq':request['seq'] if request else None,
+                'requests':[
+                    {key: item.get(key) for key in ('request_id','key','kind')}
+                    for item in pending.get('requests',[]) if isinstance(item,dict)
+                ],
+            }
             c.execute('INSERT INTO decisions(run,value) VALUES(?,?) ON CONFLICT(run) DO UPDATE SET value=excluded.value',(rid,value))
             c.execute("UPDATE runs SET status='queued' WHERE id=?",(rid,))
             c.execute("UPDATE jobs SET status='queued' WHERE run=?",(rid,))
+            c.execute("INSERT INTO events(session,run,kind,payload) VALUES(?,?,'approval.decided',?)",
+                      (row['session'],rid,json.dumps(decision,ensure_ascii=False)))

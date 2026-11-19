@@ -79,7 +79,11 @@ CREATE TABLE IF NOT EXISTS resource_changes(change_id TEXT PRIMARY KEY, backend 
         if self.store.query("SELECT name FROM sqlite_master WHERE type='table' AND name='business_tasks'"):
             for task in self.store.query('SELECT id FROM business_tasks WHERE session=?',(session,)):
                 self.task_binding(task['id'],session)
+        previous=self.store.query('SELECT workspace_id FROM session_workspaces WHERE session=?',(session,))
         with self.store.tx() as c:c.execute('INSERT INTO session_workspaces(session,workspace_id) VALUES(?,?) ON CONFLICT(session) DO UPDATE SET workspace_id=excluded.workspace_id',(session,wid))
+        self.store.emit(session,None,'workspace.selected',{
+            'previous_workspace_id':previous[0]['workspace_id'] if previous else None,
+            'workspace_id':wid,'kind':w['kind']})
         return w
     def snapshot_run(self, run, session, task='', workspace_id=None):
         existing=self.store.query('SELECT workspace_id FROM run_workspace_bindings WHERE run=? AND task=?',(run,task))

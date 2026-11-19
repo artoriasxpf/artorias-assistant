@@ -1,6 +1,7 @@
 """DeepAgents tool adapter; business operations and execution backends are injected."""
 from langchain_core.tools import tool, InjectedToolCallId
 from typing import Annotated
+from pydantic import Field
 from artorias_shared.execution.models import InputResource, OutputPolicy, PythonRequest
 
 from .files import FileToolService
@@ -17,28 +18,50 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
     sandbox = ToolExecutor(sandbox)
 
     @tool
-    def project_list() -> list[str]:
-        """List persistent user project files (not internal agent scratch files)."""
-        return ws.files()
+    def project_list(path: Annotated[str, Field(description=(
+        'Directory to list: "." for the current workspace, a workspace-relative directory, '
+        'an absolute host directory such as /Users/name/Desktop, or workspace://ID/subdirectory.'
+    ))] = '.', offset: int = 0, limit: int = 50, expected_version: str | None = None) -> dict:
+        """List up to 100 real files per page in an authorized directory tree.
+
+        Paths in files are relative to the listed directory. If has_more, pass
+        next_offset as offset and version as expected_version for the next page.
+        If denied, request read access with project_authorize. Symlinks are excluded.
+        """
+        return files.list_page(path, offset, limit, expected_version)
 
     @tool
-    def project_read(path: str) -> str:
-        """Read a UTF-8 project file by relative path."""
-        return files.read(path)
+    def project_read(path: str, offset: int = 0, limit: int = 2000,
+                     expected_version: str | None = None) -> dict:
+        """Read a page of up to 4000 characters from an authorized UTF-8 file (up to 1 MB).
+
+        Accepts workspace-relative, absolute host, or workspace://ID/file paths.
+        If has_more, pass next_offset as offset and version as expected_version.
+        Read only relevant pages and summarize findings with source paths before
+        continuing through a large directory. If denied, request read access
+        with project_authorize for the parent directory.
+        """
+        return files.read_page(path, offset, limit, expected_version)
 
     @tool
     def project_write(path: str, content: str) -> dict:
-        """Create or replace a UTF-8 project file with a versioned change."""
+        """Create or replace a real UTF-8 file with a versioned change. Accepts a
+        workspace-relative path, an absolute host path, or workspace://ID/file.
+        Requires write access. Read an existing file before replacing it."""
         return files.write(path, content)
 
     @tool
     def project_edit(path: str, old: str, new: str) -> dict:
-        """Replace exactly one occurrence of old text in a project file."""
+        """Replace exactly one occurrence of old text in an authorized real file.
+        Accepts a workspace-relative path, absolute host path, or workspace://ID/file.
+        Requires write access and a prior project_read."""
         return files.edit(path, old, new)
 
     @tool
     def project_delete(path: str) -> str:
-        """Delete a project file, preserving its previous content version."""
+        """Delete an authorized real file, preserving a backup. Accepts a
+        workspace-relative path, absolute host path, or workspace://ID/file.
+        Requires write access."""
         return ws.delete(path)
 
     @tool(args_schema=RunPythonArguments)
@@ -72,8 +95,8 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
             plan=execution_service.prepare(ws,tool_call_id,request)
             decision=interrupt(execution_service.approval(plan))
             if decision!='approve':return execution_service.reject(plan)
-            result=await execution_service.execute(ws,plan,emit)
-        emit('tool.result', result)
+            result=await execution_service.execute(ws,plan)
+        emit('tool.result', {**result, 'call_id':tool_call_id, 'name':'run_python'})
         if execution_service is not None:
             return dict(result, stdout_tail=result.get('stdout_tail','')[-4000:], stderr_tail=result.get('stderr_tail','')[-4000:],
                         artifacts=result.get('artifacts',[])[:30], published=result.get('published',[])[:30], conflicts=result.get('conflicts',[])[:30],
@@ -82,7 +105,13 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
 
     @tool
     def project_authorize(path: str, access: str = 'write') -> dict:
-        """Request approval to access an explicit local absolute directory in this Run."""
+        """Ask the user to authorize an absolute host directory for this Run.
+
+        Pass access="read" explicitly for listing or reading; use "write" only
+        for changes. Approval covers the directory and its descendants. After
+        approval call project_list or the relevant project_* tool with the
+        original path. If denied, do not retry that authorization.
+        """
         if not hasattr(ws, 'grant_access'):
             raise ValueError('当前工作空间不支持扩展授权')
         if access not in ('read', 'write'):

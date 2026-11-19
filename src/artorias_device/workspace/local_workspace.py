@@ -22,7 +22,8 @@ def digest(data):
 class LocalWorkspace:
     """The disk is authoritative. The first argument remains the backup directory."""
 
-    def __init__(self, root, journal: WorkspaceJournal, session, run, workspace_root=None, *, bind_session=True, resource_meta=None):
+    def __init__(self, root, journal: WorkspaceJournal, session, run, workspace_root=None, *,
+                 bind_session=True, create_root=True, resource_meta=None):
         self.blobs = Path(root).expanduser().resolve()
         self.blobs.mkdir(parents=True, exist_ok=True)
         self.journal, self.session, self.run = journal, session, run
@@ -40,7 +41,8 @@ class LocalWorkspace:
             actual = journal.bind(session, str(self.root))
             if actual != str(self.root):
                 raise ValueError('会话已绑定其他工作目录')
-        self.root.mkdir(parents=True, exist_ok=True)
+        if create_root:
+            self.root.mkdir(parents=True, exist_ok=True)
         with self._locked():
             self._recover()
 
@@ -111,14 +113,25 @@ class LocalWorkspace:
         return digest(self._snapshot(path)[0])
 
     def files(self):
+        return self.files_under('.')
+
+    def files_under(self, directory):
         self.path('__root_check__')
+        directory = self.root if directory == '.' else self.root/self.path(directory)
+        if not stat.S_ISDIR(directory.stat().st_mode):
+            raise NotADirectoryError(f'不是目录：{directory}')
+
+        def raise_walk_error(error):
+            raise error
+
         result = []
-        for directory, dirs, files in os.walk(self.root, followlinks=False):
-            dirs[:] = sorted(d for d in dirs if not (Path(directory)/d).is_symlink())
+        for current, dirs, files in os.walk(directory, followlinks=False, onerror=raise_walk_error):
+            current = Path(current)
+            dirs[:] = sorted(d for d in dirs if not (current/d).is_symlink())
             for name in sorted(files):
-                p = Path(directory)/name
+                p = current/name
                 if not p.is_symlink() and p.is_file():
-                    result.append(p.relative_to(self.root).as_posix())
+                    result.append(p.relative_to(directory).as_posix())
         return sorted(result)
 
     def _backup(self, data):

@@ -1,9 +1,11 @@
-import os
 import json
 from deepagents import create_deep_agent
+from deepagents.middleware.filesystem import FilesystemMiddleware
 from artorias_server.model_provider.factory import create_model
 from .budget import RequestBudget
+from .model_activity import ModelActivity
 from .checkpoints import SQLiteCheckpointProvider
+from .tool_errors import ToolErrorBoundary
 from artorias_server.workspace.factory import WorkspaceFactory
 from artorias_server.tools.registry import build_tools
 
@@ -18,7 +20,11 @@ class DeepAgentRuntime:
     async def execute(self,run):
         ws=self.workspace_factory(run)
         if hasattr(ws, "session"):ws.step=run.get("task_step_id")
-        emit=lambda kind,payload:self.store.emit(run['session'],run['id'],kind,payload)
+        detailed_results=set()
+        def emit(kind,payload):
+            if kind=='tool.result' and payload.get('call_id'):
+                detailed_results.add(payload['call_id'])
+            self.store.emit(run['session'],run['id'],kind,{**payload,'task_id':run.get('task_id')})
         model=self.model_factory()
         # Run-specific graph thread: context is deliberately assembled from completed semantic messages.
         # No implicit task splitting; the original user request is authoritative.
@@ -39,21 +45,72 @@ class DeepAgentRuntime:
             tools.append(result_tool(self.store,run['session'],run['task_id']))
         thread_id=run.get('thread_id',run['id'])
         async with self.checkpoint_provider.open() as saver:
-            agent=create_deep_agent(model=model,tools=tools,checkpointer=saver,middleware=[RequestBudget()],system_prompt='你是 Artorias 个人助理。直接聊天或使用工具完成用户要求。用户项目必须使用 project_* 工具，内置文件工具只用于内部草稿。编码执行只能使用 run_python。不要声称未实际执行的操作成功。project_* 按资源地址路由并备份。覆盖已有文件前先 project_read。访问范围由工具权限检查；不能绕过拒绝。不要自行拆分业务 Task。')
+            internal_files=FilesystemMiddleware(
+                tools=['read_file'],
+                custom_tool_descriptions={'read_file': (
+                    'Read a virtual file explicitly referenced by a prior tool result or context notice. '
+                    'This tool cannot access the Mac, host filesystem, or any user workspace. '
+                    'Use project_read for real files.'
+                )},
+                system_prompt='内置 read_file 仅用于读取工具结果或上下文提示明确引用的内部虚拟文件。',
+            )
+            agent=create_deep_agent(
+                model=model,tools=tools,checkpointer=saver,
+                middleware=[internal_files,RequestBudget(),ModelActivity(),ToolErrorBoundary()],
+                system_prompt=(
+                    '你是 Artorias 个人助理。列出真实用户目录请用 project_list，读取文件用 project_read，'
+                    '写入、编辑和删除请用对应的 project_* 工具。用户提供本机绝对路径时保留原路径。'
+                    '若列目录或读取时权限不足，使用 project_authorize(path=目标目录, access="read")；'
+                    '只有需要修改时才请求 write。收到拒绝后不得重试同一授权。'
+                    '覆盖已有文件前先 project_read。编码执行只能使用 run_python。'
+                    '不要声称未实际执行的操作成功。不要自行拆分业务 Task。'
+                ),
+            )
             result=None
             from langgraph.types import Command
+            config={'configurable':{'thread_id':thread_id},'recursion_limit':50}
             payload=Command(resume=run['decision']) if run.get('decision') else {'messages':messages}
-            async for mode,chunk in agent.astream(payload,config={'configurable':{'thread_id':thread_id},'recursion_limit':50},stream_mode=['messages','values']):
+            seen_calls=set()
+            seen_results=set()
+            if run.get('decision'):
+                previous=await agent.aget_state(config)
+                for msg in previous.values.get('messages',[]):
+                    if msg.type=='ai':
+                        seen_calls.update(call['id'] for call in msg.tool_calls if call.get('id') and call.get('name'))
+                    elif msg.type=='tool':
+                        seen_results.add(msg.tool_call_id)
+            async for mode,chunk in agent.astream(payload,config=config,stream_mode=['messages','values','custom']):
+                if mode=='custom':
+                    if isinstance(chunk,dict) and chunk.get('kind') in ('model.started','model.finished'):
+                        yield chunk['kind'],chunk['payload']
+                    continue
                 if mode=='messages':
-                    msg,metadata=chunk
-                    text=text_content(msg.content)
+                    msg,_=chunk
+                    text=text_content(msg.content) if msg.type in ('ai','AIMessageChunk') else ''
                     if text:yield 'assistant.delta',{'text':text}
-                    for call in getattr(msg,'tool_calls',[]) or []:yield 'tool.call',{'name':call.get('name'),'args':call.get('args')}
-                else:result=chunk
-            state=await agent.aget_state({'configurable':{'thread_id':thread_id}})
+                    continue
+                result=chunk
+                for msg in chunk.get('messages',[]):
+                    # The message stream exposes partial arguments and often omits
+                    # the tool name. Graph state contains the assembled messages.
+                    if msg.type=='ai':
+                        for call in msg.tool_calls:
+                            call_id,name=call.get('id'),call.get('name')
+                            if not call_id or not name or call_id in seen_calls:continue
+                            seen_calls.add(call_id)
+                            yield 'tool.call',{'call_id':call_id,'name':name,'args':call['args']}
+                    elif msg.type=='tool' and msg.tool_call_id not in seen_results:
+                        seen_results.add(msg.tool_call_id)
+                        if msg.tool_call_id not in detailed_results:
+                            yield 'tool.result',{'call_id':msg.tool_call_id,'name':msg.name,'status':msg.status,'content':msg.content}
+            state=await agent.aget_state(config)
             pending=[i for task in state.tasks for i in task.interrupts]
             if pending:
-                yield 'approval.requested',{'requests':[i.value for i in pending]}
+                yield 'approval.requested',{'requests':[
+                    {**i.value,'request_id':i.id,'key':i.value.get('key') or i.value.get('kind')}
+                    if isinstance(i.value,dict) else {'request_id':i.id,'value':i.value}
+                    for i in pending
+                ]}
                 return
             text=''
             if result:

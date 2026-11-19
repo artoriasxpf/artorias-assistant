@@ -15,12 +15,13 @@ class WorkspaceService:
         self.root=self.workspace['root']
     def describe(self):
         return {k:self.workspace[k] for k in ('id','name','kind','location_id','root')}
-    def _resolve(self, path, action):
+    def _resolve(self, path, action, *, directory=False):
         if not isinstance(path,str) or not path or '\x00' in path:raise ValueError('路径不能为空')
         w=self.workspace
         if path.startswith('workspace://'):
             wid,sep,path=path[len('workspace://'):].partition('/')
             if not sep:raise ValueError('必须指定空间内的文件路径')
+            if not path and not directory:raise ValueError('必须指定空间内的文件路径')
             w=self.catalog.get(wid)
             if Path(path).is_absolute():raise ValueError('空间引用只能使用相对路径')
         elif Path(path).is_absolute():
@@ -33,11 +34,13 @@ class WorkspaceService:
         grant=self.catalog.authorize(w['location_id'],str(target),action,self.run)
         # Use the grant root as boundary; workspace is only the default resolution root.
         routed=dict(w,root=grant['root'])
+        if directory:routed['create_root']=False
         connector=self.registry.get(w['kind'],w['location_id'])
         ws=connector.open(routed,WorkspaceContext(self.session,self.run,self.task))
         relative=target.relative_to(Path(grant['root'])).as_posix()
-        if relative=='.':raise ValueError('需要文件路径而不是授权目录')
-        ws.path(relative)  # Endpoint enforces canonical path/symlink checks too.
+        if not directory:
+            if relative=='.':raise ValueError('需要文件路径而不是授权目录')
+            ws.path(relative)  # Endpoint enforces canonical path/symlink checks too.
         return ws,relative,w,target
     def path(self,path):
         _,_,w,target=self._resolve(path,'read')
@@ -60,11 +63,13 @@ class WorkspaceService:
         self._resolve(path, action)
 
     def files_under(self, directory):
-        # Resolve a directory through a sentinel; the endpoint still validates all paths.
-        prefix = directory.rstrip('/') + '/' if directory not in ('', '.') else ''
-        ws,p,_,_=self._resolve(prefix+'__artorias_directory_probe__','read')
-        relative = p.rsplit('/',1)[0]+'/' if '/' in p else ''
-        return [name[len(relative):] for name in ws.files() if name.startswith(relative)]
+        ws,relative,_,_=self._resolve(directory,'read',directory=True)
+        if hasattr(ws,'files_under'):
+            return ws.files_under(relative)
+        # Older injected connectors only support listing their root.
+        if relative=='.':return ws.files()
+        prefix=ws.path(relative).rstrip('/')+'/'
+        return [name[len(prefix):] for name in ws.files() if name.startswith(prefix)]
 
     def write_bytes(self, path, content, *, expected, operation_id=None):
         ws,p,w,target=self._resolve(path,'write')

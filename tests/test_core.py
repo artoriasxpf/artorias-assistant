@@ -17,7 +17,9 @@ def test_versions(tmp_path):
     ws.revert(b['change_id']);assert ws.read('a.py')=='one'
     deleted=ws.delete('a.py');assert ws.files()==[]
     ws.revert(deleted);assert ws.read('a.py')=='one'
-    assert db.events(s,0)
+    # File mutations are visible as tool results in the agent loop; the journal
+    # keeps the durable change ledger for revert/audit instead of file.* events.
+    assert db.query('SELECT * FROM changes')
 def test_paths(tmp_path):
     _,_,ws=setup(tmp_path)
     for p in ['../secret','/etc/passwd','a/../../bad']:

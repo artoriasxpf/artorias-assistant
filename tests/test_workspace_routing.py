@@ -127,27 +127,123 @@ def test_web_selection_grants_and_current_space(tmp_path,monkeypatch):
         assert client.get('/api/sessions/'+sid+'/files',headers=h).status_code==403
 
 
-def test_real_agent_authorization_resume(tmp_path,monkeypatch):
+@pytest.mark.parametrize('decision', ['approve', 'reject'])
+def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
+    import json
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
     from langchain_core.messages import AIMessage
+    from artorias_server.scheduler.service import Scheduler
+    from artorias_server.tasks.service import TaskRuntime
     import artorias_server.runtime.service as runtime
     db,sid,cat,local,cloud=setup(tmp_path,monkeypatch)
     outside=tmp_path/'external'
+    (outside/'nested').mkdir(parents=True)
+    (outside/'nested/existing.txt').write_text('outside')
     class Model(GenericFakeChatModel):
-        def bind_tools(self,tools,**kwargs):return self
+        def bind_tools(self,tools,**kwargs):
+            by_name={tool.name:tool for tool in tools}
+            assert {'project_list','project_read','project_authorize'} <= by_name.keys()
+            assert not {'ls','glob','grep','write_file','edit_file','delete','execute'} & by_name.keys()
+            assert 'cannot access the Mac' in by_name['read_file'].description
+            return self
     def call(name,args,cid):return AIMessage(content='',tool_calls=[{'name':name,'args':args,'id':cid,'type':'tool_call'}])
-    model=Model(disable_streaming=True,messages=iter([
-        call('project_authorize',{'path':str(outside),'access':'write'},'grant'),
-        call('project_write',{'path':str(outside/'a.txt'),'content':'approved'},'write'),AIMessage(content='done')]))
+    replies=[
+        call('project_list',{'path':str(outside)},'list-before'),
+        call('project_authorize',{'path':str(outside),'access':'read'},'grant'),
+    ]
+    if decision=='approve':
+        replies.append(call('project_list',{'path':str(outside)},'list-after'))
+    replies.append(AIMessage(content='done'))
+    model=Model(disable_streaming=True,messages=iter(replies))
     monkeypatch.setattr(runtime,'create_model',lambda:model)
     db.submit(sid,'create external file','1');run=db.claim()
     from artorias_local_app.bootstrap import create_engine
-    engine=create_engine(tmp_path/'data',db)
-    async def collect(r):return [e async for e in engine.execute(r)]
-    first=asyncio.run(collect(run));assert first[-1][0]=='approval.requested'
-    assert not outside.exists()
+    async def planner(_):return Plan(kind='tasks',items=[Item(key='write',goal='create external file')])
+    runtime=TaskRuntime(tmp_path/'data',db,engine=create_engine(tmp_path/'data',db),planner=planner)
+    scheduler=Scheduler(db,runtime)
+    asyncio.run(scheduler.execute(run))
+    request=db.events(sid,0)[-1]
+    assert request['kind']=='approval.requested'
+    assert db.query('SELECT status FROM task_steps WHERE run=?',(run['id'],))[0]['status']=='waiting'
+    assert not db.query('SELECT id FROM workspace_grants WHERE scope_run=?',(run['id'],))
     cat.select(sid,cloud['id'])
-    second=asyncio.run(collect(dict(run,decision='approve')))
-    assert second[-1][0]=='assistant.final'
-    assert (outside/'a.txt').read_text()=='approved'
+    db.decide(run['id'],decision,request['seq'])
+    asyncio.run(scheduler.execute(db.claim()))
+    events=[(row['kind'],json.loads(row['payload'])) for row in db.events(sid,0)]
+    calls=[payload for kind,payload in events if kind=='tool.call' and payload['call_id']=='grant']
+    results=[payload for kind,payload in events if kind=='tool.result' and payload['call_id']=='grant']
+    assert len(calls)==len(results)==1
+    assert results[0]['status']=='success'
+    assert sum(kind=='task.resumed' for kind,_ in events)==1
+    assert events[-1][0]=='run.completed'
+    listing={payload['call_id']:payload for kind,payload in events if kind=='tool.result' and payload['name']=='project_list'}
+    assert listing['list-before']['status']=='error'
+    assert '未授权' in listing['list-before']['content']
+    if decision=='approve':
+        assert json.loads(listing['list-after']['content'])['files']==['nested/existing.txt']
+        ws=WorkspaceService(db,sid,run['id'])
+        with pytest.raises(PermissionError):
+            ws.write(str(outside/'a.txt'),'blocked',expected=None)
+    else:
+        assert json.loads(results[0]['content'])=={'rejected':True}
+        assert not db.query('SELECT id FROM workspace_grants WHERE scope_run=?',(run['id'],))
     assert WorkspaceService(db,sid,run['id']).describe()['id']==local['id']
+
+
+def test_project_list_directory_targets(tmp_path,monkeypatch):
+    from artorias_server.tools.registry import build_tools
+
+    db,sid,_,local,_=setup(tmp_path,monkeypatch)
+    ws=WorkspaceService(db,sid,'listing-run')
+    project=Path(local['root'])
+    (project/'nested/empty').mkdir(parents=True)
+    (project/'nested/a.txt').write_text('hello')
+    (project/'linked').symlink_to(project/'nested',target_is_directory=True)
+    tool=next(tool for tool in build_tools(ws,lambda *_:None) if tool.name=='project_list')
+    assert tool.invoke({})['files']==['nested/a.txt']
+    assert tool.invoke({'path':'nested'})['files']==['a.txt']
+    assert tool.invoke({'path':f"workspace://{local['id']}/nested"})['files']==['a.txt']
+    assert tool.invoke({'path':str(project/'nested/empty')})['files']==[]
+    with pytest.raises(NotADirectoryError):
+        tool.invoke({'path':'nested/a.txt'})
+    with pytest.raises(ValueError,match='符号链接'):
+        tool.invoke({'path':'linked'})
+    missing=tmp_path/'missing'
+    ws.grant_access(str(missing),'read')
+    with pytest.raises(FileNotFoundError):
+        tool.invoke({'path':str(missing)})
+    assert not missing.exists()
+
+
+def test_project_tools_paginate_and_reject_changed_versions(tmp_path, monkeypatch):
+    import json
+    from artorias_server.tools.registry import build_tools
+
+    db,sid,_,local,_=setup(tmp_path,monkeypatch)
+    ws=WorkspaceService(db,sid,'paging-run')
+    root=Path(local['root'])
+    root.mkdir(exist_ok=True)
+    contents='字符🙂\n' * 1300
+    (root/'a.txt').write_text(contents)
+    (root/'b.txt').touch()
+    tools={tool.name:tool for tool in build_tools(ws,lambda *_:None)}
+    read=tools['project_read'].invoke
+    page=read({'path':'a.txt','limit':4000})
+    assert page['has_more'] and page['content']
+    assert len(json.dumps(page['content'],ensure_ascii=False).encode('utf-8')) <= 8192
+    combined=page['content']
+    while page['has_more']:
+        page=read({'path':'a.txt','limit':4000,'offset':page['next_offset'],'expected_version':page['version']})
+        combined+=page['content']
+    assert combined==contents
+    (root/'a.txt').write_text('changed')
+    with pytest.raises(ValueError,match='内容已变更'):
+        read({'path':'a.txt','offset':2,'expected_version':page['version']})
+
+    list_files=tools['project_list'].invoke
+    first=list_files({'limit':1})
+    assert first['files']==['a.txt'] and first['next_offset']==1
+    assert list_files({'offset':1,'expected_version':first['version']})['files']==['b.txt']
+    (root/'aa.txt').touch()
+    with pytest.raises(ValueError,match='内容已变更'):
+        list_files({'offset':1,'expected_version':first['version']})

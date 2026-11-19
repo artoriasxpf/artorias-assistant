@@ -5,30 +5,76 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Artorias Assistant</title>
     <link rel="stylesheet" href="/static/css/styles.css">
+    <script type="module" src="/static/js/reload.js"></script>
     <script type="module" src="/static/js/app.js"></script>
   </head>
   <body>
+    <aside class="sidebar" aria-label="会话">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">A</span> Artorias</div>
+      <button id="new" class="new-session" type="button"><span aria-hidden="true">＋</span> 新会话</button>
+      <h2>会话</h2>
+      <nav id="sessions" aria-label="会话列表"></nav>
+    </aside>
     <main>
-      <h1>Artorias <small>个人助理</small></h1>
-      <nav>
-        <select id="sessions" aria-label="会话"></select>
-        <button id="new">新会话</button>
-        <select id="spaces" aria-label="工作空间"></select>
-        <button id="switchSpace">切换空间</button>
-        <button id="addSpace">添加空间</button>
-        <button id="files">项目文件</button>
-        <button id="changes">变更记录</button>
-      </nav>
-      <p><small>聊天 · 本地文件 · Python 编码（Docker 隔离执行）。文件直接保存在绑定目录，修改前自动备份。</small></p>
-      <p id="workspace"></p>
-      <section id="log" aria-live="polite"></section>
-      <textarea id="input" aria-label="需求" placeholder="描述需求，例如：创建 hello.py 并运行"></textarea>
-      <p>
-        <button id="send">发送</button>
-        <button id="cancel">停止</button>
-        <span id="status" role="status"></span>
-      </p>
-      <section id="panel"></section>
+      <header class="conversation-header">
+        <h1 id="sessionTitle">新会话</h1>
+        <div class="header-actions">
+          <button id="files" type="button">项目文件</button>
+          <button id="changes" type="button">变更记录</button>
+        </div>
+      </header>
+      <div id="timeline" tabindex="0" aria-label="消息与事件">
+        <section id="log" class="content-column" role="log" aria-label="会话记录"></section>
+        <p id="empty">发送一条消息开始会话。</p>
+      </div>
+      <div class="composer-area">
+        <div class="content-column">
+          <form id="composer">
+            <textarea id="input" aria-label="消息" rows="3" placeholder="给 Artorias 发消息"></textarea>
+            <div class="composer-actions">
+              <span id="status" role="status"></span>
+              <button id="cancel" type="button" hidden>停止</button>
+              <button id="send" type="submit" class="primary" disabled>发送 <span aria-hidden="true">↑</span></button>
+            </div>
+          </form>
+          <div class="workspace-bar">
+            <button id="workspace" type="button" disabled>选择工作空间</button>
+            <small>Enter 发送 · Shift + Enter 换行</small>
+          </div>
+        </div>
+      </div>
     </main>
+    <dialog id="workspaceDialog" aria-labelledby="workspaceTitle">
+      <form id="workspaceForm">
+        <h2 id="workspaceTitle">选择工作空间</h2>
+        <label for="spaceKind">位置</label>
+        <select id="spaceKind">
+          <option value="device_fs">本机</option>
+          <option value="cloud_storage">云端</option>
+        </select>
+        <label id="spaceRootLabel" for="localRoot">文件夹</label>
+        <div class="directory-row" id="localDirectory">
+          <select id="localRoot"></select>
+          <button id="pickFolder" type="button">浏览…</button>
+        </div>
+        <input id="manualRoot" list="localRoots" placeholder="输入本机绝对路径" autocomplete="off" hidden>
+        <datalist id="localRoots"></datalist>
+        <input id="cloudRoot" list="cloudRoots" placeholder="例如 personal/reports" autocomplete="off" hidden>
+        <datalist id="cloudRoots"></datalist>
+        <p id="workspaceHint" class="dialog-hint"></p>
+        <p id="workspaceError" role="alert" hidden></p>
+        <div class="dialog-actions">
+          <button id="closeWorkspace" type="button">取消</button>
+          <button id="saveWorkspace" class="primary" type="submit">使用此目录</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="projectDialog" aria-labelledby="projectTitle">
+      <div class="project-header">
+        <h2 id="projectTitle"></h2>
+        <form method="dialog"><button>关闭</button></form>
+      </div>
+      <section id="panel"></section>
+    </dialog>
   </body>
 </html>

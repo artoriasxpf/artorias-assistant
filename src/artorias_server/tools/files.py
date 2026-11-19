@@ -1,5 +1,39 @@
 """File operations shared by tool adapters; no model-framework dependency."""
+import hashlib
+import json
+
 from artorias_shared.ports.execution import WorkspacePort
+
+PAGE_BYTES = 8192
+
+
+def _json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+
+
+def _page_bounds(offset, limit, maximum, total, version, expected_version):
+    if offset < 0 or not 1 <= limit <= maximum:
+        raise ValueError('分页范围无效')
+    if offset and not expected_version:
+        raise ValueError('读取下一页时请传入上一页的 version 作为 expected_version')
+    if expected_version is not None and version != expected_version:
+        raise ValueError('内容已变更，请从 offset=0 重新读取')
+    if offset > total:
+        raise ValueError('分页范围无效')
+
+
+def _byte_capped_page(values, offset, limit):
+    """Find the largest prefix that fits the JSON content byte cap."""
+    start, stop = offset, min(len(values), offset + limit)
+    while start < stop:
+        end = (start + stop + 1) // 2
+        if len(_json_bytes(values[offset:end])) <= PAGE_BYTES:
+            start = end
+        else:
+            stop = end - 1
+    if start == offset and offset < len(values):
+        raise ValueError('单项超过分页字节上限')
+    return values[offset:start], start if start < len(values) else None
 
 class FileToolService:
     def __init__(self, workspace: WorkspacePort):
@@ -11,6 +45,26 @@ class FileToolService:
         text, version = self.workspace.read_version(path)
         self.observed_versions[self.workspace.path(path)] = version
         return text
+
+    def read_page(self, path, offset, limit, expected_version):
+        text, version = self.workspace.read_version(path)
+        _page_bounds(offset, limit, 4000, len(text), version, expected_version)
+        content, next_offset = _byte_capped_page(text, offset, limit)
+        self.observed_versions[self.workspace.path(path)] = version
+        return {
+            'path': path, 'content': content, 'version': version, 'offset': offset,
+            'total_chars': len(text), 'next_offset': next_offset, 'has_more': next_offset is not None,
+        }
+
+    def list_page(self, path, offset, limit, expected_version):
+        entries = sorted(self.workspace.files() if path == '.' else self.workspace.files_under(path))
+        version = hashlib.sha256(_json_bytes(entries)).hexdigest()
+        _page_bounds(offset, limit, 100, len(entries), version, expected_version)
+        files, next_offset = _byte_capped_page(entries, offset, limit)
+        return {
+            'path': path, 'files': files, 'version': version, 'offset': offset,
+            'total_files': len(entries), 'next_offset': next_offset, 'has_more': next_offset is not None,
+        }
 
     def write(self, path, content):
         key = self.workspace.path(path)

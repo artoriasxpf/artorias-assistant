@@ -9,6 +9,6 @@ class LocalFilesystemConnector:
 
     def open(self, workspace: dict, context: WorkspaceContext):
         return LocalWorkspace(workspace['blob_root'], self.journal, context.session_id, context.run_id,
-            workspace_root=workspace['root'], bind_session=False,
+            workspace_root=workspace['root'], bind_session=False, create_root=workspace.get('create_root',True),
             resource_meta=dict(backend=workspace['kind'], location_id=workspace['location_id'],
                                task_id=context.task_id, workspace_id=workspace.get('id')))

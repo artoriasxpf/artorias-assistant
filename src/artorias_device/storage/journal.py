@@ -4,7 +4,6 @@ The all-in-one profile points this adapter at the existing app.sqlite to retain
 atomic file journal/event commits and compatibility. A standalone device may
 use its own database; network replication of these records is not implemented.
 """
-import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -94,8 +93,9 @@ class SQLiteWorkspaceJournal:
                 return
             keys = ('id','session','run','path','before_hash','after_hash','reverts')
             c.execute('INSERT OR IGNORE INTO changes('+','.join(keys)+') VALUES(?,?,?,?,?,?,?)', tuple(op[k] for k in keys))
-            c.execute('INSERT INTO events(session,run,kind,payload) VALUES(?,?,?,?)',
-                      (op['session'],op['run'],op['kind'],json.dumps({'change_id':op['id'],'path':op['path'],'version':op['after_hash'],'reverts':op['reverts']})))
+            # File mutations are already visible as tool.call/tool.result events, so no
+            # file.* rows are written to the session event table; the changes table
+            # remains the durable ledger for revert and audit queries.
 
     def abort(self, operation_id):
         with self.tx() as c:

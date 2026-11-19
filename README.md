@@ -15,6 +15,8 @@ uv run artorias-assistant
 
 打开 http://127.0.0.1:8765 。模型必须支持 tool calling；密钥只在后端读取。模型 API 兼容性仍须用你实际的供应商验证。
 
+在左侧选择会话，右侧查看消息和运行事件。输入时按 Enter 发送，按 Shift + Enter 换行，拼音组词期间的 Enter 由输入法处理。输入框下方可以切换本机或云端工作空间。在 macOS 上，点击「浏览…」可通过系统窗口选择或新建本机文件夹。云端工作空间使用逻辑路径，例如 `personal/reports`。
+
 运行代码需要本机安装并启动 Docker Desktop，然后预先下载镜像：
 
 ```bash
@@ -66,11 +68,24 @@ docker pull python:3.12-slim
 8. 文件访问检查持久目录授权和 Run 授权；外部目录通过 project_authorize 审批，Python 执行逐次审批。邮件、购物、社交、搜索、MCP、长期记忆未接入。
 9. 默认不提供任意 shell、依赖安装、网络访问。编码环境只带镜像中的 Python；更换镜像由本机管理员配置。
 
+`project_list()` 递归列出当前工作空间中的文件。带 `path` 时可指定空间内的相对目录、本机绝对目录或 `workspace://ID/目录`，结果是相对于所列目录的文件路径。未授权的本机目录可通过 `project_authorize(path=..., access="read")` 申请本次运行的只读访问。模型使用 `project_*` 操作真实文件。DeepAgents 的内置 `ls`、`glob` 等工具不向模型开放，保留的内置 `read_file` 只读取框架明确引用的虚拟文件。
+
 ## 数据和排障
 
 `data/app.sqlite` 保存业务记录；`data/checkpoints.sqlite` 保存引擎状态；`data/blobs/` 保存不可变文件内容。目录不会进入源码包。
 
+查看 [事件清单和字段说明](docs/event_catalog.md)。如需重置本地数据库及 Blob，先停止 Artorias 服务，然后运行：
+
+```bash
+uv run python scripts/reset_local_data.py          # 预览清理路径
+uv run python scripts/reset_local_data.py --apply  # 确认后永久清理
+```
+
+脚本使用 `ARTORIAS_DATA`，也可用 `--data /path/to/data` 指定。它删除业务数据库和检查点数据库（含 SQLite 辅助文件），以及本地和云端逻辑空间的 Blob。重新启动后会创建空库。工作空间里的实际文件与 `executions/` 下的产物文件会保留，但历史会话、变更记录及产物的下载索引会丢失。
+
 模型错误会显示 run.failed；检查模型名、key、base URL 与 tool calling 支持。Docker 错误检查 Docker Desktop 和预下载镜像。依赖直接版本已按生成环境固定；附带 uv.lock 固定传递依赖，可用 uv sync --locked 安装。
+
+`project_read` 和 `project_list` 按页返回结果。要继续读取，使用上一页的 `next_offset` 和 `version` 作为下一次请求的 `offset` 和 `expected_version`。文件内容或目录列表变更后要从第一页重读。一次请求超过 `ARTORIAS_REQUEST_MAX_BYTES` 时，运行时会先压缩发给模型的旧工具记录，再检查预算。会话事件仍保留记录的载荷，可在工具卡片的「详情 JSON」中查看。
 
 执行期间浏览器断线不会取消 Run。明确点击停止会请求取消；已提交文件不会自动回滚，可从变更记录撤销。
 

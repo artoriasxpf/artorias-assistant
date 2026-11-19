@@ -86,7 +86,8 @@ def test_crash_after_replace_reconciles_once(tmp_path,monkeypatch):
     assert db.query('SELECT * FROM changes')==[]
     again=LocalWorkspace(ws.blobs,SQLiteWorkspaceJournal(db.path),sid,'recover')
     assert len(db.query('SELECT * FROM changes'))==1
-    assert len(db.query("SELECT * FROM events WHERE kind='file.changed'"))==1
+    # File mutations are expressed via tool.call/tool.result; no file.* event rows.
+    assert len(db.query("SELECT * FROM events WHERE kind='file.changed'"))==0
     LocalWorkspace(ws.blobs,SQLiteWorkspaceJournal(db.path),sid,'recover2')
     assert len(db.query('SELECT * FROM changes'))==1
     again.revert(db.query('SELECT id FROM changes')[0]['id'])

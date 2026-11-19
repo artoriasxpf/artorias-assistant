@@ -11,7 +11,7 @@ class AssistantService:
             raise ConnectorUnavailable('取消运行需要配置调度器控制适配器')
         self.scheduler.cancel(run)
         return {"requested":True}
-    def decide(self,run,decision):
+    def decide(self,run,decision,request_seq=None):
         if decision not in ("approve","reject"):raise ValueError("Invalid decision")
-        self.repository.decide(run,decision)
+        self.repository.decide(run,decision,request_seq)
         return {"accepted":True}

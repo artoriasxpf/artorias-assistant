@@ -32,7 +32,7 @@ def setup(tmp_path,backend):
     return ws,service,db
 
 
-def execute(service,ws,plan):return asyncio.run(service.execute(ws,plan,lambda *a:None))
+def execute(service,ws,plan):return asyncio.run(service.execute(ws,plan))
 
 
 def test_binary_output_and_idempotency_and_revert(tmp_path):

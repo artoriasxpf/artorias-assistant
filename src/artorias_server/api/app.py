@@ -1,4 +1,4 @@
-import asyncio, contextlib, json, os, secrets
+import asyncio, contextlib, hashlib, json, os, secrets
 from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
@@ -17,7 +17,23 @@ class Input(BaseModel):
     text:str=Field(min_length=1,max_length=30000)
     request_key:str=Field(min_length=1,max_length=100)
 
-def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_root=None, lifespan=None):
+def web_revision(web_root):
+    """Deterministic signature over the served frontend files, for live reload."""
+    root = Path(web_root)
+    entries = []
+    for directory, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+        for name in files:
+            if name.startswith('.'):
+                continue
+            path = Path(directory) / name
+            try:
+                entries.append((path.relative_to(root).as_posix(), path.stat().st_mtime_ns))
+            except OSError:
+                continue
+    return hashlib.sha1(repr(sorted(entries)).encode('utf-8')).hexdigest()
+
+def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_root=None, lifespan=None, folder_picker=None):
     from artorias_server.workspace.connectors import ConnectorRegistry
     registry = workspace_registry if workspace_registry is not None else ConnectorRegistry()
     token=secrets.token_urlsafe(32)
@@ -27,6 +43,9 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
     app=FastAPI(title='Artorias Assistant',lifespan=lifespan)
     if web_root is not None:
         app.mount('/static', StaticFiles(directory=web_root), name='static')
+        @app.get('/dev/web-revision')
+        def web_revision_endpoint():
+            return JSONResponse({'revision': web_revision(web_root)}, headers={'Cache-Control': 'no-store'})
     app.add_middleware(TrustedHostMiddleware,allowed_hosts=['localhost','127.0.0.1','testserver'])
     @app.middleware('http')
     async def protect(request,call_next):
@@ -44,9 +63,16 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
         @app.get('/')
         def index():return FileResponse(Path(web_root)/'index.html')
     @app.get('/bootstrap')
-    def bootstrap():return JSONResponse({'token':token},headers={'Cache-Control':'no-store'})
+    def bootstrap():
+        return JSONResponse({'token':token,'native_folder_picker':folder_picker is not None},
+                            headers={'Cache-Control':'no-store'})
     @app.get('/api/sessions')
-    def sessions():return store.query('SELECT * FROM sessions ORDER BY rowid DESC')
+    def sessions():
+        return store.query("""
+            SELECT s.*, (SELECT substr(m.content, 1, 80) FROM messages m
+                          WHERE m.session=s.id AND m.role='user' ORDER BY m.rowid LIMIT 1) AS title
+            FROM sessions s ORDER BY s.rowid DESC
+        """)
     @app.post('/api/sessions')
     def new_session():
         result=service.create_session();catalog.current(result['id']);return result
@@ -66,7 +92,7 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
     def decision(rid:str,body:dict):
         value=body.get('decision')
         if value not in ('approve','reject'):raise ValueError('Invalid decision')
-        return service.decide(rid,value)
+        return service.decide(rid,value,body.get('request_seq'))
     @app.get('/api/sessions/{sid}/workspace')
     def workspace(sid:str):
         store.require(sid)
@@ -121,6 +147,10 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
     @app.get('/api/workspaces')
     def list_workspaces():
         return store.query('SELECT w.*,l.kind FROM workspaces w JOIN workspace_locations l ON l.id=w.location_id')
+    if folder_picker is not None:
+        @app.post('/api/workspaces/pick-folder')
+        def pick_workspace_folder():
+            return {'root': folder_picker()}
     @app.post('/api/workspaces')
     def register_workspace(body:dict):
         # This authenticated local UI action is the owner's persistent grant.

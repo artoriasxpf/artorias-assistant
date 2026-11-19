@@ -1,4 +1,6 @@
 import asyncio
+import json
+from contextlib import aclosing
 
 class Scheduler:
     """Single local worker; replace queue/lease adapter before running multiple processes."""
@@ -16,12 +18,17 @@ class Scheduler:
     async def execute(self,run):
         self.store.emit(run['session'],run['id'],'run.started',{})
         final=''
+        approval=None
         try:
-            async for kind,payload in self.runtime.execute(run):
-                self.store.emit(run['session'],run['id'],kind,payload)
-                if kind=='assistant.final':final=payload['text']
-                if kind=='approval.requested':
-                    self.store.finish(run,'waiting');return
+            async with aclosing(self.runtime.execute(run)) as events:
+                async for kind,payload in events:
+                    if kind=='approval.requested':
+                        approval=payload
+                        break
+                    self.store.emit(run['session'],run['id'],kind,payload)
+                    if kind=='assistant.final':final=payload['text']
+            if approval is not None:
+                self.store.finish(run,'waiting',approval=approval);return
             self.store.finish(run,'completed',final)
             self.store.emit(run['session'],run['id'],'run.completed',{})
         except asyncio.CancelledError:
@@ -33,4 +40,19 @@ class Scheduler:
         if not rows:raise KeyError(rid)
         if rid in self.active:self.active[rid].cancel()
         elif rows[0]['status'] in ('queued','waiting'):
+            if rows[0]['status']=='waiting':
+                self._close_pending_approval(rows[0],'cancelled')
             self.store.finish(rows[0],'cancelled');self.store.emit(rows[0]['session'],rid,'run.cancelled',{})
+    def _close_pending_approval(self,run,reason):
+        request=self.store.query(
+            "SELECT seq,payload FROM events WHERE session=? AND run=? AND kind='approval.requested' ORDER BY seq DESC LIMIT 1",
+            (run['session'],run['id']),
+        )
+        if not request:return
+        pending=json.loads(request[0]['payload'])
+        self.store.emit(run['session'],run['id'],'approval.closed',{
+            'task_id':pending.get('task_id'),
+            'request_seq':request[0]['seq'],
+            'request_ids':[item.get('request_id') for item in pending.get('requests',[]) if isinstance(item,dict)],
+            'reason':reason,
+        })
