@@ -1,5 +1,4 @@
 """File operations shared by tool adapters; no model-framework dependency."""
-import hashlib
 import json
 
 from artorias_shared.ports.execution import WorkspacePort
@@ -54,16 +53,6 @@ class FileToolService:
         return {
             'path': path, 'content': content, 'version': version, 'offset': offset,
             'total_chars': len(text), 'next_offset': next_offset, 'has_more': next_offset is not None,
-        }
-
-    def list_page(self, path, offset, limit, expected_version):
-        entries = sorted(self.workspace.files() if path == '.' else self.workspace.files_under(path))
-        version = hashlib.sha256(_json_bytes(entries)).hexdigest()
-        _page_bounds(offset, limit, 100, len(entries), version, expected_version)
-        files, next_offset = _byte_capped_page(entries, offset, limit)
-        return {
-            'path': path, 'files': files, 'version': version, 'offset': offset,
-            'total_files': len(entries), 'next_offset': next_offset, 'has_more': next_offset is not None,
         }
 
     def write(self, path, content):

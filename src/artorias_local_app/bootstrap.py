@@ -33,14 +33,14 @@ def create_workspace(store, session, run=None, task=None, *, registry=None):
     return WorkspaceService(store, session, run, task, registry=registry or build_registry(store))
 
 
-def create_engine(data, store, **kwargs):
+def create_engine(data, store, *, cloud_python_backend=None, **kwargs):
     from artorias_server.runtime.service import DeepAgentRuntime
     from artorias_server.tools.registry import build_tools
     kwargs.setdefault('workspace_factory', WorkspaceFactory(store, build_registry(store)))
     if 'tool_factory' not in kwargs:
         from artorias_device.tools.python_backend import DockerPythonBackend
         from artorias_server.tools.execution_service import ExecutionService
-        service=ExecutionService(data,store,DockerPythonBackend())
+        service=ExecutionService(data,store,DockerPythonBackend(),cloud_backend=cloud_python_backend)
         kwargs['tool_factory']=partial(build_tools,execution_service=service)
     engine=DeepAgentRuntime(Path(data), store, **kwargs)
     engine.execution_service=locals().get('service')

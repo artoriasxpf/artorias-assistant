@@ -4,6 +4,7 @@ import os
 import stat
 import tempfile
 import threading
+from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -115,11 +116,52 @@ class LocalWorkspace:
     def files(self):
         return self.files_under('.')
 
-    def files_under(self, directory):
-        self.path('__root_check__')
-        directory = self.root if directory == '.' else self.root/self.path(directory)
+    def _directory(self, directory):
+        if directory == '.':
+            if self.root.resolve() != self.root:
+                raise ValueError('工作目录已被替换为符号链接')
+            directory = self.root
+        else:
+            directory = self.root/self.path(directory)
         if not stat.S_ISDIR(directory.stat().st_mode):
             raise NotADirectoryError(f'不是目录：{directory}')
+        return directory
+
+    def list_directory(self, directory):
+        return self.tree(directory, max_depth=1, max_entries=None, include_hidden=True)['entries']
+
+    def tree(self, directory, *, max_depth, max_entries, include_hidden):
+        root = self._directory(directory)
+        pending = deque([(root, 0)])
+        found = []
+        truncated = False
+        while pending and not truncated:
+            current, depth = pending.popleft()
+            if depth >= max_depth:
+                continue
+            if current != root:
+                self.path(current.relative_to(self.root).as_posix())
+            with os.scandir(current) as children:
+                for child in children:
+                    if not include_hidden and child.name.startswith('.'):
+                        continue
+                    if child.is_dir(follow_symlinks=False):
+                        kind = 'directory'
+                    elif child.is_file(follow_symlinks=False):
+                        kind = 'file'
+                    else:
+                        continue
+                    if max_entries is not None and len(found) == max_entries:
+                        truncated = True
+                        break
+                    path = Path(child.path)
+                    found.append({'path': path.relative_to(root).as_posix(), 'type': kind})
+                    if kind == 'directory' and depth + 1 < max_depth:
+                        pending.append((path, depth + 1))
+        return {'entries': sorted(found, key=lambda item: item['path']), 'truncated': truncated}
+
+    def files_under(self, directory):
+        directory = self._directory(directory)
 
         def raise_walk_error(error):
             raise error

@@ -142,7 +142,7 @@ def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
     class Model(GenericFakeChatModel):
         def bind_tools(self,tools,**kwargs):
             by_name={tool.name:tool for tool in tools}
-            assert {'project_list','project_read','project_authorize'} <= by_name.keys()
+            assert {'project_tree','project_list','project_read','project_authorize'} <= by_name.keys()
             assert not {'ls','glob','grep','write_file','edit_file','delete','execute'} & by_name.keys()
             assert 'cannot access the Mac' in by_name['read_file'].description
             return self
@@ -180,7 +180,7 @@ def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
     assert listing['list-before']['status']=='error'
     assert '未授权' in listing['list-before']['content']
     if decision=='approve':
-        assert json.loads(listing['list-after']['content'])['files']==['nested/existing.txt']
+        assert json.loads(listing['list-after']['content'])['entries']==[{'path':'nested','type':'directory'}]
         ws=WorkspaceService(db,sid,run['id'])
         with pytest.raises(PermissionError):
             ws.write(str(outside/'a.txt'),'blocked',expected=None)
@@ -200,10 +200,11 @@ def test_project_list_directory_targets(tmp_path,monkeypatch):
     (project/'nested/a.txt').write_text('hello')
     (project/'linked').symlink_to(project/'nested',target_is_directory=True)
     tool=next(tool for tool in build_tools(ws,lambda *_:None) if tool.name=='project_list')
-    assert tool.invoke({})['files']==['nested/a.txt']
-    assert tool.invoke({'path':'nested'})['files']==['a.txt']
-    assert tool.invoke({'path':f"workspace://{local['id']}/nested"})['files']==['a.txt']
-    assert tool.invoke({'path':str(project/'nested/empty')})['files']==[]
+    nested=[{'path':'a.txt','type':'file'},{'path':'empty','type':'directory'}]
+    assert tool.invoke({})['entries']==[{'path':'nested','type':'directory'}]
+    assert tool.invoke({'path':'nested'})['entries']==nested
+    assert tool.invoke({'path':f"workspace://{local['id']}/nested"})['entries']==nested
+    assert tool.invoke({'path':str(project/'nested/empty')})['entries']==[]
     with pytest.raises(NotADirectoryError):
         tool.invoke({'path':'nested/a.txt'})
     with pytest.raises(ValueError,match='符号链接'):
@@ -215,7 +216,7 @@ def test_project_list_directory_targets(tmp_path,monkeypatch):
     assert not missing.exists()
 
 
-def test_project_tools_paginate_and_reject_changed_versions(tmp_path, monkeypatch):
+def test_project_read_paginates_and_rejects_changed_versions(tmp_path, monkeypatch):
     import json
     from artorias_server.tools.registry import build_tools
 
@@ -240,10 +241,46 @@ def test_project_tools_paginate_and_reject_changed_versions(tmp_path, monkeypatc
     with pytest.raises(ValueError,match='内容已变更'):
         read({'path':'a.txt','offset':2,'expected_version':page['version']})
 
-    list_files=tools['project_list'].invoke
-    first=list_files({'limit':1})
-    assert first['files']==['a.txt'] and first['next_offset']==1
-    assert list_files({'offset':1,'expected_version':first['version']})['files']==['b.txt']
-    (root/'aa.txt').touch()
-    with pytest.raises(ValueError,match='内容已变更'):
-        list_files({'offset':1,'expected_version':first['version']})
+
+def test_project_tree_and_unbounded_directory_list(tmp_path, monkeypatch):
+    from pydantic import ValidationError
+    from artorias_server.tools.registry import build_tools
+
+    db,sid,cat,local,cloud=setup(tmp_path,monkeypatch)
+    local_root=Path(local['root'])
+    (local_root/'nested/deeper').mkdir(parents=True)
+    (local_root/'nested/deeper/file.txt').touch()
+    (local_root/'.hidden').touch()
+    (local_root/'link').symlink_to(local_root/'nested',target_is_directory=True)
+    ws=WorkspaceService(db,sid)
+    tools={tool.name:tool for tool in build_tools(ws,lambda *_:None)}
+    tree=tools['project_tree'].invoke
+    assert tree({})=={'path':'.','entries':[
+        {'path':'nested','type':'directory'}, {'path':'nested/deeper','type':'directory'},
+    ],'truncated':False}
+    assert tree({'max_entries':2})['truncated'] is False
+    assert tree({'max_entries':1})['truncated'] is True
+    assert tree({'max_depth':1,'include_hidden':True})['entries']==[
+        {'path':'.hidden','type':'file'}, {'path':'nested','type':'directory'},
+    ]
+    with pytest.raises(ValidationError):
+        tree({'max_entries':1001})
+    with pytest.raises(PermissionError):
+        tree({'path':str(tmp_path/'outside')})
+
+    cat.select(sid,cloud['id'])
+    cloud_ws=WorkspaceService(db,sid)
+    tools={tool.name:tool for tool in build_tools(cloud_ws,lambda *_:None)}
+    tools['project_write'].invoke({'path':'remote/hello.txt','content':'first'})
+    tools['project_edit'].invoke({'path':'remote/hello.txt','old':'first','new':'cloud'})
+    assert tools['project_read'].invoke({'path':'remote/hello.txt'})['content']=='cloud'
+    assert tools['project_tree'].invoke({})['entries']==[
+        {'path':'remote','type':'directory'}, {'path':'remote/hello.txt','type':'file'},
+    ]
+    for index in range(1001):
+        (tmp_path/'data/cloud/files/personal'/f'file-{index}').touch()
+    listing=tools['project_list'].invoke({})
+    assert len(listing['entries'])==1002
+    assert 'truncated' not in listing
+    tree_result=tools['project_tree'].invoke({'max_entries':1000})
+    assert len(tree_result['entries'])==1000 and tree_result['truncated'] is True

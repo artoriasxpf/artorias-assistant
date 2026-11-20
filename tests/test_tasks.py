@@ -79,3 +79,61 @@ def test_essential_budget_fails_without_snapshot(tmp_path):
     step=db.query('SELECT * FROM task_steps')[0]
     with pytest.raises(ValueError):ContextBuilder(repo,budget=10).build(r,step)
     assert not db.query('SELECT * FROM context_snapshots')
+
+
+def test_planner_retries_null_patch_with_field_feedback(tmp_path, monkeypatch):
+    from langchain_core.messages import AIMessage
+    from artorias_server.tasks import planner as module
+
+    db,run=setup(tmp_path)
+    calls=[]
+    replies=iter([
+        '{"kind":"tasks","items":[{"key":"a","goal":"example","task_patch":null}]}',
+        '{"kind":"tasks","items":[{"key":"a","goal":"example","task_patch":{"operations":[]}}]}',
+    ])
+
+    class Model:
+        async def ainvoke(self, messages):
+            calls.append(messages)
+            return AIMessage(content=next(replies))
+
+    monkeypatch.setattr(module,'create_model',Model)
+    plan=asyncio.run(module.TaskPlanner(db).plan(run,[]))
+    assert plan.items[0].task_patch.operations==[]
+    assert len(calls)==2
+    assert calls[0][1]==calls[1][1]
+    assert 'items[0].task_patch' in calls[1][0]['content']
+    assert [event['kind'] for event in db.events(run['session'],0)][-4:]==[
+        'model.started','model.finished','model.started','model.finished',
+    ]
+
+
+def test_planner_stops_after_two_invalid_outputs(tmp_path, monkeypatch):
+    from langchain_core.messages import AIMessage
+    from artorias_server.scheduler.service import Scheduler
+    from artorias_server.tasks import planner as module
+
+    db,run=setup(tmp_path)
+    calls=[]
+    replies=iter([
+        'not-json',
+        '{"kind":"tasks","items":[{"key":"a","goal":"example",'
+        '"task_patch":{"expected_revision":"1","unexpected":true}}]}',
+    ])
+
+    class Model:
+        async def ainvoke(self,messages):
+            calls.append(messages)
+            return AIMessage(content=next(replies))
+
+    monkeypatch.setattr(module,'create_model',Model)
+    asyncio.run(Scheduler(db,TaskRuntime(tmp_path,db,engine=object())).execute(run))
+    assert len(calls)==2
+    assert '必须返回有效的 JSON 对象' in calls[1][0]['content']
+    assert not db.query('SELECT * FROM task_plans')
+    assert not db.query('SELECT * FROM task_steps')
+    event=db.events(run['session'],0)[-1]
+    assert event['kind']=='run.failed'
+    error=json.loads(event['payload'])['error']
+    assert 'items[0].task_patch.expected_revision' in error
+    assert 'items[0].task_patch.unexpected' in error

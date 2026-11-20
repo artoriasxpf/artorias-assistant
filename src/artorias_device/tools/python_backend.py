@@ -78,7 +78,10 @@ def unpack(data, destination):
 
 
 class DockerPythonBackend:
-    location='device'
+    def __init__(self, *, location='device'):
+        if location not in ('device', 'cloud'):
+            raise ValueError('Python 执行位置必须是 device 或 cloud')
+        self.location=location
 
     def profile(self):
         image=os.getenv('ARTORIAS_IMAGE','python:3.12-slim')
@@ -88,7 +91,7 @@ class DockerPythonBackend:
             raise ValueError('Docker 或预装 Python 镜像不可用；请启动 Docker 并预先拉取镜像') from exc
         digest=proc.stdout.strip()
         if not digest.startswith('sha256:') or len(digest)!=71:raise ValueError('无法确定镜像内容 ID')
-        return {'id':'python-default','image':digest,'location':'device','memory_mb':256,'cpus':1,'pids':64,'output_bytes':64_000_000,'work_bytes':128_000_000}
+        return {'id':'python-default','image':digest,'location':self.location,'memory_mb':256,'cpus':1,'pids':64,'output_bytes':64_000_000,'work_bytes':128_000_000}
 
     async def command(self,args,limit=128_000,timeout=15):
         proc=await asyncio.create_subprocess_exec('docker',*args,stdout=asyncio.subprocess.PIPE,stderr=asyncio.subprocess.PIPE)

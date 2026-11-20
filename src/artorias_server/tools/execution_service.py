@@ -8,7 +8,10 @@ import shutil
 import stat
 from pathlib import Path
 from artorias_shared.execution.models import PythonRequest, safe_relative
+from artorias_shared.ports.execution import PythonExecutionBackend
+from artorias_shared.workspace import ConnectorUnavailable
 from artorias_server.storage.executions import ExecutionRepository
+from .executor import ExecutorRegistry
 
 MAX_FILE=32_000_000
 MAX_TOTAL=96_000_000
@@ -47,9 +50,27 @@ def scan(root):
 
 
 class ExecutionService:
-    def __init__(self, data, store, backend):
+    def __init__(self, data, store, backend: PythonExecutionBackend | None = None, *, cloud_backend: PythonExecutionBackend | None = None):
         self.root=Path(data).resolve()/'executions';self.root.mkdir(parents=True,exist_ok=True)
         self.repo=ExecutionRepository(store);self.backend=backend
+        self.backends=ExecutorRegistry()
+        if backend is not None:
+            self.backends.register(backend.location,backend)
+        if cloud_backend is not None:
+            if cloud_backend.location != 'cloud':
+                raise ValueError('云端 Python 适配器的 location 必须是 cloud')
+            self.backends.register('cloud',cloud_backend)
+
+    def _plan_location(self, plan):
+        # Older approval plans record location only in the execution profile.
+        hint=plan['request'].get('execution_hint','auto')
+        return plan.get('execution_location') or plan['profile'].get('location') or ('device' if hint=='auto' else hint)
+
+    def _backend(self, location):
+        try:
+            return self.backends.get(location)
+        except ConnectorUnavailable:
+            raise ConnectorUnavailable(f'未配置 {location} Python 执行器；不会切换执行位置') from None
 
     async def recover(self, workspace_factory):
         """Single-process startup reconciliation; never restart uncertain Python code."""
@@ -58,10 +79,11 @@ class ExecutionService:
             row=self.repo.get(item['id']);plan=row['plan']
             if item['status']=='running':
                 stopped=False
-                if hasattr(self.backend,'stop'):
-                    try:
-                        await self.backend.stop(plan['id']);stopped=True
-                    except Exception:pass
+                try:
+                    backend=self._backend(self._plan_location(plan))
+                    if hasattr(backend,'stop'):
+                        await backend.stop(plan['id']);stopped=True
+                except Exception:pass
                 self.repo.save(plan['id'],'unknown',{'execution_id':plan['id'],'execution_status':'unknown',
                     'publish_status':'not_requested','container_stopped':stopped,
                     'error':'上次进程中断，脚本结果无法核实；不会自动重跑。'})
@@ -82,7 +104,10 @@ class ExecutionService:
         if existing:
             if existing['request_hash']!=rh:raise ValueError('同一工具调用参数发生变化')
             return existing['plan']
-        if req['execution_hint'] not in ('auto',self.backend.location):raise ValueError('请求的执行位置不可用；不会自动迁移数据')
+        location=req['execution_hint']
+        if location=='auto':
+            location={'device_fs':'device','cloud_storage':'cloud'}[ws.describe()['kind']]
+        backend=self._backend(location)
         if req['mode']=='workspace_copy' and not req['working_directory']:raise ValueError('workspace_copy 需要 working_directory')
         if req['allow_delete'] and req['mode']!='workspace_copy':raise ValueError('删除仅支持工作副本模式')
         root=self.root/eid
@@ -126,7 +151,8 @@ class ExecutionService:
                 ref=join(target,name);ws.check_access(ref,'write')
                 targets[name]=ws.head(ref) if req['output']['overwrite']=='if_unchanged' else None
             plan={'id':eid,'request_hash':rh,'context':context,'request':req,'inputs':entries,
-                  'baseline':baseline,'target':target,'targets':targets,'profile':self.backend.profile(),
+                  'baseline':baseline,'target':target,'targets':targets,'profile':backend.profile(),
+                  'execution_location':location,
                   'network':'none','input_bytes':total}
             plan['plan_hash']=hashed(plan)
             self.repo.install(plan)
@@ -138,7 +164,7 @@ class ExecutionService:
         req=plan['request']
         return {'kind':'code_execution','execution_id':plan['id'],'path':req['path'],'plan_hash':plan['plan_hash'],
                 'mode':req['mode'],'inputs':[x['resource'] for x in plan['inputs']],
-                'script_sha256':plan['inputs'][0]['sha256'],'execution_location':self.backend.location,
+                'script_sha256':plan['inputs'][0]['sha256'],'execution_location':self._plan_location(plan),
                 'environment':plan['profile'],'network':'none','timeout_seconds':req['timeout_seconds'],
                 'output':dict(req['output'],target=plan['target']),'working_directory':req['working_directory'],
                 'allow_delete':req['allow_delete'],'notice':'仅提交已批准范围内的产物；覆盖需匹配执行前版本。'}
@@ -155,6 +181,7 @@ class ExecutionService:
         if row['status']=='collected':return self.publish(ws,plan,row['result'])
         if row['status']!='awaiting_approval':
             return {'execution_id':eid,'execution_status':'unknown','publish_status':'not_requested','error':'执行状态不确定，禁止自动重跑；请检查设备容器与日志'}
+        backend=self._backend(self._plan_location(plan))
         # Bind approval to the staged bytes and current resource permissions/versions.
         try:
             for entry in plan['inputs']:
@@ -170,7 +197,7 @@ class ExecutionService:
         # Execution lifecycle detail travels inside the run_python tool result; no
         # separate execution.* events are written to the session event table.
         try:
-            result=await self.backend.run(plan,root)
+            result=await backend.run(plan,root)
             result=dict(result,execution_id=eid,publish_status='not_requested',artifacts=[],published=[],conflicts=[])
             outputs=scan(root/'outputs')
             work=scan(root/'work_result') if plan['request']['mode']=='workspace_copy' else {}

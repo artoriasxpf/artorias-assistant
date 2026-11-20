@@ -48,6 +48,48 @@ def test_binary_output_and_idempotency_and_revert(tmp_path):
     with pytest.raises(FileNotFoundError):ws.read_bytes('reports/report.bin')
 
 
+def test_python_selects_and_pins_cloud_executor(tmp_path, monkeypatch):
+    from artorias_server.workspace.catalog import WorkspaceCatalog
+    from artorias_shared.workspace import ConnectorUnavailable
+
+    monkeypatch.delenv('ARTORIAS_WORKSPACE',raising=False)
+    device=Backend()
+    _, service, db=setup(tmp_path,device)
+    sid=db.query('SELECT id FROM sessions')[0]['id']
+    catalog=WorkspaceCatalog(db)
+    cloud=catalog.register('cloud','reports','cloud_storage')
+    catalog.select(sid,cloud['id'])
+    db.submit(sid,'execute in cloud','two')
+    cloud_run=db.claim()
+    workspace=create_workspace(db,sid,cloud_run['id'])
+    workspace.write('script.py','print(42)',expected=None)
+
+    with pytest.raises(ConnectorUnavailable,match='cloud Python'):
+        service.prepare(workspace,'cloud-call',{'path':'script.py'})
+    assert device.calls==0
+
+    class CloudBackend(Backend):
+        location='cloud'
+        def profile(self):
+            return {'location':'cloud','image':'sha256:cloud'}
+
+    def write_cloud_output(plan, root):
+        assert plan['execution_location']=='cloud'
+        assert (root/'app/__entry__.py').read_text()=='print(42)'
+        (root/'outputs/result.txt').write_text('cloud output')
+
+    backend=CloudBackend(write_cloud_output)
+    service=ExecutionService(tmp_path/'data',db,device,cloud_backend=backend)
+    plan=service.prepare(workspace,'cloud-call',{'path':'script.py','output':{'target':'out'}})
+    assert service.approval(plan)['execution_location']=='cloud'
+    resumed=ExecutionService(tmp_path/'data',db,device,cloud_backend=backend)
+    stored=resumed.prepare(workspace,'cloud-call',{'path':'script.py','output':{'target':'out'}})
+    assert stored==plan
+    assert execute(resumed,workspace,stored)['publish_status']=='succeeded'
+    assert workspace.read('out/result.txt')=='cloud output'
+    assert backend.calls==1 and device.calls==0
+
+
 def test_input_mapping_and_approval_snapshot(tmp_path):
     ws,service,db=setup(tmp_path,Backend())
     ws.write('data/input.csv','a,b',expected=None)

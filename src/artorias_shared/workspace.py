@@ -1,6 +1,6 @@
 """Resource contracts. No filesystem, database or agent-framework dependencies."""
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol, TypedDict
 
 UNSET_VERSION = object()
 
@@ -31,9 +31,21 @@ class BlobStore(Protocol):
     def get(self, ref: BlobRef) -> bytes: ...
 
 
+class DirectoryEntry(TypedDict):
+    path: str
+    type: Literal['file', 'directory']
+
+
+class DirectoryTree(TypedDict):
+    entries: list[DirectoryEntry]
+    truncated: bool
+
+
 class FileOperations(Protocol):
     def path(self, path: str) -> str: ...
     def files(self) -> list[str]: ...
+    def list_directory(self, directory: str) -> list[DirectoryEntry]: ...
+    def tree(self, directory: str, *, max_depth: int, max_entries: int, include_hidden: bool) -> DirectoryTree: ...
     def read_bytes(self, path: str) -> bytes: ...
     def read_version(self, path: str) -> tuple[str, str]: ...
     def head(self, path: str) -> str | None: ...

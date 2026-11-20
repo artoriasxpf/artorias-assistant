@@ -2,7 +2,7 @@
 from pathlib import Path
 from .catalog import WorkspaceCatalog
 from .connectors import ConnectorRegistry
-from artorias_shared.workspace import WorkspaceContext, UNSET_VERSION
+from artorias_shared.workspace import ConnectorUnavailable, WorkspaceContext, UNSET_VERSION
 _UNSET = UNSET_VERSION
 
 class WorkspaceService:
@@ -15,7 +15,7 @@ class WorkspaceService:
         self.root=self.workspace['root']
     def describe(self):
         return {k:self.workspace[k] for k in ('id','name','kind','location_id','root')}
-    def _resolve(self, path, action, *, directory=False):
+    def _resolve(self, path, action, *, directory=False, create_default=False):
         if not isinstance(path,str) or not path or '\x00' in path:raise ValueError('路径不能为空')
         w=self.workspace
         if path.startswith('workspace://'):
@@ -34,7 +34,7 @@ class WorkspaceService:
         grant=self.catalog.authorize(w['location_id'],str(target),action,self.run)
         # Use the grant root as boundary; workspace is only the default resolution root.
         routed=dict(w,root=grant['root'])
-        if directory:routed['create_root']=False
+        if directory:routed['create_root']=create_default
         connector=self.registry.get(w['kind'],w['location_id'])
         ws=connector.open(routed,WorkspaceContext(self.session,self.run,self.task))
         relative=target.relative_to(Path(grant['root'])).as_posix()
@@ -70,6 +70,20 @@ class WorkspaceService:
         if relative=='.':return ws.files()
         prefix=ws.path(relative).rstrip('/')+'/'
         return [name[len(prefix):] for name in ws.files() if name.startswith(prefix)]
+
+    def list_directory(self, directory):
+        endpoint, relative, _, _ = self._resolve(directory, 'read', directory=True, create_default=directory=='.')
+        list_directory = getattr(endpoint, 'list_directory', None)
+        if list_directory is None:
+            raise ConnectorUnavailable('目标连接器不支持目录列表')
+        return list_directory(relative)
+
+    def tree(self, directory, *, max_depth, max_entries, include_hidden):
+        endpoint, relative, _, _ = self._resolve(directory, 'read', directory=True, create_default=directory=='.')
+        tree = getattr(endpoint, 'tree', None)
+        if tree is None:
+            raise ConnectorUnavailable('目标连接器不支持目录树')
+        return tree(relative, max_depth=max_depth, max_entries=max_entries, include_hidden=include_hidden)
 
     def write_bytes(self, path, content, *, expected, operation_id=None):
         ws,p,w,target=self._resolve(path,'write')

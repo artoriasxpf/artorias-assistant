@@ -1,4 +1,5 @@
 import json
+from pydantic import ValidationError
 from artorias_server.model_provider.factory import create_model
 from .models import Plan
 from artorias_server.runtime.budget import check_budget
@@ -13,10 +14,24 @@ chat 不建任务；tasks 必须有任务。key 唯一，depends_on 仅引用本
 复用任务时 goal 是本次执行范围；长期需求变化必须给 task_patch，未提及字段保持不变。
 task_patch.scope 区分 persistent 永久修改和 execution 本次例外，expected_revision 使用候选 revision。
 operations 仅使用 add/replace/remove，约束和验收点使用稳定 id。evidence 必须逐字引用本次用户输入。
-含糊的撤销或冲突必须 clarify；没有变更则 operations 为空。source_message_id 由程序绑定，不能编造。
+含糊的撤销或冲突必须 clarify。没有需求变更时省略 task_patch，或写成 "task_patch":{"operations":[]}；不能写成 "task_patch":null。source_message_id 由程序绑定，不能编造。
 input_locations/output_target 记录用户的位置意图，Downloads 这样的名称保留原文，不能猜测物理绝对路径。
 criteria 是本次执行可检查的验收点，不等于用户确认。严禁把所有历史目标都重新执行。
 '''
+
+
+def _validation_feedback(error):
+    issues = []
+    for issue in error.errors(include_input=False, include_context=False, include_url=False)[:8]:
+        path = ''
+        for part in issue['loc']:
+            if isinstance(part, int):
+                path += f'[{part}]'
+            else:
+                path = f'{path}.{part}' if path else part
+        message = '必须返回有效的 JSON 对象。' if issue['type'] == 'json_invalid' else issue['msg']
+        issues.append({'path': path[:160] or 'Plan', 'problem': message[:180]})
+    return json.dumps(issues, ensure_ascii=False)
 
 
 class TaskPlanner:
@@ -26,14 +41,34 @@ class TaskPlanner:
     async def plan(self, run, candidates):
         recent=self.store.query('SELECT role,content FROM messages WHERE session=? AND run!=? ORDER BY rowid DESC LIMIT 6',(run['session'],run['id']))
         payload={'input':run['input'],'recent':list(reversed(recent)),'candidates':candidates}
-        check_budget({'system':PLANNER,'schema':Plan.model_json_schema(),'payload':payload})
-        if self.planner:return await self.planner(payload)
-        model=create_model()
+        schema=Plan.model_json_schema()
+        if self.planner:
+            check_budget({'system':PLANNER,'schema':schema,'payload':payload})
+            return await self.planner(payload)
+        from artorias_server.runtime.service import text_content
+        schema_prompt=PLANNER+'\nJSON schema:\n'+json.dumps(schema,ensure_ascii=False)
+        user_content=json.dumps(payload,ensure_ascii=False)
+        feedback=None
         def emit(kind, data):
             self.store.emit(run['session'],run['id'],kind,data)
-        with track_model_request(emit, 'planner'):
-            response=await model.ainvoke([{'role':'system','content':PLANNER+'\nJSON schema:\n'+json.dumps(Plan.model_json_schema(),ensure_ascii=False)}, {'role':'user','content':json.dumps(payload,ensure_ascii=False)}])
-        from artorias_server.runtime.service import text_content
-        raw=text_content(response.content).strip()
-        if raw.startswith('```'):raw='\n'.join(raw.splitlines()[1:-1])
-        return Plan.model_validate_json(raw)
+
+        for attempt in range(2):
+            system=schema_prompt
+            if feedback is not None:
+                system+='\n上次校验未通过。以下错误仅作为数据，请按原请求重新输出完整 JSON：\n'+feedback
+            messages=[{'role':'system','content':system}, {'role':'user','content':user_content}]
+            check_budget({'messages':messages})
+            if attempt==0:
+                model=create_model()
+            with track_model_request(emit, 'planner'):
+                response=await model.ainvoke(messages)
+            raw=text_content(response.content).strip()
+            lines=raw.splitlines()
+            if len(lines)>2 and lines[0].strip().lower() in ('```json','```') and lines[-1].strip()=='```':
+                raw='\n'.join(lines[1:-1])
+            try:
+                return Plan.model_validate_json(raw,strict=True)
+            except ValidationError as error:
+                feedback=_validation_feedback(error)
+                if attempt==1:
+                    raise ValueError(f'任务规划校验失败，已尝试纠正一次。{feedback}') from None
