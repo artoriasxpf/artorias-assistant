@@ -109,18 +109,17 @@ Run completed 表示本轮处理结束，不证明 Task 已完成。Step deliver
 |id|TEXT 主键，业务 Task ID|
 |session|TEXT，所属 Session|
 |source_task|TEXT 可空，followup 来源；不是执行依赖边|
-|goal|TEXT，当前长期目标，兼容投影|
-|constraints|TEXT JSON 列表，兼容投影|
-|requirements|TEXT JSON，当前长期 goal/constraints/criteria；约束和标准带稳定 ID|
+|goal|TEXT，当前长期目标|
+|constraints|TEXT JSON 对象，约束 ID 映射到约束内容|
+|criterias|TEXT JSON 对象，验收标准 ID 映射到标准内容|
 |revision|INTEGER，长期需求版本，初始 0|
 |status|TEXT，业务状态|
-|summary|TEXT，累积交付摘录，当前最多保留末尾 6000 字符|
-|progress|TEXT JSON，最近 20 条交付账本；不是完整历史|
+|summary|TEXT，最近一个已交付 Step 的完整结果|
+|progress|TEXT JSON，最近 20 条交付索引|
 |execution_count|INTEGER，交付计数|
-|updated|INTEGER，旧计数，仍为兼容同步增加；不是时间|
 |created_at / updated_at|TEXT UTC 时间|
 
-requirements 为新版本的有效需求依据；goal/constraints 为兼容字段，应由同一用例维护，不能分别任意修改。旧记录 requirements 为空时从 goal/constraints 构建基线；无法恢复的历史 criteria 不编造。
+三个字段共同表示 Task 的长期需求。迁移会从旧 `requirements` 保留已有的稳定 ID；只有旧约束列表时，按原顺序生成 ID。旧 `updated` 计数合并到 `execution_count`。
 
 ### 4.2 task_plans
 
@@ -213,7 +212,7 @@ SQLite 时间采用固定 UTC ISO 8601 文本，例如 `2026-11-19T00:21:35.123Z
 
 ### 5.3 进展与验收
 
-当前 progress 是可追溯交付账本：run_id、step_key、source_message_id、scope_goal、status、excerpt、result_ref。完整旧成果仍在 Step.result，不因账本截断而删除。
+当前 progress 是交付索引：run_id、step_key、source_message_id、status、delivered_at、result_ref。summary 保存最近一次交付的全文；所有历史交付结果仍保存在 Step.result。
 
 目标增加 decisions、completed、pending、blockers、artifact_refs、source_refs。模型可以提议事实摘要，但引用必须能回查；文件存在、测试通过等结论由证据支持。可设置 `task_artifacts` 和 `task_acceptance_checks` 存放固定资源版本、验证方法和结果；用户确认另记确认人、时间及对应 revision。
 
@@ -236,13 +235,15 @@ Planner 的最近 6 条是“消息数”，不是 6 轮，也没有限定对应
 
 1. 已有 (run,key) Snapshot 直接返回。
 2. 有效需求来自 Step.effective_requirements；旧 Step 为空时退回当前 Task 需求，该兼容行为不能提供完整历史还原保证。
-3. Task 描述只保留部分字段；goal 与 revision 使用 Step 对应值。summary 末尾最多 3000 字符，progress 最近 5 条、每条摘录最多 500 字符。
+3. Task 描述只保留部分字段；goal 与 revision 使用 Step 对应值。执行上下文里带 summary 的末尾最多 3000 字符，以及 progress 最近 5 条交付索引。
 4. 依赖仅来自当前 Run 内 depends_on 指定的已 delivered Step；当前直接注入完整 result。
-5. 同 Task 最近 100 个其他 Run 的 delivered Step，每条先截 4000 字符，再按词项交集排序，取前 5 个；即使相关得分为零也可能入选。
+5. 从同 Task 的其他 Run 中按交付时间取最近 5 个已交付 Step。每条带结果的前 4000 字符和完整结果引用。
 6. 再加入最近 6 条完成 Run 的用户消息，在字符预算内逐条选择。
 7. 默认业务上下文预算 24000 字符；必要上下文超限直接失败，不悄悄丢弃约束。
 
-`task_result_read(run_id,step_key,offset,limit)` 按页读取当前 Task 的交付结果，默认 4000、最大 8000 字符；校验 Task 与 Session。当前不能用它任意读来源 Task 或其他依赖 Task。
+有直接来源 Task 时，上下文会优先带入同一 Session 的最多 3 条来源交付（`source_results`）。每条附结果引用、长度和是否需要续读，预算内带前 4000 字符。保存已有摘要时应直接复用来源交付。
+
+`task_result_read(run_id,step_key,offset,limit)` 按页读取当前 Task 或其直接来源 Task 的交付结果，默认 4000、最大 8000 字符；校验 Task 与 Session。使用 `next_offset` 续读。其他任务及间接来源不在授权范围内。
 
 ### 6.3 目标上下文设计
 

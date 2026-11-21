@@ -1,4 +1,4 @@
-> v0.5 更新：Workspace 的绑定、路由、备份以 [workspace_design.md](workspace_design.md) 为准；本文保留原有架构背景。
+> v0.5 更新：Workspace 的绑定、路由、备份以 [workspace_design.md](../design/workspace_design.md) 为准；本文保留原有架构背景。
 
 # 个人助理 Agent：本地 Web + Deep Agents 实现设计
 

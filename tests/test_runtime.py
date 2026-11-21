@@ -59,6 +59,46 @@ def test_web_job_completion(tmp_path):
         assert db.query('SELECT status FROM runs')[0]['status']=='completed'
         assert db.events(sid,0)[-1]['kind']=='run.completed'
 
+def test_followup_saves_previous_delivery_without_reopening_files(tmp_path, monkeypatch):
+    from artorias_local_app.bootstrap import create_workspace
+    from artorias_server.scheduler.service import Scheduler
+    from artorias_server.tasks.executor import TaskRuntime
+    from artorias_server.tasks.models import Item, Plan
+    from artorias_server.tasks.repository import TaskRepository
+
+    monkeypatch.setenv('ARTORIAS_WORKSPACE','')
+    store=Store(tmp_path/'app.sqlite')
+    sid=store.session()
+    store.submit(sid,'扫描原目录','scan')
+    scan=store.claim()
+    repo=TaskRepository(store)
+    repo.install(scan,Plan(kind='tasks',items=[Item(key='scan',goal='扫描原目录')]),[])
+    source=store.query('SELECT * FROM task_steps')[0]
+    summary='原始报告：只保留这份已经交付的摘要。'
+    repo.deliver(scan,source,summary)
+    store.finish(scan,'completed',summary)
+    store.submit(sid,'把上面的摘要保存到原目录','save')
+    save=store.claim()
+
+    class FollowupModel(FakeModel):
+        def _generate(self, messages, *args, **kwargs):
+            assert any(summary in str(message.content) and 'source_results' in str(message.content) for message in messages)
+            return super()._generate(messages,*args,**kwargs)
+
+    model=FollowupModel(disable_streaming=True,messages=iter([
+        AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'summary.md','content':summary},'id':'write'}]),
+        AIMessage(content='已保存摘要'),
+    ]))
+    async def planner(_):
+        return Plan(kind='tasks',items=[Item(key='save',goal='保存已有摘要',relation='followup',task_id=source['task'])])
+
+    runtime=TaskRuntime(tmp_path,store,engine=DeepAgentRuntime(tmp_path,store,model_factory=lambda:model),planner=planner)
+    asyncio.run(Scheduler(store,runtime).execute(save))
+    calls=[json.loads(event['payload'])['name'] for event in store.events(sid,0) if event['kind']=='tool.call']
+    assert calls==['project_write']
+    assert create_workspace(store,sid,save['id']).read('summary.md')==summary
+
+
 def test_approval_reject_resume(tmp_path,monkeypatch):
     import artorias_server.runtime.service as rt
     replies=iter([AIMessage(content='',tool_calls=[{'name':'run_python','args':{'path':'x.py'},'id':'code1','type':'tool_call'}]),AIMessage(content='已取消运行')])

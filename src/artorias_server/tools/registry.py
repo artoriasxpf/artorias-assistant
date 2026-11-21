@@ -46,7 +46,9 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
     def project_read(path: str, offset: int = 0, limit: int = 2000,
                      expected_version: str | None = None) -> dict:
         """Read one UTF-8 page from an authorized file. For the next page, pass
-        next_offset as offset and version as expected_version. Summarize in batches.
+        next_offset as offset and version as expected_version. For analysis, use
+        at most 3 reads per batch and limit each to 2000 characters. Record concise
+        findings with source paths and page ranges before reading the next batch.
         """
         return executor.read(path, offset, limit, expected_version)
 

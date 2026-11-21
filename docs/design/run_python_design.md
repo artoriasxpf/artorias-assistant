@@ -327,4 +327,4 @@ artifact TTL 必须覆盖等待审批/冲突处理期间，正在被任务引用
 - 暂未实现：独立执行服务、submit/query/event 协议、长任务释放 worker 后唤醒、远端 RPC、Task 范围免重复审批、直接可写挂载、自动依赖安装、产物 TTL/垃圾回收。这些属于目标方案的后续阶段。
 - stage_only 与冲突产物长期保留，提供下载；暂无自动另存/重试发布 UI。不会擅自覆盖或变更目标。
 
-见 [v0.8 发布说明](release_v0.8.md) 的使用示例、升级及 Docker 实测命令。
+见 [v0.8 发布说明](../releases/release_v0.8.md) 的使用示例、升级及 Docker 实测命令。

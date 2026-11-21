@@ -99,7 +99,7 @@ def test_migration_preserves_old_task_and_change(tmp_path,monkeypatch):
     change=old.write('old.txt','old')
     repo=TaskRepository(db)
     with db.tx() as c:
-        c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,status,summary,updated) VALUES('legacy',?,NULL,'old','[]','open','',0)",(sid,))
+        c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,status,summary) VALUES('legacy',?,NULL,'old','{}','open','')",(sid,))
         c.execute('DELETE FROM session_workspaces WHERE session=?',(sid,))
     assert cat.task_binding('legacy',sid)['root']==str(tmp_path/'project')
     cat.select(sid,cloud['id'])

@@ -12,7 +12,7 @@
 
 参考与优先级：
 
-- [cloud_runtime_architecture.md](cloud_runtime_architecture.md)：云端最终拓扑，部分“第一版”描述已过时。
+- [cloud_runtime_architecture.md](../architecture/cloud_runtime_architecture.md)：云端最终拓扑，部分“第一版”描述已过时。
 - [task_design.md](task_design.md)：当前 Task 与 Step 行为及需求演进；当前已经有任务拆分。
 - [workspace_design.md](workspace_design.md)：v0.5 空间绑定与备份语义。
 - runtime_worker_design.md：本轮讨论形成的独立 Worker 方案；关键决策在本文重述，项目内未假设该文件已经存在。

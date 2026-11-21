@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import pytest
 from artorias_server.storage.sqlite import Store
@@ -27,6 +28,51 @@ def test_legacy_schema_and_all_timestamps(tmp_path):
         assert {'created_at','updated_at'} <= columns
     Store(path)
     assert db.query('SELECT * FROM sessions')[0]['created_at']==first['created_at']
+
+
+def test_task_column_migration_keeps_stable_ids_counts_and_timestamps(tmp_path):
+    from artorias_server.storage.migrations import ensure_timestamps
+    from artorias_server.tasks.requirements import requirements_for
+
+    path=tmp_path/'app.db'
+    with sqlite3.connect(path) as conn:
+        conn.executescript("""
+            CREATE TABLE business_tasks(id TEXT PRIMARY KEY, session TEXT NOT NULL, source_task TEXT,
+                goal TEXT NOT NULL, constraints TEXT NOT NULL, status TEXT NOT NULL,
+                summary TEXT NOT NULL DEFAULT '', updated INTEGER NOT NULL DEFAULT 0,
+                requirements TEXT NOT NULL DEFAULT '{}', execution_count INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX task_session ON business_tasks(session,updated);
+        """)
+        ensure_timestamps(conn)
+        conn.execute("""
+            INSERT INTO business_tasks(id,session,goal,constraints,status,summary,updated,requirements,execution_count,revision,created_at,updated_at)
+            VALUES('versioned','s','old goal','["old rule"]','open','old summary',7,?,4,2,'2026-01-01T00:00:00.000Z','2026-03-01T00:00:00.000Z')
+        """, (json.dumps({'goal':'current goal','constraints':{'rule-8':'use Chinese'},'criteria':{'criterion-3':'cite source'}}),))
+        conn.execute("""
+            INSERT INTO business_tasks(id,session,goal,constraints,status,updated,execution_count)
+            VALUES('legacy','s','legacy goal','["English","sources"]','open',2,4)
+        """)
+        conn.execute("UPDATE business_tasks SET updated_at='2026-03-01T00:00:00.000Z' WHERE id='versioned'")
+
+    db=Store(path)
+    TaskRepository(db)
+    tasks={row['id']:row for row in db.query('SELECT * FROM business_tasks')}
+    assert {'requirements','updated'}.isdisjoint(tasks['versioned'])
+    assert requirements_for(tasks['versioned'])=={
+        'goal':'current goal','constraints':{'rule-8':'use Chinese'},'criteria':{'criterion-3':'cite source'},
+    }
+    assert requirements_for(tasks['legacy'])=={
+        'goal':'legacy goal','constraints':{'constraint_1':'English','constraint_2':'sources'},'criteria':{},
+    }
+    assert tasks['versioned']['execution_count']==7 and tasks['legacy']['execution_count']==4
+    assert tasks['versioned']['summary']=='old summary' and tasks['versioned']['revision']==2
+    assert tasks['versioned']['updated_at']=='2026-03-01T00:00:00.000Z'
+    TaskRepository(db)
+    assert {row['id']:row for row in db.query('SELECT * FROM business_tasks')}==tasks
+    with db.tx() as conn:
+        conn.execute("UPDATE business_tasks SET goal='new' WHERE id='versioned'")
+    assert db.query("SELECT updated_at FROM business_tasks WHERE id='versioned'")[0]['updated_at']!='2026-03-01T00:00:00.000Z'
 
 
 def test_checkpointer_timestamps(tmp_path):

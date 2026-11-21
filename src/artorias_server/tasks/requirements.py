@@ -4,12 +4,10 @@ import json
 
 
 def requirements_for(task):
-    current = json.loads(task.get('requirements') or '{}')
-    if current:
-        return current
-    return {'goal': task['goal'], 'constraints': {
-        f'constraint_{i+1}': value for i, value in enumerate(json.loads(task['constraints']))
-    }, 'criteria': {}}
+    return {
+        'goal': task['goal'], 'constraints': json.loads(task['constraints']),
+        'criteria': json.loads(task['criterias']),
+    }
 
 
 def initial_requirements(item):
