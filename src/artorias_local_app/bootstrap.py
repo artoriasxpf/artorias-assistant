@@ -63,7 +63,7 @@ def create_app(data=None, runtime_factory=None):
         runtime_factory = lambda data, store: TaskRuntime(data, store, engine=engine)
     runtime = runtime_factory(data, store)
     if hasattr(runtime, 'repo') and getattr(runtime.repo.search.index, 'remote', False):
-        from artorias_server.tasks.search_sync import SearchSyncWorker
+        from artorias_server.integrations.search.worker import SearchSyncWorker
         search_sync = SearchSyncWorker(runtime.repo.search)
         search_client = runtime.repo.search.index.client
     scheduler = Scheduler(store, runtime)

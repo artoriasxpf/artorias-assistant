@@ -3,8 +3,9 @@
 ## 拆分决策（实施前方案）
 
 搜索服务独立进程、独立 SQLite 数据目录，不挂载 assistant 的 app.sqlite。
-保留 artorias_search 的分词与 FTS5 实现，增加 FastAPI HTTP 边界；assistant
-通过 artorias_search_client 调用，不加载 jieba。进程内实现仅保留为测试和显式兼容模式。
+`services/search/` 拥有独立的依赖、分词、FTS5、HTTP 与部署配置。
+Assistant 通过 `artorias_server/integrations/search/` 调用，默认运行不安装搜索引擎。
+进程内实现通过 `search` extra 按需安装，供测试和显式兼容模式使用。
 
 业务数据仍由 business_tasks 管理。原本的跨表本地事务改成：业务写入与 outbox
 同事务；同步 worker 提交 HTTP 请求；服务端索引与消费位置同事务；收到确认后删除
@@ -54,12 +55,12 @@
 
 | 模块 | 职责 |
 | --- | --- |
-| `artorias_search_service/app.py` | Bearer 鉴权、集合白名单、API 校验、独立数据库事务、消费游标 |
-| `artorias_search_service/main.py` | `artorias-search` 启动入口 |
-| `artorias_search_client/client.py` | HTTP 连接池、超时、错误分类；不使用环境代理 |
-| `artorias_search_client/outbox.py` | 本地事务内的投影事件写入；不执行网络请求 |
-| `artorias_server/tasks/search.py` | 生成 Task 投影、快照、远端召回后回表与候选融合 |
-| `artorias_server/tasks/search_sync.py` | 按序消费 outbox、服务版本检查、自动重建、退避重试 |
+| `services/search/src/artorias_search_service/api/app.py` | Bearer 鉴权、集合白名单、API 校验、独立数据库事务、消费游标 |
+| `services/search/src/artorias_search_service/main.py` | `artorias-search` 启动入口 |
+| `artorias_server/integrations/search/client.py` | HTTP 连接池、超时、错误分类；不使用环境代理 |
+| `artorias_server/integrations/search/outbox.py` | 本地事务内的投影事件写入；不执行网络请求 |
+| `artorias_server/integrations/search/tasks/` | 生成 Task 投影、快照、远端召回后回表与候选融合 |
+| `artorias_server/integrations/search/worker.py` | 按序消费 outbox、服务版本检查、自动重建、退避重试 |
 | `artorias_local_app/bootstrap.py` | 默认远端模式，生命周期内启动同步 worker 并关闭连接池 |
 | `scripts/sync_task_search.py` | 云端可独立运行的同步进程 |
 | `scripts/rebuild_task_search.py` | 入队快照并等待同步完成，失败保留事件且退出非零 |
@@ -85,7 +86,7 @@ export ARTORIAS_SEARCH_URL=http://127.0.0.1:8766
 uv run artorias-assistant
 ```
 
-镜像只安装 FastAPI、Uvicorn、jieba 并复制 `artorias_search`、`artorias_search_service`，不安装 LLM、runtime 或 device。
+镜像从 `services/search/` 构建，按服务自己的锁文件安装独立包。仓库根目录的 `docker compose up --build` 可以同时启动两个进程，适合联调 HTTP 和索引同步。容器中的 Assistant 使用自己的工作区和数据卷，未挂载宿主机文件或 Docker socket，需调用宿主机工具时使用下方的本机启动方式。
 容器使用独立持久化卷和非 root 用户，默认仅映射主机 loopback 端口。生产跨主机部署使用
 内网服务地址和 TLS，并配置密钥管理。当前 SQLite 服务采用单副本持久化卷，不将多个
 不共享数据库的副本挂到负载均衡后；横向扩容需迁移存储实现。
@@ -93,10 +94,11 @@ uv run artorias-assistant
 不用 Docker 时，可在独立终端运行：
 
 ```bash
-uv sync --locked --extra search
+cd services/search
+uv sync --locked
 export ARTORIAS_SEARCH_TOKEN='replace-with-your-service-secret'
 export ARTORIAS_SEARCH_DB=./search-data/search.sqlite
-uv run --extra search artorias-search --host 127.0.0.1 --port 8766
+uv run --locked artorias-search --host 127.0.0.1 --port 8766
 ```
 
 搜索入口读取环境变量，不隐式读取 assistant 的 `.env`。assistant 仍会读取 `.env`。

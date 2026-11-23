@@ -9,7 +9,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from artorias_server.storage.sqlite import Store
 from artorias_server.tasks.repository import TaskRepository
-from artorias_server.tasks.search_sync import SearchSyncWorker
+from artorias_server.integrations.search.worker import SearchSyncWorker
 
 
 def main():

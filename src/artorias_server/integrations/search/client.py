@@ -1,6 +1,6 @@
 import os
 import httpx
-from artorias_search.contracts import IndexUnavailable, SearchHit
+from .models import IndexUnavailable, SearchHit
 
 
 class SearchProtocolError(RuntimeError):

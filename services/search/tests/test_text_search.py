@@ -3,7 +3,9 @@ import sqlite3
 
 import pytest
 
-from artorias_search import Document, IndexUnavailable, Scope, SQLiteTextIndex, Tokenizer, WriteResult
+from artorias_search_service.engine.models import Document, IndexUnavailable, Scope, WriteResult
+from artorias_search_service.engine.sqlite_index import SQLiteTextIndex
+from artorias_search_service.engine.tokenizer import Tokenizer
 
 
 @pytest.fixture

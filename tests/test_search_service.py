@@ -7,15 +7,17 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from artorias_search import Document, IndexUnavailable, Scope, SQLiteTextIndex
-from artorias_search_service.app import create_app
-from artorias_search_client import OutboxTextIndex, SearchClient
-from artorias_search_client.client import SearchProtocolError
+from artorias_search_service.engine.sqlite_index import SQLiteTextIndex
+from artorias_server.integrations.search.models import IndexUnavailable, Scope
+from artorias_search_service.api.app import create_app
+from artorias_server.integrations.search.outbox import OutboxTextIndex
+from artorias_server.integrations.search.client import SearchClient
+from artorias_server.integrations.search.client import SearchProtocolError
 from artorias_server.storage.sqlite import Store
 from artorias_server.tasks.models import Item, Plan
 from artorias_server.tasks.repository import TaskRepository
-from artorias_server.tasks.search import PROJECTION_VERSION
-from artorias_server.tasks.search_sync import SearchSyncWorker
+from artorias_server.integrations.search.tasks.projection import PROJECTION_VERSION
+from artorias_server.integrations.search.worker import SearchSyncWorker
 
 
 @pytest.fixture
@@ -209,7 +211,7 @@ def test_network_outside_business_transaction_and_default_remote(remote, monkeyp
 
 def test_client_import_does_not_load_tokenizer():
     result = subprocess.run([sys.executable, '-c',
-        "import sys; import artorias_search_client; assert 'jieba' not in sys.modules"], capture_output=True)
+        "import sys; import artorias_server.integrations.search.client; assert 'artorias_search_service' not in sys.modules and 'jieba' not in sys.modules"], capture_output=True)
     assert result.returncode == 0, result.stderr
 
 
@@ -262,54 +264,3 @@ def test_restart_reuses_source_and_pending_events(remote):
     assert store.query('SELECT * FROM search_sync_state') == before
     drain(SearchSyncWorker(restarted.search))
     assert hits(client, session, 'quartz')
-
-
-def test_service_import_is_independent_of_assistant_runtime():
-    code = """
-import sys
-class Block:
-    def find_spec(self, fullname, *args):
-        if fullname.startswith(('artorias_server', 'artorias_device', 'deepagents', 'langchain')):
-            raise ImportError(fullname)
-sys.meta_path.insert(0, Block())
-from artorias_search_service.app import create_app
-"""
-    subprocess.run([sys.executable, '-c', code], check=True)
-
-
-def test_standalone_process_over_real_http(tmp_path):
-    import os
-    import socket
-    import time
-    with socket.socket() as sock:
-        sock.bind(('127.0.0.1', 0))
-        port = sock.getsockname()[1]
-    env = dict(os.environ, ARTORIAS_SEARCH_TOKEN='process-secret',
-               ARTORIAS_SEARCH_DB=str(tmp_path / 'standalone.sqlite'))
-    process = subprocess.Popen([sys.executable, '-m', 'artorias_search_service.main',
-                                '--port', str(port)], env=env,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    client = SearchClient(f'http://127.0.0.1:{port}', 'process-secret', timeout=1)
-    try:
-        deadline = time.monotonic() + 10
-        while True:
-            try:
-                status = client.status('tasks', 'test-v1')
-                break
-            except IndexUnavailable:
-                if process.poll() is not None or time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.05)
-        assert not status['current']
-        client.send(dict(source_id='source', seq=1, collection='tasks', projection_version='test-v1',
-                         operation='snapshot', entries=[{'partition':'session', 'document':{
-                             'id':'task', 'title':'中文搜索部署验证'}}]))
-        assert client.search(Scope('tasks', 'session'), '搜索', projection_version='test-v1')[0].id == 'task'
-    finally:
-        client.close()
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()

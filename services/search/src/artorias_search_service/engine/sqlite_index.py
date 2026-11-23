@@ -7,7 +7,7 @@ import logging
 import sqlite3
 from time import perf_counter
 
-from .contracts import Document, IndexUnavailable, Mode, Scope, SearchHit, TextTokenizer, WriteResult
+from .models import Document, IndexUnavailable, Mode, Scope, SearchHit, TextTokenizer, WriteResult
 from .tokenizer import Tokenizer
 
 log = logging.getLogger(__name__)

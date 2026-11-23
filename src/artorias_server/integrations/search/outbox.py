@@ -3,7 +3,7 @@ from dataclasses import asdict
 import json
 import uuid
 
-from artorias_search.contracts import WriteResult
+from .models import WriteResult
 
 
 class OutboxTextIndex:

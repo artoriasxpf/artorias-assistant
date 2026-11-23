@@ -18,13 +18,16 @@ dependencies = [
     "httpx>=0.27,<1",
 ]
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "jieba==0.42.1"]
-search = ["jieba==0.42.1"]
+dev = ["pytest", "httpx", "artorias-search-service"]
+search = ["artorias-search-service"]
 [project.scripts]
-artorias-search = "artorias_search_service.main:main"
 artorias-assistant = "artorias_local_app.main:main"
 artorias-server = "artorias_server.main:main"
 [tool.hatch.build.targets.wheel]
-packages = ["src/artorias_shared", "src/artorias_device", "src/artorias_server", "src/artorias_web", "src/artorias_local_app", "src/artorias_search", "src/artorias_search_client", "src/artorias_search_service"]
+packages = ["src/artorias_shared", "src/artorias_device", "src/artorias_server", "src/artorias_web", "src/artorias_local_app"]
+[tool.uv.sources]
+artorias-search-service = { path = "services/search" }
+
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 pythonpath = ["src"]

@@ -3,8 +3,8 @@ import asyncio
 import json
 import logging
 
-from artorias_search_client.client import SearchProtocolError
-from .search import COLLECTION, PROJECTION_VERSION
+from .client import SearchProtocolError
+from .tasks.projection import COLLECTION, PROJECTION_VERSION
 
 log = logging.getLogger(__name__)
 

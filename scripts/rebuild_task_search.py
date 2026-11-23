@@ -20,7 +20,7 @@ def main():
     repo = TaskRepository(Store(path))
     count = repo.rebuild_search()
     if getattr(repo.search.index, 'remote', False):
-        from artorias_server.tasks.search_sync import SearchSyncWorker
+        from artorias_server.integrations.search.worker import SearchSyncWorker
         try:
             worker = SearchSyncWorker(repo.search)
             while worker.sync_once():

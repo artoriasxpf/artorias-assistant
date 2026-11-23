@@ -49,8 +49,8 @@
 
 | 模块 | 已实现职责 |
 | --- | --- |
-| `src/artorias_search/` | 通用分词、协议、SQLite 索引、版本与批量增删改。 |
-| `src/artorias_server/tasks/search.py` | Task 文档投影、分批全量重建、候选融合和回表。 |
+| `services/search/src/artorias_search_service/engine/` | 通用分词、协议、SQLite 索引、版本与批量增删改。 |
+| `src/artorias_server/integrations/search/tasks/` | Task 文档投影、分批全量重建、候选融合和回表。 |
 | `tasks/repository.py` | 初始化索引，在新建/永久需求变更/交付事务内更新；提供 `rebuild_search()`。 |
 | `tasks/executor.py` | `TaskRuntime(..., text_index=...)` 注入通用依赖；Step 上下文不变。 |
 | `src/artorias_local_app/bootstrap.py` | 默认组装 HTTP/outbox 适配器并启动同步 worker；embedded 需显式配置。 |

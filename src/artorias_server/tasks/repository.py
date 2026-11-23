@@ -1,8 +1,8 @@
 import json
 import logging
-from artorias_search import IndexUnavailable
+from artorias_server.integrations.search.models import IndexUnavailable
 from artorias_shared.ids import uid
-from .search import TaskSearch
+from artorias_server.integrations.search.tasks.indexing import TaskSearch
 from .requirements import requirements_for, initial_requirements, apply_patch
 from .models import Plan
 from artorias_server.storage.migrations import ensure_task_fields

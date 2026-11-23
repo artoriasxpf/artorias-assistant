@@ -11,8 +11,8 @@
 提供可复用的文本分析、文档索引与关键词排序能力。服务只理解文档、集合和授权分区，既不理解 Task，也不调用 LLM。适用对象包括任务、文档元数据和可搜索的短文本。第一版提供中文词级检索、混合文本检索和 BM25 排序；同义改写和语义检索另立阶段。
 
 当前默认独立 HTTP 部署：搜索服务拥有自己的 SQLite 索引库，assistant 通过 HTTP 客户端查询，
-通过业务库 outbox 与同步 worker 更新索引。`artorias_search` 保留纯搜索核心，
-`artorias_search_service` 承担 HTTP/认证/数据库边界，`artorias_search_client` 承担调用与 outbox。
+通过业务库 outbox 与同步 worker 更新索引。`artorias_search_service/engine/` 提供纯搜索核心，
+`artorias_search_service` 承担 HTTP/认证/数据库边界，`artorias_server/integrations/search/` 承担调用与 outbox。
 本地事务只覆盖业务数据与 outbox；远端索引最终一致。具体协议、重建、部署见
 [独立部署方案](search_service_deployment.md)。embedded 兼容模式仍支持同库事务。
 
@@ -63,7 +63,8 @@ flowchart LR
 
 ```python
 import sqlite3
-from artorias_search import Document, Scope, SQLiteTextIndex
+from artorias_search_service.engine.models import Document, Scope
+from artorias_search_service.engine.sqlite_index import SQLiteTextIndex
 
 index = SQLiteTextIndex()
 scope = Scope('notes', 'user-1')
@@ -80,7 +81,7 @@ with sqlite3.connect(':memory:') as conn:
 
 ## 实施顺序与验收
 
-已实现可注入接口、混合分词、批量增删改、BM25、版本化重建与 Task 接入。`tests/test_text_search.py` 覆盖中文词边界、混合文件名、权重与排序、any/all、分区和集合隔离、FTS 语法输入、超长 token、指纹跳过、覆盖删除、事务回滚和版本切换。
+已实现可注入接口、混合分词、批量增删改、BM25、版本化重建与 Task 接入。`services/search/tests/test_text_search.py` 覆盖中文词边界、混合文件名、权重与排序、any/all、分区和集合隔离、FTS 语法输入、超长 token、指纹跳过、覆盖删除、事务回滚和版本切换。
 
 真实语料的 Recall@K、无命中率和查询 p95 仍需在实际使用中采集；本次没有引入额外监控服务或声称已达到生产性能指标。独立 HTTP 适配层和跨数据库 outbox 同步现已实现，见独立部署方案。
 

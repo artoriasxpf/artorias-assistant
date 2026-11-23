@@ -4,11 +4,11 @@ import sys
 
 import pytest
 
-from artorias_search import Scope, SearchHit
+from artorias_server.integrations.search.models import Scope, SearchHit
 from artorias_server.storage.sqlite import Store
 from artorias_server.tasks.models import Item, Plan, RequirementOperation, RequirementPatch
 from artorias_server.tasks.repository import TaskRepository
-from artorias_server.tasks.search import PROJECTION_VERSION
+from artorias_server.integrations.search.tasks.projection import PROJECTION_VERSION
 
 
 @pytest.fixture

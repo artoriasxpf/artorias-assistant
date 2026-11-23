@@ -17,15 +17,20 @@ from artorias_shared.tools import ToolRequest
 def test_dependency_direction():
     root = Path(__file__).resolve().parents[1]/'src'
     forbidden = {
-        'artorias_search': ('artorias_server', 'artorias_device', 'artorias_local_app', 'fastapi', 'langchain', 'deepagents'),
-        'artorias_search_service': ('artorias_server', 'artorias_device', 'artorias_local_app', 'langchain', 'deepagents'),
-        'artorias_search_client': ('artorias_server', 'artorias_device', 'artorias_local_app', 'jieba', 'fastapi', 'langchain', 'deepagents'),
         'artorias_shared': ('artorias_server', 'artorias_device', 'artorias_local_app', 'fastapi', 'langchain', 'deepagents'),
         'artorias_device': ('artorias_server', 'artorias_local_app', 'fastapi', 'langchain', 'deepagents'),
         'artorias_server': ('artorias_device', 'artorias_local_app'),
     }
-    for package, prefixes in forbidden.items():
-        for path in (root/package).rglob('*.py'):
+    targets = [(root / package, prefixes) for package, prefixes in forbidden.items()]
+    service = root.parent / 'services/search/src/artorias_search_service'
+    assistant_dependencies = ('artorias_server', 'artorias_device', 'artorias_local_app', 'langchain', 'deepagents')
+    targets.extend([
+        (service, assistant_dependencies),
+        (service / 'engine', ('fastapi',)),
+    ])
+    for directory, prefixes in targets:
+        assert directory.is_dir()
+        for path in directory.rglob('*.py'):
             for node in ast.walk(ast.parse(path.read_text())):
                 names = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or ''] if isinstance(node, ast.ImportFrom) and not node.level else []
                 assert not any(name.startswith(prefixes) for name in names), path
