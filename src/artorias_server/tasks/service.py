@@ -4,6 +4,5 @@ from .repository import TaskRepository
 from .context import ContextBuilder
 from .executor import TaskRuntime
 from .planner import TaskPlanner, PLANNER
-from .matching import terms
 
 __all__ = ["Item", "Plan", "TaskRepository", "ContextBuilder", "TaskRuntime", "TaskPlanner"]

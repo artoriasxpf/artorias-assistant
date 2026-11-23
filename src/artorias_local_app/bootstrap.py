@@ -55,10 +55,12 @@ def create_app(data=None, runtime_factory=None):
     registry = build_registry(store)
     execution_service = None
     if runtime_factory is None:
+        from artorias_search import SQLiteTextIndex
         from artorias_server.tasks.executor import TaskRuntime
         engine = create_engine(data, store)
         execution_service = engine.execution_service
-        runtime_factory = lambda data, store: TaskRuntime(data, store, engine=engine)
+        text_index = SQLiteTextIndex()
+        runtime_factory = lambda data, store: TaskRuntime(data, store, engine=engine, text_index=text_index)
     scheduler = Scheduler(store, runtime_factory(data, store))
     @asynccontextmanager
     async def lifespan(app):

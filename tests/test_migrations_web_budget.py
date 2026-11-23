@@ -23,9 +23,12 @@ def test_legacy_schema_and_all_timestamps(tmp_path):
     second=db.query('SELECT * FROM sessions')[0]
     assert second['created_at']==first['created_at']
     assert second['updated_at']!='2000-01-01T00:00:00Z'
-    for table in db.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+    for table in db.query("SELECT name FROM pragma_table_list WHERE schema='main' AND type='table' AND name NOT LIKE 'sqlite_%'"):
         columns={r['name'] for r in db.query('PRAGMA table_info('+table['name']+')')}
         assert {'created_at','updated_at'} <= columns
+    for table in db.query("SELECT name FROM pragma_table_list WHERE schema='main' AND type IN ('virtual','shadow')"):
+        columns={r['name'] for r in db.query('PRAGMA table_info('+table['name']+')')}
+        assert {'created_at','updated_at'}.isdisjoint(columns)
     Store(path)
     assert db.query('SELECT * FROM sessions')[0]['created_at']==first['created_at']
 

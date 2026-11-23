@@ -1,12 +1,14 @@
 import json
+import logging
+from artorias_search import IndexUnavailable
 from artorias_shared.ids import uid
-from .matching import terms
+from .search import TaskSearch
 from .requirements import requirements_for, initial_requirements, apply_patch
 from .models import Plan
 from artorias_server.storage.migrations import ensure_task_fields
 
 class TaskRepository:
-    def __init__(self, store):
+    def __init__(self, store, *, text_index=None):
         self.store = store
         from artorias_server.workspace.catalog import WorkspaceCatalog
         self.workspaces = WorkspaceCatalog(store)
@@ -20,26 +22,18 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
             # executescript commits before running DDL; keep the data migration atomic.
             c.execute('BEGIN IMMEDIATE')
             ensure_task_fields(c)
+        self.search = TaskSearch(store, text_index)
+        try:
+            self.search.prepare()
+        except IndexUnavailable as exc:
+            logging.getLogger(__name__).warning('task.index unavailable: %s', exc)
+
+    def rebuild_search(self):
+        """Rebuild from authoritative tasks, including after a missing-index repair."""
+        return self.search.prepare(force=True)
+
     def candidates(self, session, text):
-        recent = self.store.query('SELECT * FROM business_tasks WHERE session=? ORDER BY updated_at DESC,rowid DESC LIMIT 200', (session,))
-        # Explicit same-session IDs bypass the recent window, without granting cross-session access.
-        import re
-        explicit = []
-        for tid in set(re.findall(r'\b[a-f0-9]{32}\b', text)):
-            explicit.extend(self.store.query('SELECT * FROM business_tasks WHERE session=? AND id=?', (session, tid)))
-        query = terms(text)
-        ranked = sorted(recent, key=lambda r: len(query & terms(r['goal']+' '+r['summary'])), reverse=True)
-        selected = explicit + recent[:8] + [r for r in ranked if query & terms(r['goal']+' '+r['summary'])][:8]
-        result = []
-        seen = set()
-        for row in selected:
-            if row['id'] in seen: continue
-            seen.add(row['id'])
-            candidate={k:row[k] for k in ('id','goal','status','revision','source_task','updated_at')}
-            candidate['summary']=row['summary'][-2000:]
-            candidate['effective_requirements']=requirements_for(row)
-            result.append(candidate)
-        return result[:20]
+        return self.search.candidates(session, text)
     def install(self, run, plan, candidates):
         existing = self.store.query('SELECT plan FROM task_plans WHERE run=?', (run['id'],))
         if existing:
@@ -105,6 +99,8 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
                     c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,criterias,status,revision) VALUES(?,?,?,?,?,?,'open',?)",
                         (tid,run['session'],item.task_id,goal,constraints,criterias,applied))
                     c.execute('INSERT INTO task_workspaces(task,workspace_id) VALUES(?,?)',(tid,default['id']))
+                if not reused or applied != revision:
+                    self.search.update(c, tid)
                 c.execute("INSERT INTO task_steps(run,key,task,scope,status,result,source_message_id,base_revision,applied_revision,task_patch,effective_requirements,baseline_requirements) VALUES(?,?,?,?,'pending','',?,?,?,?,?,?)",
                     (run['id'],item.key,tid,item.model_dump_json(),source[0],revision,applied,patch.model_dump_json(),json.dumps(effective,ensure_ascii=False),json.dumps(baseline,ensure_ascii=False)))
         return plan
@@ -126,4 +122,5 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
             status = 'needs_review' if row['revision'] == step['applied_revision'] else row['status']
             c.execute('UPDATE business_tasks SET status=?,summary=?,progress=?,execution_count=execution_count+1 WHERE id=?',
                 (status,final,json.dumps(progress[-20:],ensure_ascii=False),step['task']))
+            self.search.update(c, step['task'])
             c.execute('DELETE FROM decisions WHERE run=?',(run['id'],))

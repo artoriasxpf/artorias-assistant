@@ -10,6 +10,7 @@ PLANNER = '''你是业务任务路由器，只返回符合 schema 的 JSON，不
 先关联再拆分。同一目标的补充/细化使用 continue/refine，保留原目标和有效约束。
 已交付目标的新增范围用 followup（task_id 为来源）；没有来源用 new。
 同一个项目不代表同一个目标。已有 task_id 只能从候选选取。不能确定指代时 clarify。
+候选 recall_sources 标识 explicit（显式引用）、keyword（关键词）或 recent（近期）；命中和排序仅供参考，必须核对目标与本次意图。
 chat 不建任务；tasks 必须有任务。key 唯一，depends_on 仅引用本次其他 key，无环。
 复用任务时 goal 是本次执行范围；长期需求变化必须给 task_patch，未提及字段保持不变。
 task_patch.scope 区分 persistent 永久修改和 execution 本次例外，expected_revision 使用候选 revision。

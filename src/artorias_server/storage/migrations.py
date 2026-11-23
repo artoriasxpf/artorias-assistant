@@ -5,9 +5,10 @@ NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 
 def ensure_timestamps(connection):
-    tables = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-    ).fetchall()
+    # FTS5 virtual tables and their shadow tables are owned by SQLite. Adding
+    # application columns/triggers to them corrupts the index schema.
+    tables = [(row[1],) for row in connection.execute('PRAGMA main.table_list')
+              if row[2] == 'table' and not row[1].startswith('sqlite_')]
     for (table,) in tables:
         quoted = '"' + table.replace('"', '""') + '"'
         columns = {row[1] for row in connection.execute(f'PRAGMA table_info({quoted})')}

@@ -7,9 +7,9 @@ import json
 from contextlib import aclosing
 
 class TaskRuntime:
-    def __init__(self, data, store, engine=None, planner=None):
+    def __init__(self, data, store, engine=None, planner=None, *, text_index=None):
         from artorias_server.runtime.service import DeepAgentRuntime
-        self.store=store;self.repo=TaskRepository(store);self.context=ContextBuilder(self.repo)
+        self.store=store;self.repo=TaskRepository(store,text_index=text_index);self.context=ContextBuilder(self.repo)
         self.engine=engine or DeepAgentRuntime(data,store);self.planner=planner
         self.task_planner = TaskPlanner(store, planner)
     async def plan(self, run, candidates):
