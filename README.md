@@ -1,5 +1,10 @@
 # Artorias Assistant
 
+默认搜索模式已改为**独立 HTTP 服务**。启动 assistant 前请配置 `ARTORIAS_SEARCH_TOKEN`
+与 `ARTORIAS_SEARCH_URL`；部署、迁移及兼容模式见
+[Search 独立部署方案](docs/design/search_service_deployment.md)。
+
+
 基于 Deep Agents 的本地个人助理 Python 项目，Web 输入、聊天、受管文件读写和 Python 编码执行。
 
 ## 快速启动（macOS / Linux）

@@ -1,8 +1,9 @@
 """Task projections and candidate fusion; lexical mechanics live in artorias_search."""
 import logging
 import re
+import os
 
-from artorias_search import Document, IndexUnavailable, Scope, SQLiteTextIndex, TextIndex
+from artorias_search import Document, IndexUnavailable, Scope, TextIndex
 from .requirements import requirements_for
 
 log = logging.getLogger(__name__)
@@ -24,7 +25,16 @@ def project(task) -> Document:
 class TaskSearch:
     def __init__(self, store, index: TextIndex | None = None):
         self.store = store
-        self.index = index if index is not None else SQLiteTextIndex()
+        if index is not None:
+            self.index = index
+        elif os.getenv('ARTORIAS_SEARCH_MODE', 'remote') == 'embedded':
+            from artorias_search import SQLiteTextIndex
+            self.index = SQLiteTextIndex()
+        elif os.getenv('ARTORIAS_SEARCH_MODE', 'remote') == 'remote':
+            from artorias_search_client import OutboxTextIndex, SearchClient
+            self.index = OutboxTextIndex(SearchClient())
+        else:
+            raise ValueError('ARTORIAS_SEARCH_MODE must be remote or embedded')
 
     def prepare(self, *, force=False) -> int | None:
         with self.store.tx() as conn:
@@ -44,7 +54,9 @@ class TaskSearch:
                                  projection_version=PROJECTION_VERSION)
 
     def candidates(self, session, text):
-        # Read authoritative rows and the index under the same snapshot.
+        # Fetch remotely before opening the local transaction; hydrate current authority later.
+        remote = getattr(self.index, 'remote', False)
+        remote_hits = self._keyword_hits(None, session, text) if remote else None
         with self.store.tx() as conn:
             explicit = []
             for task_id in dict.fromkeys(match.group().lower() for match in _TASK_ID.finditer(text)):
@@ -53,12 +65,7 @@ class TaskSearch:
                     explicit.append(task_id)
                     if len(explicit) == 20:
                         break
-            try:
-                hits = self.index.search(conn, Scope(COLLECTION, session), text[:30000],
-                                         projection_version=PROJECTION_VERSION, limit=10)
-            except IndexUnavailable as exc:
-                log.warning('task.recall degraded: %s', exc)
-                hits = []
+            hits = remote_hits if remote else self._keyword_hits(conn, session, text)
             recent = conn.execute('''SELECT id FROM business_tasks WHERE session=?
                 ORDER BY updated_at DESC,rowid DESC LIMIT 8''', (session,)).fetchall()
             sources = {}
@@ -82,3 +89,11 @@ class TaskSearch:
                 if len(candidates) == 20:
                     break
             return candidates
+
+    def _keyword_hits(self, conn, session, text):
+        try:
+            return self.index.search(conn, Scope(COLLECTION, session), text[:30000],
+                                     projection_version=PROJECTION_VERSION, limit=10)
+        except IndexUnavailable as exc:
+            log.warning('task.recall degraded: %s', exc)
+            return []

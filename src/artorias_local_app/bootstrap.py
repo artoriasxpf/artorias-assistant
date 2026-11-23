@@ -54,25 +54,36 @@ def create_app(data=None, runtime_factory=None):
     store = Store(data/'app.sqlite')
     registry = build_registry(store)
     execution_service = None
+    search_sync = None
+    search_client = None
     if runtime_factory is None:
-        from artorias_search import SQLiteTextIndex
         from artorias_server.tasks.executor import TaskRuntime
         engine = create_engine(data, store)
         execution_service = engine.execution_service
-        text_index = SQLiteTextIndex()
-        runtime_factory = lambda data, store: TaskRuntime(data, store, engine=engine, text_index=text_index)
-    scheduler = Scheduler(store, runtime_factory(data, store))
+        runtime_factory = lambda data, store: TaskRuntime(data, store, engine=engine)
+    runtime = runtime_factory(data, store)
+    if hasattr(runtime, 'repo') and getattr(runtime.repo.search.index, 'remote', False):
+        from artorias_server.tasks.search_sync import SearchSyncWorker
+        search_sync = SearchSyncWorker(runtime.repo.search)
+        search_client = runtime.repo.search.index.client
+    scheduler = Scheduler(store, runtime)
     @asynccontextmanager
     async def lifespan(app):
         if execution_service is not None:
             await execution_service.recover(lambda ctx:create_workspace(store,ctx['session'],ctx['run'],ctx['task'],registry=registry))
         worker = asyncio.create_task(scheduler.loop())
+        sync_worker = asyncio.create_task(search_sync.run()) if search_sync else None
         try:
             yield
         finally:
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
+            workers = [worker] + ([sync_worker] if sync_worker else [])
+            for task in workers:
+                task.cancel()
+            for task in workers:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+            if search_client:
+                search_client.close()
     import artorias_web
     from artorias_device.folder_picker import pick_folder
     return create_http_app(data, store, scheduler, workspace_registry=registry,

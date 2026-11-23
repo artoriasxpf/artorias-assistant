@@ -17,8 +17,17 @@ def main():
     path = (args.data or Path(os.getenv('ARTORIAS_DATA', 'data'))).resolve() / 'app.sqlite'
     if not path.is_file():
         parser.error(f'Existing database required: {path}')
-    count = TaskRepository(Store(path)).rebuild_search()
-    print(f'Rebuilt {count} Task documents in {path}')
+    repo = TaskRepository(Store(path))
+    count = repo.rebuild_search()
+    if getattr(repo.search.index, 'remote', False):
+        from artorias_server.tasks.search_sync import SearchSyncWorker
+        try:
+            worker = SearchSyncWorker(repo.search)
+            while worker.sync_once():
+                pass
+        finally:
+            repo.search.index.client.close()
+    print(f'Rebuilt {count} Task documents from {path}')
 
 
 if __name__ == '__main__':

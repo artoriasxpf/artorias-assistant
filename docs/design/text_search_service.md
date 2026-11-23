@@ -1,10 +1,20 @@
 # 通用分词与关键词匹配服务方案
 
+> 部署版本更新：默认已切换到独立 HTTP 搜索服务。当前跨进程协议、outbox 同步、
+> 重建和部署方式以 [Search 独立部署方案](search_service_deployment.md) 为准。
+> 下文中的“同 SQLite 事务”“启动直接构建”描述保留用于 embedded 兼容实现；
+> 远端模式仅保证 Task 与 outbox 同事务，索引最终一致，启动不要求服务在线。
+
+
 ## 目标和部署边界
 
 提供可复用的文本分析、文档索引与关键词排序能力。服务只理解文档、集合和授权分区，既不理解 Task，也不调用 LLM。适用对象包括任务、文档元数据和可搜索的短文本。第一版提供中文词级检索、混合文本检索和 BM25 排序；同义改写和语义检索另立阶段。
 
-首版已实现为 Runtime Server 的进程内依赖，由应用注入接口。SQLite 索引与业务数据在同一个事务中更新，不需要另启服务。核心包 `artorias_search` 不依赖 Task、Runtime Server 或模型。独立部署时可以在相同接口外加 HTTP 适配层，使用单独数据库；本次未新增 HTTP 服务。业务变更发生在另一个数据库时，需要持久化同步协议，不能沿用进程内的事务保证。
+当前默认独立 HTTP 部署：搜索服务拥有自己的 SQLite 索引库，assistant 通过 HTTP 客户端查询，
+通过业务库 outbox 与同步 worker 更新索引。`artorias_search` 保留纯搜索核心，
+`artorias_search_service` 承担 HTTP/认证/数据库边界，`artorias_search_client` 承担调用与 outbox。
+本地事务只覆盖业务数据与 outbox；远端索引最终一致。具体协议、重建、部署见
+[独立部署方案](search_service_deployment.md)。embedded 兼容模式仍支持同库事务。
 
 ```mermaid
 flowchart LR
@@ -47,7 +57,7 @@ flowchart LR
 | `index.search(conn, scope, query, projection_version=..., mode='any', limit=20)` | `POST /v1/search` | 返回有序 `SearchHit(id, score)`；SQLite BM25 分数越小越相关，只用于本次排序。 |
 | `index.rebuild(conn, collection, documents, projection_version=...)` | 管理命令或管理端点 | 流式接收 `(partition, Document)`，替换整个集合，返回文档数。 |
 
-`Scope(collection, partition)` 由可信调用方创建，`Document(id, title, keywords, body)` 是通用数据对象。`TextTokenizer`、`TextIndex` 是可注入的 Protocol；SQLite 实现不自建连接或提交事务，调用者负责开启事务，异常必须回滚。所有更新必须使用已经构建的同版本集合，版本不兼容会抛出 `IndexUnavailable`，不会把新规则词项写进旧集合。
+`Scope(collection, partition)` 由可信调用方创建，`Document(id, title, keywords, body)` 是通用数据对象。`TextTokenizer`、`TextIndex` 是可注入的 Protocol；SQLite 核心实现不自建连接或提交事务，独立 HTTP 服务负责开启与提交索引库事务，异常必须回滚。所有更新必须使用已经构建的同版本集合，版本不兼容会抛出 `IndexUnavailable`，不会把新规则词项写进旧集合。
 
 **方案修正：重建粒度为集合，而非单分区。** 分词版本记录在集合层；只重建一个分区就宣布整个集合升级，会造成其他分区仍使用旧词项。日常增删改按分区执行，版本升级从权威来源重建整个集合，其他集合保持不变。没有权威模型的通用调用方也可先读取保存的检索字段，作为 `rebuild` 的文档来源；投影规则变化时必须重新生成投影。
 
@@ -72,6 +82,6 @@ with sqlite3.connect(':memory:') as conn:
 
 已实现可注入接口、混合分词、批量增删改、BM25、版本化重建与 Task 接入。`tests/test_text_search.py` 覆盖中文词边界、混合文件名、权重与排序、any/all、分区和集合隔离、FTS 语法输入、超长 token、指纹跳过、覆盖删除、事务回滚和版本切换。
 
-真实语料的 Recall@K、无命中率和查询 p95 仍需在实际使用中采集；本次没有引入额外监控服务或声称已达到生产性能指标。独立 HTTP 适配层和跨数据库同步留待后续部署需求。
+真实语料的 Recall@K、无命中率和查询 p95 仍需在实际使用中采集；本次没有引入额外监控服务或声称已达到生产性能指标。独立 HTTP 适配层和跨数据库 outbox 同步现已实现，见独立部署方案。
 
 参考：[Jieba 中文分词](https://github.com/fxsjy/jieba) · [SQLite FTS5](https://www.sqlite.org/fts5.html)

@@ -20,7 +20,7 @@ class TaskRuntime:
         if stored:
             plan=Plan.model_validate_json(stored[0]['plan'])
         else:
-            candidates=self.repo.candidates(run['session'],run['input'])
+            candidates=await asyncio.to_thread(self.repo.candidates, run['session'], run['input'])
             plan=self.repo.install(run,await self.plan(run,candidates),candidates)
             yield 'task.plan',plan.model_dump()
             # Surface the requirements patches that actually took effect: the plan

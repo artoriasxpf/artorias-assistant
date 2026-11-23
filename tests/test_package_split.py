@@ -18,6 +18,8 @@ def test_dependency_direction():
     root = Path(__file__).resolve().parents[1]/'src'
     forbidden = {
         'artorias_search': ('artorias_server', 'artorias_device', 'artorias_local_app', 'fastapi', 'langchain', 'deepagents'),
+        'artorias_search_service': ('artorias_server', 'artorias_device', 'artorias_local_app', 'langchain', 'deepagents'),
+        'artorias_search_client': ('artorias_server', 'artorias_device', 'artorias_local_app', 'jieba', 'fastapi', 'langchain', 'deepagents'),
         'artorias_shared': ('artorias_server', 'artorias_device', 'artorias_local_app', 'fastapi', 'langchain', 'deepagents'),
         'artorias_device': ('artorias_server', 'artorias_local_app', 'fastapi', 'langchain', 'deepagents'),
         'artorias_server': ('artorias_device', 'artorias_local_app'),

@@ -74,7 +74,7 @@ source = { editable = "." }
 dependencies = [
     { name = "deepagents" },
     { name = "fastapi" },
-    { name = "jieba" },
+    { name = "httpx" },
     { name = "langchain-anthropic" },
     { name = "langchain-deepseek" },
     { name = "langchain-openai" },
@@ -86,15 +86,21 @@ dependencies = [
 [package.optional-dependencies]
 dev = [
     { name = "httpx" },
+    { name = "jieba" },
     { name = "pytest" },
+]
+search = [
+    { name = "jieba" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "deepagents", specifier = "==0.7.35" },
     { name = "fastapi", specifier = "==0.141.1" },
+    { name = "httpx", specifier = ">=0.27,<1" },
     { name = "httpx", marker = "extra == 'dev'" },
-    { name = "jieba", specifier = "==0.42.1" },
+    { name = "jieba", marker = "extra == 'dev'", specifier = "==0.42.1" },
+    { name = "jieba", marker = "extra == 'search'", specifier = "==0.42.1" },
     { name = "langchain-anthropic", specifier = "==1.7.10" },
     { name = "langchain-deepseek", specifier = "==1.1.1" },
     { name = "langchain-openai", specifier = "==1.7.4" },
@@ -103,7 +109,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = "==1.2.2" },
     { name = "uvicorn", specifier = "==0.52.1" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["dev", "search"]
 
 [[package]]
 name = "bracex"
