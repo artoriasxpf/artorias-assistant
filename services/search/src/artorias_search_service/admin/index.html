@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Search Admin · Artorias</title>
+  <link rel="stylesheet" href="admin/assets/style.css">
+  <script defer src="admin/assets/admin.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-content">
+      <a class="brand" href="admin"><span class="brand-icon" aria-hidden="true">⌕</span> Artorias Search</a>
+      <a class="docs" href="docs">OpenAPI 文档 ↗</a>
+    </div>
+  </header>
+  <main>
+    <div class="intro">
+      <h1>搜索服务调试台</h1>
+      <p>编辑 JSON 请求，检查索引状态、写入 Task 搜索文档，或查询匹配结果。</p>
+    </div>
+    <form id="request-form">
+      <section class="settings" aria-label="请求设置">
+        <div>
+          <label for="token">服务令牌</label>
+          <input id="token" type="password" autocomplete="off" placeholder="ARTORIAS_SEARCH_TOKEN" required>
+        </div>
+        <div>
+          <label for="endpoint">接口</label>
+          <select id="endpoint">
+            <option value="status">POST /v1/status · 索引状态</option>
+            <option value="search">POST /v1/search · 搜索</option>
+            <option value="events">POST /v1/events · 索引事件</option>
+            <option value="health">GET /healthz · 存活检查</option>
+            <option value="ready">GET /readyz · 就绪检查</option>
+          </select>
+        </div>
+      </section>
+
+      <div class="panels">
+        <section class="panel" aria-labelledby="request-title">
+          <div class="panel-header">
+            <h2 id="request-title">请求</h2>
+            <span class="mono-label" id="request-path">POST /v1/status</span>
+          </div>
+          <div class="panel-content">
+            <div id="json-controls">
+              <div class="presets">
+                <div class="preset-field">
+                  <label for="preset">请求模板</label>
+                  <select id="preset"></select>
+                </div>
+                <button type="button" id="load-preset" class="secondary">载入</button>
+                <button type="button" id="format-json" class="secondary">格式化</button>
+              </div>
+              <label for="payload" class="editor-label">请求正文</label>
+              <textarea id="payload" spellcheck="false" autocapitalize="off" autocomplete="off"
+                        aria-describedby="request-help json-error"></textarea>
+            </div>
+            <p id="request-help" class="help"></p>
+            <p id="json-error" class="error" role="alert" hidden></p>
+            <div class="actions"><button id="send" class="primary" type="submit">发送请求 <span aria-hidden="true">→</span></button></div>
+          </div>
+        </section>
+        <section class="panel response-panel" aria-labelledby="response-title">
+          <div class="panel-header">
+            <h2 id="response-title">响应</h2>
+            <span class="badge" id="response-status" role="status">等待请求</span>
+          </div>
+          <div class="panel-content">
+            <pre id="response" tabindex="0" aria-label="响应内容">发送请求后，此处会显示 HTTP 响应正文。</pre>
+          </div>
+        </section>
+      </div>
+    </form>
+    <aside class="notice" aria-labelledby="sandbox-title">
+      <h2 id="sandbox-title">在测试集合验证写入</h2>
+      <p>示例使用 <code>tasks_sandbox</code>。启动服务前，将它追加到 <code>ARTORIAS_SEARCH_COLLECTIONS</code>。依次发送「初始化快照」「新增文档」「更新文档」，再用搜索模板验证。重复操作前，可从状态响应读取 <code>last_seq</code>，下一条增量事件使用 <code>last_seq + 1</code>。</p>
+      <p>在线 Assistant 管理 <code>tasks</code> 集合的消费游标。该集合适合用页面查询和查看状态。手工写入只改 Search Service 的索引，可能与 Assistant 的 outbox 冲突。</p>
+    </aside>
+  </main>
+</body>
+</html>
