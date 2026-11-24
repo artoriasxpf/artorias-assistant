@@ -88,7 +88,7 @@ class WorkspaceToolExecutor:
         if service is None:
             if (request.args or request.inputs or request.output != OutputPolicy()
                     or request.mode != 'isolated' or request.working_directory or request.code_directory
-                    or request.allow_delete or request.execution_hint != 'auto'):
+                    or request.dependencies or request.allow_delete or request.execution_hint != 'auto'):
                 raise ValueError('此执行器不支持产物模式')
             approval = ApprovalRequest('code_execution', request.path, {'notice':'Legacy sandbox: logs only'})
             if approve(approval.to_payload()) != 'approve':

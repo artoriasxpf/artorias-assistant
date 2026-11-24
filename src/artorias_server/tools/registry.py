@@ -85,18 +85,21 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         working_directory: str | None = None, code_directory: str | None = None,
         allow_delete: bool = False, execution_hint: str = 'auto',
         environment: str = 'python-default', timeout_seconds: int = 120,
+        dependencies: list[str] | None = None,
     ) -> dict:
         """Run an authorized Python script after approval. Auto uses the linked
         workspace's execution environment. Inputs are staged under /inputs,
         code under /app, and outputs under /outputs. workspace_copy requires
-        working_directory. Existing output overwrites require if_unchanged
+        working_directory. Prefer ARTORIAS_INPUT_DIR, ARTORIAS_OUTPUT_DIR and
+        ARTORIAS_WORK_DIR for portable scripts. Native macOS supports dependencies
+        declared as package names or package==version. Existing output overwrites require if_unchanged
         and expected_files. Returns execution and publication statuses.
         """
         request = PythonRequest(
             path=path, args=args or [], mode=mode, inputs=inputs or [],
             output=output or OutputPolicy(), working_directory=working_directory,
             code_directory=code_directory, allow_delete=allow_delete, execution_hint=execution_hint,
-            environment=environment, timeout_seconds=timeout_seconds,
+            environment=environment, timeout_seconds=timeout_seconds, dependencies=dependencies or [],
         )
         return await executor.run_python(tool_call_id, request, interrupt, emit)
 

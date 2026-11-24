@@ -33,7 +33,15 @@ def excluded(name):
 def scan(root):
     """Never follow executable-created links or read unbounded files."""
     result={};total=0
-    for directory,dirs,files in os.walk(root,followlinks=False):
+    if root.is_symlink():
+        raise ValueError('产物目录不能是链接')
+
+    def raise_walk_error(error):
+        raise error
+
+    if not root.exists():
+        return result
+    for directory,dirs,files in os.walk(root,followlinks=False,onerror=raise_walk_error):
         for name in dirs+files:
             path=Path(directory)/name;info=path.lstat()
             if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
@@ -50,10 +58,11 @@ def scan(root):
 
 
 class ExecutionService:
-    def __init__(self, data, store, backend: PythonExecutionBackend | None = None, *, cloud_backend: PythonExecutionBackend | None = None):
+    def __init__(self, data, store, backend: PythonExecutionBackend | None = None, *, cloud_backend: PythonExecutionBackend | None = None, docker_backend: PythonExecutionBackend | None = None):
         self.root=Path(data).resolve()/'executions';self.root.mkdir(parents=True,exist_ok=True)
         self.repo=ExecutionRepository(store);self.backend=backend
         self.backends=ExecutorRegistry()
+        self.docker_backend = docker_backend
         if backend is not None:
             self.backends.register(backend.location,backend)
         if cloud_backend is not None:
@@ -72,6 +81,15 @@ class ExecutionService:
         except ConnectorUnavailable:
             raise ConnectorUnavailable(f'未配置 {location} Python 执行器；不会切换执行位置') from None
 
+    def _planned_backend(self, plan):
+        location = self._plan_location(plan)
+        if location == 'device' and 'image' in plan['profile'] and self.docker_backend is not None:
+            return self.docker_backend
+        backend = self._backend(location)
+        if plan['profile'].get('backend') == 'macos-venv' and not getattr(backend, 'native', False):
+            raise ValueError('原生执行计划需要启用 macOS 后端')
+        return backend
+
     async def recover(self, workspace_factory):
         """Single-process startup reconciliation; never restart uncertain Python code."""
         rows=self.repo.store.query("SELECT id,status FROM python_executions WHERE status IN ('running','collected')")
@@ -80,7 +98,7 @@ class ExecutionService:
             if item['status']=='running':
                 stopped=False
                 try:
-                    backend=self._backend(self._plan_location(plan))
+                    backend=self._planned_backend(plan)
                     if hasattr(backend,'stop'):
                         await backend.stop(plan['id']);stopped=True
                 except Exception:pass
@@ -98,6 +116,8 @@ class ExecutionService:
 
     def prepare(self, ws, call_id, request):
         req=PythonRequest.model_validate(request).model_dump()
+        if not req['dependencies']:
+            req.pop('dependencies')  # Keep existing approval request hashes stable.
         context={'session':ws.session,'run':ws.run,'task':ws.task,'step':getattr(ws,'step',None),'call':call_id}
         eid='exec_'+hashed(context)[:40];rh=hashed(req)
         existing=self.repo.get(eid)
@@ -108,6 +128,9 @@ class ExecutionService:
         if location=='auto':
             location={'device_fs':'device','cloud_storage':'cloud'}[ws.describe()['kind']]
         backend=self._backend(location)
+        profile = backend.profile()
+        if req.get('dependencies') and profile.get('backend') != 'macos-venv':
+            raise ValueError('动态依赖安装需要 macOS 原生后端')
         if req['mode']=='workspace_copy' and not req['working_directory']:raise ValueError('workspace_copy 需要 working_directory')
         if req['allow_delete'] and req['mode']!='workspace_copy':raise ValueError('删除仅支持工作副本模式')
         root=self.root/eid
@@ -151,7 +174,7 @@ class ExecutionService:
                 ref=join(target,name);ws.check_access(ref,'write')
                 targets[name]=ws.head(ref) if req['output']['overwrite']=='if_unchanged' else None
             plan={'id':eid,'request_hash':rh,'context':context,'request':req,'inputs':entries,
-                  'baseline':baseline,'target':target,'targets':targets,'profile':backend.profile(),
+                  'baseline':baseline,'target':target,'targets':targets,'profile':profile,
                   'execution_location':location,
                   'network':'none','input_bytes':total}
             plan['plan_hash']=hashed(plan)
@@ -165,7 +188,7 @@ class ExecutionService:
         return {'kind':'code_execution','execution_id':plan['id'],'path':req['path'],'plan_hash':plan['plan_hash'],
                 'mode':req['mode'],'inputs':[x['resource'] for x in plan['inputs']],
                 'script_sha256':plan['inputs'][0]['sha256'],'execution_location':self._plan_location(plan),
-                'environment':plan['profile'],'network':'none','timeout_seconds':req['timeout_seconds'],
+                'environment':plan['profile'],'dependencies':req.get('dependencies', []),'dependency_network':'PyPI' if req.get('dependencies') else 'none','network':'none','timeout_seconds':req['timeout_seconds'],
                 'output':dict(req['output'],target=plan['target']),'working_directory':req['working_directory'],
                 'allow_delete':req['allow_delete'],'notice':'仅提交已批准范围内的产物；覆盖需匹配执行前版本。'}
 
@@ -181,7 +204,6 @@ class ExecutionService:
         if row['status']=='collected':return self.publish(ws,plan,row['result'])
         if row['status']!='awaiting_approval':
             return {'execution_id':eid,'execution_status':'unknown','publish_status':'not_requested','error':'执行状态不确定，禁止自动重跑；请检查设备容器与日志'}
-        backend=self._backend(self._plan_location(plan))
         # Bind approval to the staged bytes and current resource permissions/versions.
         try:
             for entry in plan['inputs']:
@@ -197,7 +219,7 @@ class ExecutionService:
         # Execution lifecycle detail travels inside the run_python tool result; no
         # separate execution.* events are written to the session event table.
         try:
-            result=await backend.run(plan,root)
+            result=await self._planned_backend(plan).run(plan,root)
             result=dict(result,execution_id=eid,publish_status='not_requested',artifacts=[],published=[],conflicts=[])
             outputs=scan(root/'outputs')
             work=scan(root/'work_result') if plan['request']['mode']=='workspace_copy' else {}

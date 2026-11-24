@@ -46,6 +46,7 @@ class PythonRequest(BaseModel):
     allow_delete: bool = False
     execution_hint: Literal['auto','device','cloud'] = 'auto'
     environment: Literal['python-default'] = 'python-default'
+    dependencies: list[str] = Field(default_factory=list, max_length=32)
     timeout_seconds: int = Field(default=120, ge=1, le=300)
 
     @field_validator('args')

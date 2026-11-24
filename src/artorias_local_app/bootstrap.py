@@ -40,7 +40,16 @@ def create_engine(data, store, *, cloud_python_backend=None, **kwargs):
     if 'tool_factory' not in kwargs:
         from artorias_device.tools.python_backend import DockerPythonBackend
         from artorias_server.tools.execution_service import ExecutionService
-        service=ExecutionService(data,store,DockerPythonBackend(),cloud_backend=cloud_python_backend)
+        from artorias_device.tools.macos_python import MacOSVenvPythonBackend
+
+        selection = os.getenv('ARTORIAS_PYTHON_BACKEND', 'auto')
+        if selection not in ('auto', 'macos-venv', 'docker'):
+            raise ValueError('ARTORIAS_PYTHON_BACKEND 必须为 auto、macos-venv 或 docker')
+        docker = DockerPythonBackend()
+        native = selection == 'macos-venv' or (selection == 'auto' and sys.platform == 'darwin')
+        backend = MacOSVenvPythonBackend(Path(data) / 'python-envs') if native else docker
+        service = ExecutionService(data, store, backend, cloud_backend=cloud_python_backend,
+                                   docker_backend=docker)
         kwargs['tool_factory']=partial(build_tools,execution_service=service)
     engine=DeepAgentRuntime(Path(data), store, **kwargs)
     engine.execution_service=locals().get('service')
