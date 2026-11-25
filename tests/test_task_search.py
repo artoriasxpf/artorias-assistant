@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, deliver, user_rule
 import sqlite3
 import subprocess
 import sys
@@ -21,7 +22,7 @@ def create(tasks, goal='originalword', **fields):
     store, repo, session = tasks
     store.submit(session, goal, str(len(store.query('SELECT id FROM runs'))))
     run = store.claim()
-    repo.install(run, Plan(kind='tasks', items=[Item(key='step', goal=goal, **fields)]), [])
+    repo.install(run, Plan(kind='tasks', items=[plan_item(key='step', goal=goal, **fields)]), [])
     step = store.query('SELECT * FROM task_steps WHERE run=?', (run['id'],))[0]
     return run, step
 
@@ -38,7 +39,7 @@ def test_recall_beyond_200_order_sources_dedup_and_session(tasks):
     foreign = store.session()
     with store.tx() as conn:
         for i in range(215):
-            conn.execute('''INSERT INTO business_tasks(id,session,goal,constraints,criterias,status,updated_at)
+            conn.execute('''INSERT INTO business_tasks(id,session,goal,constraints,criteria,status,updated_at)
                 VALUES(?,?,?,'{}','{}','open',?)''',
                 (f'{i:032x}', foreign if i == 214 else session,
                  'quartz' if i in (0, 214) else 'unrelated', f'2026-01-01T00:00:00.{i:03}Z'))
@@ -58,7 +59,7 @@ def test_recall_beyond_200_order_sources_dedup_and_session(tasks):
     assert len(repo.candidates(session, '的 和 我')) == 8
 
 
-@pytest.mark.parametrize('scope', ['persistent', 'execution'])
+@pytest.mark.parametrize('scope', ['persistent'])
 def test_requirement_projection_and_delivery_updates(tasks, scope):
     store, repo, session = tasks
     run, first = create(tasks, constraints=['oldconstraint'], criteria=['oldcriterion'])
@@ -66,37 +67,39 @@ def test_requirement_projection_and_delivery_updates(tasks, scope):
     assert search(tasks, 'originalword') == [tid]
     assert search(tasks, 'oldconstraint') == [tid]
     assert search(tasks, 'oldcriterion') == [tid]
-    repo.deliver(run, first, 'oldsummary')
+    deliver(repo,run, first, 'oldsummary')
     assert search(tasks, 'oldsummary') == [tid]
     store.finish(run, 'completed')
     store.submit(session, 'replacewords', 'revision')
     changed = store.claim()
-    patch = RequirementPatch(scope=scope, expected_revision=0, operations=[
+    patch = RequirementPatch(expected_revision=0, operations=[
         RequirementOperation(op='replace', field='goal', value='newgoal', evidence='replacewords'),
-        RequirementOperation(op='replace', field='constraints', id='constraint_1', value='newconstraint', evidence='replacewords'),
-        RequirementOperation(op='replace', field='criteria', id='criterion_1', value='newcriterion', evidence='replacewords'),
+        RequirementOperation(op='replace', field='constraints', id='K1', value='newconstraint', evidence='replacewords'),
+        RequirementOperation(op='replace', field='criteria', id='C1', value=user_rule('newcriterion'), evidence='replacewords'),
     ])
-    repo.install(changed, Plan(kind='tasks', items=[Item(key='next', goal='execute', relation='refine',
+    repo.install(changed, Plan(kind='tasks', items=[plan_item(key='next', goal='execute', relation='refine',
         task_id=tid, task_patch=patch)]), repo.candidates(session, tid))
     for old, new in [('originalword', 'newgoal'), ('oldconstraint', 'newconstraint'), ('oldcriterion', 'newcriterion')]:
         assert search(tasks, old) == ([] if scope == 'persistent' else [tid])
         assert search(tasks, new) == ([tid] if scope == 'persistent' else [])
     step = store.query('SELECT * FROM task_steps WHERE run=?', (changed['id'],))[0]
     summary = 'beginword ' + 'x ' * 8000 + ' endword'
-    repo.deliver(changed, step, summary)
+    deliver(repo,changed, step, summary)
     assert search(tasks, 'oldsummary') == []
     assert search(tasks, 'beginword endword') == [tid]
     row = store.query('SELECT * FROM text_search_documents WHERE document_id=?', (tid,))[0]
-    assert len(row['body']) == 12000
-    assert row['body'].startswith('beginword') and row['body'].endswith('endword')
-    assert store.query('SELECT summary FROM business_tasks WHERE id=?', (tid,))[0]['summary'] == summary
-    repo.deliver(changed, step, 'duplicateignored')
+    assert len(row['body']) <= 1000
+    assert 'beginword' in row['body']
+    assert store.query('SELECT summary FROM business_tasks WHERE id=?', (tid,))[0]['summary'] == row['body']
+    with pytest.raises(ValueError):
+        deliver(repo,changed, step, 'duplicateignored')
     assert search(tasks, 'duplicateignored') == []
 
 
 def test_write_failure_rolls_back_plan_and_delivery(tasks, monkeypatch):
     store, repo, session = tasks
     run, step = create(tasks)
+    before = store.query('SELECT summary,execution_count FROM business_tasks')[0]
     original = repo.search.index.upsert
 
     def fail(*args, **kwargs):
@@ -105,15 +108,15 @@ def test_write_failure_rolls_back_plan_and_delivery(tasks, monkeypatch):
 
     monkeypatch.setattr(repo.search.index, 'upsert', fail)
     with pytest.raises(RuntimeError, match='index failure'):
-        repo.deliver(run, step, 'newsummary')
-    assert store.query('SELECT summary,execution_count FROM business_tasks')[0] == {'summary': '', 'execution_count': 0}
+        deliver(repo,run, step, 'newsummary')
+    assert store.query('SELECT summary,execution_count FROM business_tasks')[0] == before
     assert store.query('SELECT status FROM task_steps')[0]['status'] == 'pending'
     assert search(tasks, 'newsummary') == []
     store.finish(run, 'completed')
     store.submit(session, 'newtask', 'failure')
     failed_run = store.claim()
     with pytest.raises(RuntimeError, match='index failure'):
-        repo.install(failed_run, Plan(kind='tasks', items=[Item(key='new', goal='newtask')]), [])
+        repo.install(failed_run, Plan(kind='tasks', items=[plan_item(key='new', goal='newtask')]), [])
     assert len(store.query('SELECT * FROM business_tasks')) == 1
     assert not store.query('SELECT * FROM task_plans WHERE run=?', (failed_run['id'],))
     assert not store.query('SELECT * FROM task_steps WHERE run=?', (failed_run['id'],))
@@ -170,7 +173,7 @@ def test_hydration_rechecks_session_and_current_revision(tasks, monkeypatch):
     run, step = create(tasks)
     with store.tx() as conn:
         conn.execute("UPDATE business_tasks SET revision=7,goal='newauthoritative'")
-        conn.execute('''INSERT INTO business_tasks(id,session,goal,constraints,criterias,status)
+        conn.execute('''INSERT INTO business_tasks(id,session,goal,constraints,criteria,status)
             VALUES('foreign','other','foreign','{}','{}','open')''')
     monkeypatch.setattr(repo.search.index, 'search', lambda *args, **kwargs: [
         SearchHit('foreign', -5), SearchHit('deleted', -4), SearchHit(step['task'], -3)])

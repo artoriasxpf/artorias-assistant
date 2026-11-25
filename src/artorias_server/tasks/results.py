@@ -2,7 +2,7 @@
 from langchain_core.tools import tool
 
 
-def result_tool(store, session_id, task_id):
+def result_tool(store, session_id, task_id, consumer_run=None, consumer_key=None):
     @tool
     def task_result_read(run_id: str, step_key: str, offset: int = 0, limit: int = 4000) -> dict:
         """Read a delivered result_ref from this Task or its direct source in this
@@ -11,12 +11,17 @@ def result_tool(store, session_id, task_id):
         """
         if offset < 0 or not 1 <= limit <= 8000:
             raise ValueError('Invalid result page')
+        import json
+        consumers=store.query('SELECT scope FROM task_steps WHERE task=? AND run=? AND key=?',(task_id,consumer_run,consumer_key))
+        scope=json.loads(consumers[0]['scope']) if consumers else {}
+        declared=scope.get('depends_on',[])+[w['step_key'] for w in scope.get('step_spec',{}).get('wait_for',[])]
+        dependency=consumer_run==run_id and step_key in declared
         rows = store.query(
             "SELECT s.result FROM task_steps s JOIN business_tasks t ON t.id=s.task "
             "JOIN business_tasks current ON current.id=? AND current.session=t.session "
-            "WHERE t.session=? AND (t.id=current.id OR t.id=current.source_task) "
+            "WHERE t.session=? AND (t.id=current.id OR t.id=current.source_task OR ?) "
             "AND s.run=? AND s.key=? AND s.status='delivered'",
-            (task_id, session_id, run_id, step_key),
+            (task_id, session_id, dependency, run_id, step_key),
         )
         if not rows:
             raise ValueError('Result not available in this Task or its direct source')

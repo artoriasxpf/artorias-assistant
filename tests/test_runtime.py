@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, finish_message, deliver
 from artorias_device.storage.journal import SQLiteWorkspaceJournal
 import asyncio
 import json
@@ -72,10 +73,10 @@ def test_followup_saves_previous_delivery_without_reopening_files(tmp_path, monk
     store.submit(sid,'扫描原目录','scan')
     scan=store.claim()
     repo=TaskRepository(store)
-    repo.install(scan,Plan(kind='tasks',items=[Item(key='scan',goal='扫描原目录')]),[])
+    repo.install(scan,Plan(kind='tasks',items=[plan_item(key='scan',goal='扫描原目录')]),[])
     source=store.query('SELECT * FROM task_steps')[0]
     summary='原始报告：只保留这份已经交付的摘要。'
-    repo.deliver(scan,source,summary)
+    deliver(repo,scan,source,summary)
     store.finish(scan,'completed',summary)
     store.submit(sid,'把上面的摘要保存到原目录','save')
     save=store.claim()
@@ -87,15 +88,15 @@ def test_followup_saves_previous_delivery_without_reopening_files(tmp_path, monk
 
     model=FollowupModel(disable_streaming=True,messages=iter([
         AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'summary.md','content':summary},'id':'write'}]),
-        AIMessage(content='已保存摘要'),
+        finish_message('已保存摘要'),
     ]))
     async def planner(_):
-        return Plan(kind='tasks',items=[Item(key='save',goal='保存已有摘要',relation='followup',task_id=source['task'])])
+        return Plan(kind='tasks',items=[plan_item(key='save',goal='保存已有摘要',relation='followup',task_id=source['task'])])
 
     runtime=TaskRuntime(tmp_path,store,engine=DeepAgentRuntime(tmp_path,store,model_factory=lambda:model),planner=planner)
     asyncio.run(Scheduler(store,runtime).execute(save))
     calls=[json.loads(event['payload'])['name'] for event in store.events(sid,0) if event['kind']=='tool.call']
-    assert calls==['project_write']
+    assert calls==['project_write','finish_step']
     assert create_workspace(store,sid,save['id']).read('summary.md')==summary
 
 

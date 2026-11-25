@@ -17,14 +17,14 @@ class SQLiteWorkspaceJournal:
             for statement in (
                 'CREATE TABLE IF NOT EXISTS workspace_bindings(session TEXT PRIMARY KEY, root TEXT NOT NULL)',
                 '''CREATE TABLE IF NOT EXISTS workspace_operations(
-                    id TEXT PRIMARY KEY, root TEXT, session TEXT, run TEXT, path TEXT,
+                    id TEXT PRIMARY KEY, session TEXT, run TEXT, root TEXT, path TEXT,
                     before_hash TEXT, after_hash TEXT, before_mode INTEGER, after_mode INTEGER,
                     reverts TEXT, kind TEXT, status TEXT)''',
                 'CREATE TABLE IF NOT EXISTS changes(id TEXT PRIMARY KEY, session TEXT, run TEXT, path TEXT, before_hash TEXT, after_hash TEXT, reverts TEXT)',
                 'CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT, run TEXT, kind TEXT, payload TEXT)',
                 '''CREATE TABLE IF NOT EXISTS resource_changes(change_id TEXT PRIMARY KEY,
-                    backend TEXT NOT NULL, location_id TEXT NOT NULL, root TEXT NOT NULL,
-                    blob_root TEXT NOT NULL, task_id TEXT, workspace_id TEXT)''',
+                    task_id TEXT, workspace_id TEXT, location_id TEXT NOT NULL, backend TEXT NOT NULL,
+                    root TEXT NOT NULL, blob_root TEXT NOT NULL)''',
             ):
                 c.execute(statement)
             # Only this adapter's ordinary tables. Never inspect/alter FTS internals.

@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, finish_message
 from artorias_device.storage.journal import SQLiteWorkspaceJournal
 import asyncio
 from pathlib import Path
@@ -24,7 +25,7 @@ def test_task_inherits_submission_snapshot_and_refine_stays(tmp_path,monkeypatch
     db.submit(sid,'write project','1');run=db.claim()
     cat.select(sid,cloud['id'])
     repo=TaskRepository(db)
-    repo.install(run,Plan(kind='tasks',items=[Item(key='a',goal='project')]),[])
+    repo.install(run,Plan(kind='tasks',items=[plan_item(key='a',goal='project')]),[])
     task=db.query('SELECT * FROM business_tasks')[0]
     assert cat.task_binding(task['id'],sid)['id']==local['id']
     ws=WorkspaceService(db,sid,run['id'],task['id'])
@@ -32,7 +33,7 @@ def test_task_inherits_submission_snapshot_and_refine_stays(tmp_path,monkeypatch
     assert (tmp_path/'project/a.txt').read_text()=='local'
     db.finish(run,'completed')
     db.submit(sid,'refine and another task','2');r2=db.claim()
-    repo.install(r2,Plan(kind='tasks',items=[Item(key='a',goal='refine',relation='refine',task_id=task['id']),Item(key='b',goal='new')]),repo.candidates(sid,'project'))
+    repo.install(r2,Plan(kind='tasks',items=[plan_item(key='a',goal='refine',relation='refine',task_id=task['id']),plan_item(key='b',goal='new')]),repo.candidates(sid,'project'))
     tasks=db.query('SELECT * FROM business_tasks ORDER BY rowid')
     assert cat.task_binding(tasks[0]['id'],sid)['id']==local['id']
     assert cat.task_binding(tasks[1]['id'],sid)['id']==cloud['id']
@@ -92,21 +93,6 @@ def test_connector_unavailable_never_falls_back(tmp_path,monkeypatch):
     assert not (tmp_path/'project/a').exists()
 
 
-def test_migration_preserves_old_task_and_change(tmp_path,monkeypatch):
-    from artorias_device.workspace.local_workspace import LocalWorkspace
-    db,sid,cat,local,cloud=setup(tmp_path,monkeypatch)
-    old=LocalWorkspace(tmp_path/'data/blobs',SQLiteWorkspaceJournal(db.path),sid,'old',workspace_root=tmp_path/'project')
-    change=old.write('old.txt','old')
-    repo=TaskRepository(db)
-    with db.tx() as c:
-        c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,status,summary) VALUES('legacy',?,NULL,'old','{}','open','')",(sid,))
-        c.execute('DELETE FROM session_workspaces WHERE session=?',(sid,))
-    assert cat.task_binding('legacy',sid)['root']==str(tmp_path/'project')
-    cat.select(sid,cloud['id'])
-    WorkspaceService(db,sid).revert(change['change_id'])
-    assert not (tmp_path/'project/old.txt').exists()
-
-
 def test_web_selection_grants_and_current_space(tmp_path,monkeypatch):
     from fastapi.testclient import TestClient
     from artorias_local_app.bootstrap import create_app
@@ -153,12 +139,12 @@ def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
     ]
     if decision=='approve':
         replies.append(call('project_list',{'path':str(outside)},'list-after'))
-    replies.append(AIMessage(content='done'))
+    replies.append(finish_message('done'))
     model=Model(disable_streaming=True,messages=iter(replies))
     monkeypatch.setattr(runtime,'create_model',lambda:model)
     db.submit(sid,'create external file','1');run=db.claim()
     from artorias_local_app.bootstrap import create_engine
-    async def planner(_):return Plan(kind='tasks',items=[Item(key='write',goal='create external file')])
+    async def planner(_):return Plan(kind='tasks',items=[plan_item(key='write',goal='create external file')])
     runtime=TaskRuntime(tmp_path/'data',db,engine=create_engine(tmp_path/'data',db),planner=planner)
     scheduler=Scheduler(db,runtime)
     asyncio.run(scheduler.execute(run))

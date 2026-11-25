@@ -42,9 +42,27 @@ class DeepAgentRuntime:
                 +json.dumps(run['task_context'],ensure_ascii=False)})
         messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；无权限先 project_authorize，拒绝后不得重试同一授权。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
         tools=list(self.tool_factory(ws,emit))
+        finished = []
         if run.get('task_id'):
             from artorias_server.tasks.results import result_tool
-            tools.append(result_tool(self.store,run['session'],run['task_id']))
+            tools.append(result_tool(self.store,run['session'],run['task_id'],run['id'],run['task_step_id']))
+            from langchain_core.tools import tool
+            from artorias_server.tasks.models import FinishStep
+            from artorias_server.tasks.verification import resolve
+
+            @tool(args_schema=FinishStep, return_direct=True)
+            def finish_step(**kwargs):
+                """Submit this step's final answer and evidence. Use response to cite final_text."""
+                submission=FinishStep.model_validate(kwargs)
+                step=self.store.query('SELECT * FROM task_steps WHERE run=? AND key=?',
+                                      (run['id'],run['task_step_id']))[0]
+                resolve(self.store,run,step,submission)
+                finished.append(submission)
+                return submission.final_text
+
+            tools.append(finish_step)
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text 和证据；当前答复引用名为 response。'
+
         thread_id=run.get('thread_id',run['id'])
         async with self.checkpoint_provider.open() as saver:
             internal_files=FilesystemMiddleware(
@@ -123,6 +141,11 @@ class DeepAgentRuntime:
                 for m in reversed(result.get('messages',[])):
                     if getattr(m,'type',None)=='ai' and not getattr(m,'tool_calls',[]):
                         text=text_content(m.content);break
+            if run.get('task_id'):
+                if len(finished)!=1:
+                    raise ValueError('Task execution requires one valid finish_step')
+                yield 'step.submitted',finished[0].model_dump()
+                text=finished[0].final_text
             yield 'assistant.final',{'text':text}
 
 def text_content(content):

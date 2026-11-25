@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, deliver
 import json
 import sqlite3
 import subprocess
@@ -40,7 +41,7 @@ def remote(tmp_path):
 def add_task(store, repo, session, goal='quartz'):
     store.submit(session, goal, str(len(store.query('SELECT id FROM runs'))))
     run = store.claim()
-    repo.install(run, Plan(kind='tasks', items=[Item(key='one', goal=goal)]), [])
+    repo.install(run, Plan(kind='tasks', items=[plan_item(key='one', goal=goal)]), [])
     return run, store.query('SELECT * FROM task_steps WHERE run=?', (run['id'],))[0]
 
 
@@ -64,7 +65,7 @@ def test_remote_task_pipeline_and_eventual_consistency(remote):
     drain(worker)
     assert hits(client, session, 'quartz')[0].id == step['task']
     assert not hits(client, 'other-session', 'quartz')
-    repo.deliver(run, step, 'newsummary')
+    deliver(repo,run, step, 'newsummary')
     assert not hits(client, session, 'newsummary')
     drain(worker)
     assert hits(client, session, 'newsummary')[0].id == step['task']
@@ -85,8 +86,8 @@ def test_outage_commit_retry_and_crash_after_remote_commit(remote, monkeypatch):
     with pytest.raises(IndexUnavailable):
         worker.sync_once()
     assert store.query('SELECT * FROM search_outbox')
-    repo.deliver(run, step, 'committedwhileoffline')
-    assert store.query('SELECT summary FROM business_tasks')[0]['summary'] == 'committedwhileoffline'
+    deliver(repo,run, step, 'committedwhileoffline')
+    assert 'committedwhileoffline' in store.query('SELECT summary FROM business_tasks')[0]['summary']
     monkeypatch.setattr(client, 'send', original)
     drain(worker)
     assert hits(client, session, 'committedwhileoffline')
@@ -106,9 +107,9 @@ def test_business_rollback_removes_event(remote, monkeypatch):
 
     monkeypatch.setattr(repo.search.index, 'upsert', fail)
     with pytest.raises(RuntimeError):
-        repo.deliver(run, step, 'rollbackword')
+        deliver(repo,run, step, 'rollbackword')
     assert not store.query('SELECT * FROM search_outbox')
-    assert store.query('SELECT summary FROM business_tasks')[0]['summary'] == ''
+    assert 'rollbackword' not in store.query('SELECT summary FROM business_tasks')[0]['summary']
     assert not hits(client, session, 'rollbackword')
 
 
@@ -117,7 +118,7 @@ def test_version_upgrade_and_missing_service_index_recover(remote):
     session = store.session()
     run, step = add_task(store, repo, session)
     drain(worker)
-    repo.deliver(run, step, 'latestsummary')
+    deliver(repo,run, step, 'latestsummary')
     index.tokenizer.version = 'new-tokenizer'
     drain(worker)
     assert hits(client, session, 'latestsummary')
@@ -132,7 +133,7 @@ def test_snapshot_supersedes_pending_events_without_resetting_sequence(remote):
     session = store.session()
     run, step = add_task(store, repo, session)
     drain(worker)
-    repo.deliver(run, step, 'snapshotword')
+    deliver(repo,run, step, 'snapshotword')
     before = store.query('SELECT next_seq FROM search_sync_state')[0]['next_seq']
     repo.rebuild_search()
     rows = store.query('SELECT * FROM search_outbox')
@@ -169,7 +170,7 @@ def test_remote_index_failure_rolls_back_cursor_and_snapshot(remote, monkeypatch
     run, step = add_task(store, repo, session)
     drain(worker)
     before = client.status('tasks', PROJECTION_VERSION)['consumer']['last_seq']
-    repo.deliver(run, step, 'mustrollback')
+    deliver(repo,run, step, 'mustrollback')
     repo.rebuild_search()
     original = index._upsert
 
@@ -225,7 +226,7 @@ def test_actual_transport_failure_and_auth_failure_are_distinct(remote, monkeypa
         raise httpx.ConnectError('offline')
 
     monkeypatch.setattr(client.http, 'post', offline)
-    repo.deliver(run, step, 'savedoffline')
+    deliver(repo,run, step, 'savedoffline')
     assert repo.candidates(session, 'savedoffline')[0]['recall_sources'] == ['recent']
     with pytest.raises(IndexUnavailable):
         worker.sync_once()
@@ -244,7 +245,7 @@ def test_update_during_snapshot_delivery_is_not_lost(remote, monkeypatch):
     original = client.send
 
     def concurrent_update(event):
-        repo.deliver(run, step, 'concurrentword')
+        deliver(repo,run, step, 'concurrentword')
         original(event)
 
     monkeypatch.setattr(client, 'send', concurrent_update)

@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, submission
 """Event emission coverage for the session event table.
 
 Covers the events added to close the gaps in docs/event_catalog.md and the
@@ -101,13 +102,14 @@ def test_task_resumed_after_approval(tmp_path):
     """审批后恢复执行的任务步骤发出 task.resumed，而不是重复 task.started。"""
     db, r = setup_task(tmp_path)
     async def planner(payload):
-        return Plan(kind='tasks', items=[Item(key='a', goal='框架')])
+        return Plan(kind='tasks', items=[plan_item(key='a', goal='框架')])
     class Engine:
         async def execute(self, run):
             if not run.get('decision'):
                 yield 'approval.requested', {'requests': []}
                 return
-            yield 'assistant.final', {'text': '完成'}
+            yield 'step.submitted', submission('完成').model_dump()
+            yield 'assistant.final', {'text':'完成'}
     runtime = TaskRuntime(tmp_path, db, Engine(), planner)
     async def collect(run):
         return [e async for e in runtime.execute(run)]
@@ -123,17 +125,18 @@ def test_task_revised_event(tmp_path):
     """持久化需求补丁生效后发出 task.revised，携带基础/生效版本。"""
     db, r = setup_task(tmp_path)
     repo = TaskRepository(db)
-    repo.install(r, Plan(kind='tasks', items=[Item(key='a', goal='报告', constraints=['英语'])]), [])
+    repo.install(r, Plan(kind='tasks', items=[plan_item(key='a', goal='报告', constraints=['英语'])]), [])
     task = db.query('SELECT * FROM business_tasks')[0]
     db.finish(r, 'completed', '初稿')
     db.submit(r['session'], '改为中文', 'two'); r2 = db.claim()
     async def planner(payload):
-        return Plan(kind='tasks', items=[Item(key='b', goal='更新报告', relation='refine', task_id=task['id'],
-            task_patch=RequirementPatch(scope='persistent', expected_revision=0, operations=[
-                RequirementOperation(op='replace', field='constraints', id='constraint_1', value='中文', evidence='改为中文')]))])
+        return Plan(kind='tasks', items=[plan_item(key='b', goal='更新报告', relation='refine', task_id=task['id'],
+            task_patch=RequirementPatch( expected_revision=0, operations=[
+                RequirementOperation(op='replace', field='constraints', id='K1', value='中文', evidence='改为中文')]))])
     class Engine:
         async def execute(self, run):
-            yield 'assistant.final', {'text': '已更新'}
+            yield 'step.submitted', submission('已更新').model_dump()
+            yield 'assistant.final', {'text':'已更新'}
     runtime = TaskRuntime(tmp_path, db, Engine(), planner)
     async def collect():
         return [e async for e in runtime.execute(r2)]
@@ -147,7 +150,7 @@ def test_task_failed_and_interrupted_events(tmp_path):
     """步骤失败/中断分别发出 task.failed / task.interrupted 并保持步骤状态。"""
     db, r = setup_task(tmp_path)
     async def planner(payload):
-        return Plan(kind='tasks', items=[Item(key='a', goal='框架'), Item(key='b', goal='说明')])
+        return Plan(kind='tasks', items=[plan_item(key='a', goal='框架'), plan_item(key='b', goal='说明')])
     state = {'n': 0}
     class Engine:
         async def execute(self, run):
