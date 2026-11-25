@@ -5,7 +5,8 @@ from artorias_shared.ids import uid
 from artorias_server.integrations.search.tasks.indexing import TaskSearch
 from .requirements import requirements_for, initial_requirements, apply_patch
 from .models import Plan
-from artorias_server.storage.migrations import ensure_task_fields
+from pathlib import Path
+from .memory import refresh, deliver_result
 
 class TaskRepository:
     def __init__(self, store, *, text_index=None):
@@ -13,15 +14,8 @@ class TaskRepository:
         from artorias_server.workspace.catalog import WorkspaceCatalog
         self.workspaces = WorkspaceCatalog(store)
         with store.tx() as c:
-            c.executescript('''
-CREATE TABLE IF NOT EXISTS business_tasks(id TEXT PRIMARY KEY, session TEXT NOT NULL, source_task TEXT, goal TEXT NOT NULL, constraints TEXT NOT NULL, criterias TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL, summary TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS task_plans(run TEXT PRIMARY KEY, plan TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS task_steps(run TEXT, key TEXT, task TEXT, scope TEXT NOT NULL, status TEXT NOT NULL, result TEXT NOT NULL DEFAULT '', PRIMARY KEY(run,key));
-CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT NULL, PRIMARY KEY(run,key));
-''')
-            # executescript commits before running DDL; keep the data migration atomic.
-            c.execute('BEGIN IMMEDIATE')
-            ensure_task_fields(c)
+            schema = Path(__file__).parents[1] / 'storage' / 'task_schema.sql'
+            c.executescript(schema.read_text())
         self.search = TaskSearch(store, text_index)
         try:
             self.search.prepare()
@@ -44,7 +38,7 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
             raise ValueError('Invalid task count/keys')
         ordered, remaining = [], list(plan.items)
         while remaining:
-            ready = [i for i in remaining if set(i.depends_on)<=set(x.key for x in ordered)]
+            ready = [i for i in remaining if (set(i.depends_on) | {w.step_key for w in i.step_spec.wait_for})<=set(x.key for x in ordered)]
             if not ready: raise ValueError('Invalid or cyclic dependencies')
             ordered.extend(ready)
             remaining = [i for i in remaining if i not in ready]
@@ -63,9 +57,13 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
             if item.relation in ('continue','refine'):
                 self.workspaces.task_binding(item.task_id,run['session'])
         with self.store.tx() as c:
+            saved = c.execute('SELECT plan FROM task_plans WHERE run=?',(run['id'],)).fetchone()
+            if saved:
+                return Plan.model_validate_json(saved[0])
             source = c.execute("SELECT id FROM messages WHERE run=? AND role='user' ORDER BY rowid LIMIT 1", (run['id'],)).fetchone()
             if not source: raise ValueError('Missing source message')
             c.execute('INSERT INTO task_plans(run,plan) VALUES(?,?)',(run['id'],plan.model_dump_json()))
+            plan_aliases = {}
             for item in ordered:
                 reused = item.relation in ('continue', 'refine')
                 tid = item.task_id if reused else uid()
@@ -81,46 +79,53 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
                     baseline = initial_requirements(item)
                     revision = 0
                 patch = item.task_patch
-                if patch.operations and patch.expected_revision != revision:
+                if reused and patch.expected_revision != revision:
                     raise ValueError('Task patch revision conflict')
-                effective = apply_patch(baseline, patch, run['input'])
-                permanent = effective if patch.scope == 'persistent' else baseline
-                goal, constraints, criterias = (
+                effective, aliases = apply_patch(baseline, patch, run['input'])
+                plan_aliases[item.key] = aliases
+                permanent = effective
+                spec = item.step_spec
+                for wait in spec.wait_for:
+                    wait.criterion_ref = plan_aliases[wait.step_key].get(wait.criterion_ref, wait.criterion_ref)
+                spec.criterion_refs = [aliases.get(k,k) for k in spec.criterion_refs]
+                if set(spec.criterion_refs) - effective['criteria'].keys() or spec.local_reviews.keys() & effective['criteria'].keys():
+                    raise ValueError('Unknown or ambiguous criterion reference')
+                goal, constraints, criteria = (
                     permanent['goal'], json.dumps(permanent['constraints'],ensure_ascii=False),
                     json.dumps(permanent['criteria'],ensure_ascii=False),
                 )
-                applied = revision + int(bool(patch.operations) and patch.scope == 'persistent')
+                applied = revision + int(effective != baseline)
                 if reused:
                     if applied != revision:
-                        changed = c.execute("UPDATE business_tasks SET status='open',goal=?,constraints=?,criterias=?,revision=? WHERE id=? AND revision=?",
-                            (goal,constraints,criterias,applied,tid,revision))
+                        changed = c.execute("UPDATE business_tasks SET status='open',goal=?,constraints=?,criteria=?,revision=? WHERE id=? AND revision=?",
+                            (goal,constraints,criteria,applied,tid,revision))
                         if changed.rowcount != 1: raise ValueError('Task revision conflict')
                 else:
-                    c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,criterias,status,revision) VALUES(?,?,?,?,?,?,'open',?)",
-                        (tid,run['session'],item.task_id,goal,constraints,criterias,applied))
+                    c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,criteria,status,revision) VALUES(?,?,?,?,?,?,'open',?)",
+                        (tid,run['session'],item.task_id,goal,constraints,criteria,applied))
                     c.execute('INSERT INTO task_workspaces(task,workspace_id) VALUES(?,?)',(tid,default['id']))
                 if not reused or applied != revision:
-                    self.search.update(c, tid)
+                    from .reviews import supersede
+                    supersede(c, tid, effective["criteria"])
+                    refresh(c, tid, self.search)
                 c.execute("INSERT INTO task_steps(run,key,task,scope,status,result,source_message_id,base_revision,applied_revision,task_patch,effective_requirements,baseline_requirements) VALUES(?,?,?,?,'pending','',?,?,?,?,?,?)",
                     (run['id'],item.key,tid,item.model_dump_json(),source[0],revision,applied,patch.model_dump_json(),json.dumps(effective,ensure_ascii=False),json.dumps(baseline,ensure_ascii=False)))
+                for wait in spec.wait_for:
+                    producer = c.execute('SELECT scope,effective_requirements FROM task_steps WHERE run=? AND key=?',
+                                         (run['id'],wait.step_key)).fetchone()
+                    rules = json.loads(producer['effective_requirements'])['criteria']
+                    local = json.loads(producer['scope'])['step_spec']['local_reviews']
+                    if wait.criterion_ref not in rules and wait.criterion_ref not in local:
+                        raise ValueError('Unknown dependency criterion')
+                    policy = (local.get(wait.criterion_ref) or rules[wait.criterion_ref])["verification"]
+                    if policy["method"] != "user":
+                        raise ValueError("A gated dependency requires explicit user confirmation")
+                    version = rules.get(wait.criterion_ref,{}).get('v',1)
+                    c.execute("INSERT INTO task_step_waits(run,consumer,producer,criterion_id,criterion_version,artifact_role,state) VALUES(?,?,?,?,?,?,'pending')",
+                              (run['id'],item.key,wait.step_key,wait.criterion_ref,version,wait.artifact_role))
+            c.execute('UPDATE task_plans SET plan=? WHERE run=?',(plan.model_dump_json(),run['id']))
         return plan
 
-    def deliver(self, run, step, final):
+    def deliver(self, run, step, result, evidence, verdicts):
         with self.store.tx() as c:
-            current = c.execute('SELECT status FROM task_steps WHERE run=? AND key=?', (run['id'], step['key'])).fetchone()
-            if current['status'] == 'delivered': return
-            row = c.execute('SELECT * FROM business_tasks WHERE id=?', (step['task'],)).fetchone()
-            progress = json.loads(row['progress'])
-            c.execute("UPDATE task_steps SET status='delivered',result=? WHERE run=? AND key=?",(final,run['id'],step['key']))
-            delivered_at = c.execute('SELECT updated_at FROM task_steps WHERE run=? AND key=?',
-                                     (run['id'],step['key'])).fetchone()[0]
-            progress.append({
-                'run_id': run['id'], 'step_key': step['key'],
-                'source_message_id': step['source_message_id'], 'status': 'delivered',
-                'delivered_at': delivered_at, 'result_ref': {'run': run['id'], 'key': step['key']},
-            })
-            status = 'needs_review' if row['revision'] == step['applied_revision'] else row['status']
-            c.execute('UPDATE business_tasks SET status=?,summary=?,progress=?,execution_count=execution_count+1 WHERE id=?',
-                (status,final,json.dumps(progress[-20:],ensure_ascii=False),step['task']))
-            self.search.update(c, step['task'])
-            c.execute('DELETE FROM decisions WHERE run=?',(run['id'],))
+            return deliver_result(c, self.search, run, step, result, evidence, verdicts)

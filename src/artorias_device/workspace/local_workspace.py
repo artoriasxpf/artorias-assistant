@@ -10,6 +10,7 @@ from pathlib import Path
 
 from artorias_shared.ids import uid
 from .blobs import FilesystemBlobStore
+from .moves import move_file, operation_paths, recover_move
 from artorias_shared.workspace import BlobRef, WorkspaceJournal, UNSET_VERSION
 
 _UNSET = UNSET_VERSION
@@ -216,6 +217,9 @@ class LocalWorkspace:
     def _recover(self):
         # Reconcile evidence; never blindly replay an uncertain filesystem action.
         for op in self.journal.pending(str(self.root)):
+            if op.get('move_data'):
+                recover_move(self, op)
+                continue
             data, mode = self._snapshot(op['path'])
             h = digest(data)
             if h == op['after_hash'] and mode == op['after_mode']:
@@ -236,7 +240,7 @@ class LocalWorkspace:
                     if previous['path'] != path or previous['after_hash'] != digest(data) or (expected is not _UNSET and previous['before_hash'] != expected):
                         raise ValueError('幂等操作参数不一致')
                     return {'change_id':previous['id'], 'path':path, 'version':previous['after_hash']}
-            if any(Path(op['root'])/op['path'] == self.root/path for op in self.journal.pending()):
+            if any(self.root/path in operation_paths(op) for op in self.journal.pending()):
                 raise ValueError('存在未解决的中断操作；请核对备份和磁盘文件后再操作')
             before, before_mode = self._snapshot(path)
             if expected is not _UNSET and digest(before) != expected:
@@ -282,9 +286,15 @@ class LocalWorkspace:
         data = self.read_bytes(path)
         return self._mutate(path, None, expected=digest(data), kind='file.deleted')['change_id']
 
+    def move_to(self, source, destination_workspace, destination, *, expected_version=None, reverts=None):
+        return move_file(self, source, destination_workspace, destination,
+                         expected_version=expected_version, reverts=reverts)
+
     def revert(self, cid):
         old = self.journal.committed(cid, self.session, str(self.root))
         if not old:
             raise ValueError('变更不存在或属于旧 Blob 工作空间；旧版本请单独导出')
+        if old.get('move_data'):
+            raise ValueError('移动撤销需要通过工作空间路由验证两端权限')
         return self._mutate(old['path'], self._blob(old['before_hash']), expected=old['after_hash'],
                             reverts=cid, mode=old['before_mode'], kind='file.reverted')['change_id']

@@ -6,6 +6,7 @@ from .budget import RequestBudget
 from .model_activity import ModelActivity
 from .checkpoints import SQLiteCheckpointProvider
 from .tool_errors import ToolErrorBoundary
+from .step_repair import repair_submission
 from artorias_server.workspace.factory import WorkspaceFactory
 from artorias_server.tools.registry import build_tools
 
@@ -42,9 +43,31 @@ class DeepAgentRuntime:
                 +json.dumps(run['task_context'],ensure_ascii=False)})
         messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；无权限先 project_authorize，拒绝后不得重试同一授权。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
         tools=list(self.tool_factory(ws,emit))
+        finished = []
         if run.get('task_id'):
             from artorias_server.tasks.results import result_tool
-            tools.append(result_tool(self.store,run['session'],run['task_id']))
+            tools.append(result_tool(self.store,run['session'],run['task_id'],run['id'],run['task_step_id']))
+            from langchain_core.tools import tool
+            from artorias_server.tasks.models import FinishStep
+            from artorias_server.tasks.verification import resolve
+
+            def validate_submission(args):
+                submission=FinishStep.model_validate(args)
+                step=self.store.query('SELECT * FROM task_steps WHERE run=? AND key=?',
+                                      (run['id'],run['task_step_id']))[0]
+                resolve(self.store,run,step,submission)
+                return submission
+
+            @tool(args_schema=FinishStep, return_direct=True)
+            def finish_step(**kwargs):
+                """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional."""
+                submission = validate_submission(kwargs)
+                finished.append(submission)
+                return submission.final_text
+
+            tools.append(finish_step)
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对 criterion_refs 指定的标准和必选 local_reviews 填写 id、claim 和自然语言 reason。未指定 criterion_refs 时填写快照中全部必选标准。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
+
         thread_id=run.get('thread_id',run['id'])
         async with self.checkpoint_provider.open() as saver:
             internal_files=FilesystemMiddleware(
@@ -62,6 +85,7 @@ class DeepAgentRuntime:
                 system_prompt=(
                     '你是 Artorias 个人助理。先用 project_tree 小范围浏览；truncated 为真时缩小目录或分层查看。'
                     '只有需要完整的单层列表时才用 project_list。用 project_read 分页读取，用 project_write 或 project_edit 修改。'
+                    '用 project_move 移动或改名本机文件，提供完整目标文件路径；改名无需读取正文。'
                     '分析多个文件或长文件时，每批最多调用 3 次 project_read，每次 limit 不超过 2000。'
                     '每批返回后先分析本批，在简短的中间回复里记下要点和来源路径、页范围，再发起下一批读取。'
                     '需要续读时使用该文件上一页的 next_offset 和 version 作为 offset 和 expected_version。'
@@ -74,7 +98,7 @@ class DeepAgentRuntime:
             )
             result=None
             from langgraph.types import Command
-            config={'configurable':{'thread_id':thread_id},'recursion_limit':50}
+            config={'configurable':{'thread_id':thread_id},'recursion_limit':200}
             payload=Command(resume=run['decision']) if run.get('decision') else {'messages':messages}
             seen_calls=set()
             seen_results=set()
@@ -123,6 +147,21 @@ class DeepAgentRuntime:
                 for m in reversed(result.get('messages',[])):
                     if getattr(m,'type',None)=='ai' and not getattr(m,'tool_calls',[]):
                         text=text_content(m.content);break
+            if run.get('task_id'):
+                if len(finished) == 1:
+                    submission = finished[0]
+                else:
+                    history = state.values.get('messages', [])
+                    problem = '需要单独提交一次有效的 finish_step'
+                    for message in reversed(history):
+                        if message.type == 'tool' and message.name == 'finish_step' and message.status == 'error':
+                            problem = str(message.content)[:1500]
+                            break
+                    submission = await repair_submission(
+                        model, finish_step, validate_submission, history, emit, problem,
+                    )
+                yield 'step.submitted',submission.model_dump()
+                text=submission.final_text
             yield 'assistant.final',{'text':text}
 
 def text_content(content):

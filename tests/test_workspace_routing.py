@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, finish_message
 from artorias_device.storage.journal import SQLiteWorkspaceJournal
 import asyncio
 from pathlib import Path
@@ -24,7 +25,7 @@ def test_task_inherits_submission_snapshot_and_refine_stays(tmp_path,monkeypatch
     db.submit(sid,'write project','1');run=db.claim()
     cat.select(sid,cloud['id'])
     repo=TaskRepository(db)
-    repo.install(run,Plan(kind='tasks',items=[Item(key='a',goal='project')]),[])
+    repo.install(run,Plan(kind='tasks',items=[plan_item(key='a',goal='project')]),[])
     task=db.query('SELECT * FROM business_tasks')[0]
     assert cat.task_binding(task['id'],sid)['id']==local['id']
     ws=WorkspaceService(db,sid,run['id'],task['id'])
@@ -32,7 +33,7 @@ def test_task_inherits_submission_snapshot_and_refine_stays(tmp_path,monkeypatch
     assert (tmp_path/'project/a.txt').read_text()=='local'
     db.finish(run,'completed')
     db.submit(sid,'refine and another task','2');r2=db.claim()
-    repo.install(r2,Plan(kind='tasks',items=[Item(key='a',goal='refine',relation='refine',task_id=task['id']),Item(key='b',goal='new')]),repo.candidates(sid,'project'))
+    repo.install(r2,Plan(kind='tasks',items=[plan_item(key='a',goal='refine',relation='refine',task_id=task['id']),plan_item(key='b',goal='new')]),repo.candidates(sid,'project'))
     tasks=db.query('SELECT * FROM business_tasks ORDER BY rowid')
     assert cat.task_binding(tasks[0]['id'],sid)['id']==local['id']
     assert cat.task_binding(tasks[1]['id'],sid)['id']==cloud['id']
@@ -92,19 +93,110 @@ def test_connector_unavailable_never_falls_back(tmp_path,monkeypatch):
     assert not (tmp_path/'project/a').exists()
 
 
-def test_migration_preserves_old_task_and_change(tmp_path,monkeypatch):
-    from artorias_device.workspace.local_workspace import LocalWorkspace
-    db,sid,cat,local,cloud=setup(tmp_path,monkeypatch)
-    old=LocalWorkspace(tmp_path/'data/blobs',SQLiteWorkspaceJournal(db.path),sid,'old',workspace_root=tmp_path/'project')
-    change=old.write('old.txt','old')
-    repo=TaskRepository(db)
-    with db.tx() as c:
-        c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,status,summary) VALUES('legacy',?,NULL,'old','{}','open','')",(sid,))
-        c.execute('DELETE FROM session_workspaces WHERE session=?',(sid,))
-    assert cat.task_binding('legacy',sid)['root']==str(tmp_path/'project')
-    cat.select(sid,cloud['id'])
-    WorkspaceService(db,sid).revert(change['change_id'])
-    assert not (tmp_path/'project/old.txt').exists()
+def test_project_move_tool_across_local_workspaces_and_undo(tmp_path, monkeypatch):
+    from artorias_server.tools.registry import build_tools
+
+    db, sid, cat, local, cloud = setup(tmp_path, monkeypatch)
+    archive = cat.register('archive', str(tmp_path / 'archive'))
+    archived = tmp_path / 'archive'
+    archived.mkdir()
+    ws = WorkspaceService(db, sid, 'run')
+    ws.write('original.md', 'content', expected=None)
+    move = next(tool for tool in build_tools(ws, lambda *_: None) if tool.name == 'project_move')
+    source = tmp_path / 'project' / 'original.md'
+    destination = archived / 'renamed.md'
+    target = f"workspace://{archive['id']}/renamed.md"
+    original_inode = source.stat().st_ino
+    destination.write_text('existing')
+    with pytest.raises(FileExistsError):
+        move.invoke({'source': 'original.md', 'destination': target})
+    assert source.read_text() == 'content' and destination.read_text() == 'existing'
+    destination.unlink()
+    with pytest.raises(ValueError, match='版本冲突'):
+        move.invoke({'source': 'original.md', 'destination': target, 'expected_source_version': 'stale'})
+    with pytest.raises(PermissionError):
+        move.invoke({'source': 'original.md', 'destination': str(tmp_path / 'unauthorized.md')})
+    with pytest.raises(ConnectorUnavailable):
+        move.invoke({'source': 'original.md', 'destination': f"workspace://{cloud['id']}/original.md"})
+
+    result = move.invoke({'source': 'original.md', 'destination': target,
+                          'expected_source_version': ws.head('original.md')})
+    assert not source.exists() and destination.stat().st_ino == original_inode
+    change = next(row for row in ws.registry.list_changes(sid) if row['id'] == result['change_id'])
+    assert change['source']['workspace_id'] == local['id']
+    assert change['destination']['workspace_id'] == archive['id']
+    assert change['kind'] == 'file.moved'
+    cat.select(sid, archive['id'])
+    WorkspaceService(db, sid).revert(result['change_id'])
+    assert source.read_text() == 'content' and not destination.exists()
+
+
+def test_project_move_cross_volume_copy_and_interrupted_source_removal(tmp_path, monkeypatch):
+    from artorias_device.workspace import moves
+
+    db, sid, cat, _, _ = setup(tmp_path, monkeypatch)
+    archive = cat.register('archive', str(tmp_path / 'archive'))
+    destination = tmp_path / 'archive' / 'result.bin'
+    destination.parent.mkdir()
+    ws = WorkspaceService(db, sid, 'run')
+    source = tmp_path / 'project' / 'original.bin'
+    source.parent.mkdir(exist_ok=True)
+    data = b'\x00\xff' * 500_001
+    source.write_bytes(data)
+    source.chmod(0o640)
+    original_identity = moves._identity
+
+    def other_volume(path):
+        identity = original_identity(path)
+        if identity is not None and path == source:
+            identity[0] = -1
+        return identity
+
+    monkeypatch.setattr(moves, '_identity', other_volume)
+    target = f"workspace://{archive['id']}/result.bin"
+    original_unlink = Path.unlink
+
+    def fail_source_removal(path, *args, **kwargs):
+        if path == source:
+            raise OSError('simulated interruption')
+        return original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(Path, 'unlink', fail_source_removal)
+        with pytest.raises(OSError, match='simulated interruption'):
+            ws.move('original.bin', target)
+    assert source.read_bytes() == destination.read_bytes() == data
+    assert destination.stat().st_mode & 0o777 == 0o640
+    assert db.query("SELECT status FROM workspace_operations WHERE kind='file.moved'") == [{'status': 'pending'}]
+    with pytest.raises(ValueError, match='未解决'):
+        ws.delete(target)
+
+    # Once the duplicate is removed, recovery sees the original state and
+    # clears the pending move. The next attempt can finish without data loss.
+    destination.unlink()
+    result = ws.move('original.bin', target)
+    assert result['change_id']
+    assert not source.exists() and destination.read_bytes() == data
+
+
+def test_project_case_only_rename_recovers_journal_after_disk_change(tmp_path, monkeypatch):
+    db, sid, _, _, _ = setup(tmp_path, monkeypatch)
+    ws = WorkspaceService(db, sid, 'run')
+    ws.write('Report.md', 'body', expected=None)
+    journal = ws.registry.changes
+
+    def interrupt(_):
+        raise OSError('simulated failure after rename')
+
+    with monkeypatch.context() as failure:
+        failure.setattr(journal, 'finish', interrupt)
+        with pytest.raises(OSError, match='simulated failure'):
+            ws.move('Report.md', 'report.md')
+    assert [entry.name for entry in (tmp_path / 'project').iterdir()] == ['report.md']
+    assert ws.read('report.md') == 'body'
+    change = next(row for row in journal.list_changes(sid) if row.get('kind') == 'file.moved')
+    ws.revert(change['id'])
+    assert [entry.name for entry in (tmp_path / 'project').iterdir()] == ['Report.md']
 
 
 def test_web_selection_grants_and_current_space(tmp_path,monkeypatch):
@@ -153,12 +245,12 @@ def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
     ]
     if decision=='approve':
         replies.append(call('project_list',{'path':str(outside)},'list-after'))
-    replies.append(AIMessage(content='done'))
+    replies.append(finish_message('done'))
     model=Model(disable_streaming=True,messages=iter(replies))
     monkeypatch.setattr(runtime,'create_model',lambda:model)
     db.submit(sid,'create external file','1');run=db.claim()
     from artorias_local_app.bootstrap import create_engine
-    async def planner(_):return Plan(kind='tasks',items=[Item(key='write',goal='create external file')])
+    async def planner(_):return Plan(kind='tasks',items=[plan_item(key='write',goal='create external file')])
     runtime=TaskRuntime(tmp_path/'data',db,engine=create_engine(tmp_path/'data',db),planner=planner)
     scheduler=Scheduler(db,runtime)
     asyncio.run(scheduler.execute(run))

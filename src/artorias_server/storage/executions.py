@@ -9,8 +9,8 @@ class ExecutionRepository:
             c.execute('''CREATE TABLE IF NOT EXISTS python_executions(
                 id TEXT PRIMARY KEY, session_id TEXT NOT NULL, run_id TEXT,
                 task_id TEXT, task_step_id TEXT, tool_call_id TEXT NOT NULL,
-                request_hash TEXT NOT NULL, plan TEXT NOT NULL, status TEXT NOT NULL,
-                result TEXT, UNIQUE(session_id,run_id,task_id,tool_call_id))''')
+                request_hash TEXT NOT NULL, plan TEXT NOT NULL,
+                result TEXT, status TEXT NOT NULL, UNIQUE(session_id,run_id,task_id,tool_call_id))''')
             c.execute('''CREATE TABLE IF NOT EXISTS execution_publications(
                 operation_id TEXT PRIMARY KEY, execution_id TEXT NOT NULL,
                 target TEXT NOT NULL, status TEXT NOT NULL, result TEXT)''')

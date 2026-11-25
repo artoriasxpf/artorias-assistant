@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, submission, finish_message
 from artorias_device.storage.journal import SQLiteWorkspaceJournal
 import asyncio
 import json
@@ -10,24 +11,25 @@ def setup(tmp_path):
 
 def test_validation_atomic(tmp_path):
     db,r=setup(tmp_path);repo=TaskRepository(db)
-    for items in [[Item(key='a',goal='x',depends_on=['b'])], [Item(key='a',goal='x',relation='continue',task_id='foreign')]]:
+    for items in [[plan_item(key='a',goal='x',depends_on=['b'])], [plan_item(key='a',goal='x',relation='continue',task_id='foreign')]]:
         with pytest.raises(ValueError):repo.install(r,Plan(kind='tasks',items=items),[])
     assert not db.query('SELECT * FROM task_plans')
 
 def test_resume_dependencies_and_original_input(tmp_path):
     db,r=setup(tmp_path);calls=[]
-    async def planner(payload):return Plan(kind='tasks',items=[Item(key='b',goal='说明',depends_on=['a']),Item(key='a',goal='框架')])
+    async def planner(payload):return Plan(kind='tasks',items=[plan_item(key='b',goal='说明',depends_on=['a']),plan_item(key='a',goal='框架')])
     class Engine:
         async def execute(self, run):
             calls.append(run)
             if run['thread_id'].endswith(':b') and not run.get('decision'):
                 yield 'approval.requested',{'requests':[]};return
-            yield 'assistant.final',{'text':run['task_context']['execution_scope']['goal']}
+            yield 'step.submitted', submission(run['task_context']['execution_scope']['goal']).model_dump()
+            yield 'assistant.final', {'text':run['task_context']['execution_scope']['goal']}
     runtime=TaskRuntime(tmp_path,db,Engine(),planner)
     async def collect(run):return [e async for e in runtime.execute(run)]
     first=asyncio.run(collect(r));assert first[-1][0]=='approval.requested'
     assert calls[0]['input']==r['input']
-    assert calls[1]['task_context']['dependency_results']==[{'key':'a','result':'框架'}]
+    assert calls[1]['task_context']['dependency_results']==[{'key':'a','preview':'框架','result_ref':{'run_id':r['id'],'step_key':'a'}}]
     db.finish(r,'waiting');db.decide(r['id'],'approve')
     second=asyncio.run(collect(db.claim()))
     assert second[-1][1]['text']=='框架\n\n说明'
@@ -37,11 +39,11 @@ def test_resume_dependencies_and_original_input(tmp_path):
 
 def test_refine_reuses_goal_and_context_budget(tmp_path):
     db,r=setup(tmp_path);repo=TaskRepository(db)
-    repo.install(r,Plan(kind='tasks',items=[Item(key='a',goal='设计整个项目')]),[])
+    repo.install(r,Plan(kind='tasks',items=[plan_item(key='a',goal='设计整个项目')]),[])
     task=db.query('SELECT * FROM business_tasks')[0]
     db.finish(r,'completed','框架已设计')
     db.submit(r['session'],'细化各模块','two');r2=db.claim()
-    repo.install(r2,Plan(kind='tasks',items=[Item(key='b',goal='细化模块',relation='refine',task_id=task['id'])]),repo.candidates(r['session'],'细化各模块'))
+    repo.install(r2,Plan(kind='tasks',items=[plan_item(key='b',goal='细化模块',relation='refine',task_id=task['id'])]),repo.candidates(r['session'],'细化各模块'))
     step=db.query('SELECT * FROM task_steps WHERE run=?',(r2['id'],))[0]
     body=ContextBuilder(repo).build(r2,step)
     assert body['task']['goal']=='设计整个项目'
@@ -59,12 +61,12 @@ def test_two_tasks_with_actual_deepagents(tmp_path, monkeypatch):
         def bind_tools(self, tools, **kwargs):return self
     model=Model(disable_streaming=True,messages=iter([
         AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'a.txt','content':'A'},'id':'a','type':'tool_call'}]),
-        AIMessage(content='A written'),
+        finish_message('A written'),
         AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'b.txt','content':'B'},'id':'b','type':'tool_call'}]),
-        AIMessage(content='B written')]))
+        finish_message('B written')]))
     monkeypatch.setattr(module,'create_model',lambda:model)
     db,r=setup(tmp_path)
-    async def planner(payload):return Plan(kind='tasks',items=[Item(key='a',goal='写 A'),Item(key='b',goal='写 B',depends_on=['a'])])
+    async def planner(payload):return Plan(kind='tasks',items=[plan_item(key='a',goal='写 A'),plan_item(key='b',goal='写 B',depends_on=['a'])])
     from artorias_local_app.bootstrap import create_engine
     runtime=TaskRuntime(tmp_path,db,engine=create_engine(tmp_path,db),planner=planner)
     async def collect():return [event async for event in runtime.execute(r)]
@@ -75,7 +77,7 @@ def test_two_tasks_with_actual_deepagents(tmp_path, monkeypatch):
 
 def test_essential_budget_fails_without_snapshot(tmp_path):
     db,r=setup(tmp_path);repo=TaskRepository(db)
-    repo.install(r,Plan(kind='tasks',items=[Item(key='a',goal='goal')]),[])
+    repo.install(r,Plan(kind='tasks',items=[plan_item(key='a',goal='goal')]),[])
     step=db.query('SELECT * FROM task_steps')[0]
     with pytest.raises(ValueError):ContextBuilder(repo,budget=10).build(r,step)
     assert not db.query('SELECT * FROM context_snapshots')
@@ -88,8 +90,8 @@ def test_planner_retries_null_patch_with_field_feedback(tmp_path, monkeypatch):
     db,run=setup(tmp_path)
     calls=[]
     replies=iter([
-        '{"kind":"tasks","items":[{"key":"a","goal":"example","task_patch":null}]}',
-        '{"kind":"tasks","items":[{"key":"a","goal":"example","task_patch":{"operations":[]}}]}',
+        '{"kind":"tasks","items":[{"key":"a","initial_requirements":{"goal":"example"},"step_spec":{"goal":"example"},"task_patch":null}]}',
+        '{"kind":"tasks","items":[{"key":"a","initial_requirements":{"goal":"example"},"step_spec":{"goal":"example"},"task_patch":{"operations":[]}}]}',
     ])
 
     class Model:
@@ -117,7 +119,7 @@ def test_planner_stops_after_two_invalid_outputs(tmp_path, monkeypatch):
     calls=[]
     replies=iter([
         'not-json',
-        '{"kind":"tasks","items":[{"key":"a","goal":"example",'
+        '{"kind":"tasks","items":[{"key":"a","initial_requirements":{"goal":"example"},"step_spec":{"goal":"example"},'
         '"task_patch":{"expected_revision":"1","unexpected":true}}]}',
     ])
 

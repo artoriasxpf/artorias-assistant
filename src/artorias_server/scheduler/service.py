@@ -22,6 +22,10 @@ class Scheduler:
         try:
             async with aclosing(self.runtime.execute(run)) as events:
                 async for kind,payload in events:
+                    if kind=='task.awaiting_review':
+                        from artorias_server.tasks.reviews import park_or_requeue
+                        park_or_requeue(self.store,run)
+                        return
                     if kind=='approval.requested':
                         approval=payload
                         break
@@ -39,7 +43,7 @@ class Scheduler:
         rows=self.store.query('SELECT * FROM runs WHERE id=?',(rid,))
         if not rows:raise KeyError(rid)
         if rid in self.active:self.active[rid].cancel()
-        elif rows[0]['status'] in ('queued','waiting'):
+        elif rows[0]['status'] in ('queued','waiting','awaiting_review'):
             if rows[0]['status']=='waiting':
                 self._close_pending_approval(rows[0],'cancelled')
             self.store.finish(rows[0],'cancelled');self.store.emit(rows[0]['session'],rid,'run.cancelled',{})

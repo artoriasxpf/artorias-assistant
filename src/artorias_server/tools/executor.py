@@ -70,6 +70,12 @@ class WorkspaceToolExecutor:
     def delete(self, path):
         return self.workspace.delete(path)
 
+    def move(self, source, destination, expected_source_version=None):
+        move = getattr(self.workspace, 'move', None)
+        if move is None:
+            raise ConnectorUnavailable('当前工作空间不支持文件移动')
+        return move(source, destination, expected_source_version=expected_source_version)
+
     def authorize(self, path, access, approve):
         if not hasattr(self.workspace, 'grant_access'):
             raise ConnectorUnavailable('当前工作空间不支持本机目录授权')

@@ -40,6 +40,24 @@ runpy.run_path(script, run_name='__main__')
 """
 
 
+def redact_diagnostics(text):
+    text = re.sub(r'(https?://)[^/\s@]+@', r'\1[redacted]@', text)
+    return re.sub(
+        r'(?i)((?:bearer\s+|(?:[\w-]*(?:token|password|secret|api[_-]?key|credential)[\w-]*)[=:]\s*))[^\s&]+',
+        r'\1[redacted]', text,
+    )
+
+
+class ProcessTimeout(TimeoutError):
+    def __init__(self, stdout, stderr, truncated):
+        self.stdout, self.stderr, self.truncated = stdout, stderr, truncated
+
+
+class StageFailure(Exception):
+    def __init__(self, **result):
+        self.result = result
+
+
 def sandbox_profile(readable, writable, executable, *, install=False, fork=False):
     def paths(rule, roots, match='subpath'):
         return [
@@ -99,28 +117,52 @@ class MacOSVenvPythonBackend:
         self.active[execution_id] = proc.pid
         truncated = False
 
-        async def tail(stream):
+        stdout, stderr = bytearray(), bytearray()
+
+        async def tail(stream, data):
             nonlocal truncated
-            data = bytearray()
             while chunk := await stream.read(8192):
                 data.extend(chunk)
                 if len(data) > 65536:
                     truncated = True
                     del data[:-65536]
-            return data.decode(errors='replace')
 
         try:
-            stdout, stderr = await asyncio.wait_for(
-                asyncio.gather(tail(proc.stdout), tail(proc.stderr)), timeout,
+            await asyncio.wait_for(
+                asyncio.gather(tail(proc.stdout, stdout), tail(proc.stderr, stderr)), timeout,
             )
             code = await asyncio.wait_for(proc.wait(), 2)
-            return code, stdout, stderr, truncated
+            return code, stdout.decode(errors='replace'), stderr.decode(errors='replace'), truncated
+        except TimeoutError as exc:
+            raise ProcessTimeout(stdout.decode(errors='replace'), stderr.decode(errors='replace'), truncated) from exc
         finally:
             try:
                 await self.stop(execution_id)
             finally:
                 self.active.pop(execution_id, None)
                 await proc.wait()
+
+    async def _run_stage(self, execution_id, phase, step, args, **options):
+        try:
+            code, stdout, stderr, truncated = await self._run_process(execution_id, args, **options)
+        except ProcessTimeout as exc:
+            raise StageFailure(
+                phase=phase, step=step, execution_status='timed_out', error_code='timeout',
+                exit_code=None, stdout_tail=exc.stdout, stderr_tail=exc.stderr,
+                logs_truncated=exc.truncated,
+            ) from exc
+        except OSError as exc:
+            raise StageFailure(
+                phase=phase, step=step, execution_status='failed', error_code='process_start_failed',
+                exit_code=None, stderr_tail=str(exc),
+            ) from exc
+        if code:
+            raise StageFailure(
+                phase=phase, step=step, execution_status='failed', error_code='nonzero_exit',
+                exit_code=code, stdout_tail=stdout, stderr_tail=stderr, logs_truncated=truncated,
+            )
+        return {'execution_status': 'succeeded', 'exit_code': code, 'stdout_tail': stdout,
+                'stderr_tail': stderr, 'logs_truncated': truncated}
 
     async def stop(self, execution_id):
         pid = self.active.get(execution_id)
@@ -143,38 +185,37 @@ class MacOSVenvPythonBackend:
                 if (candidate / 'bin/python').is_file():
                     return candidate
             base = Path(tempfile.mkdtemp(prefix=key + '-', dir=self.cache))
-            env = base / 'venv'
-            temporary = base / 'tmp'
-            temporary.mkdir()
-            python = profile['python']
-            uv = profile['uv']
-            req = base / 'requirements.in'
-            req.write_text('\n'.join(sorted(set(dependencies))) + '\n')
-            lock = base / 'requirements.lock'
-            policy = sandbox_profile(
-                [base, python, uv, profile['python_prefix']], [base], [python, uv],
-                install=bool(dependencies), fork=True,
-            )
-            install_env = {
-                'PATH': '/usr/bin:/bin', 'HOME': str(base), 'TMPDIR': str(temporary),
-                'UV_CACHE_DIR': str(base / 'cache'), 'UV_PYTHON_DOWNLOADS': 'never',
-            }
-            commands = [[uv, '--no-config', 'venv', '--python', python, env]]
-            if dependencies:
-                common = ['--no-build', '--index-url', 'https://pypi.org/simple']
-                commands += [
-                    [uv, '--no-config', 'pip', 'compile', req, '--python', python,
-                     '--generate-hashes', '--output-file', lock, *common],
-                    [uv, '--no-config', 'pip', 'sync', lock, '--python', env / 'bin/python',
-                     '--require-hashes', '--link-mode', 'copy', *common],
-                ]
             try:
-                for command in commands:
-                    code, _, stderr, _ = await self._run_process(
-                        execution_id, command, policy=policy, cwd=base, env=install_env, timeout=120,
+                env = base / 'venv'
+                temporary = base / 'tmp'
+                temporary.mkdir()
+                python = profile['python']
+                uv = profile['uv']
+                req = base / 'requirements.in'
+                req.write_text('\n'.join(sorted(set(dependencies))) + '\n')
+                lock = base / 'requirements.lock'
+                policy = sandbox_profile(
+                    [base, python, uv, profile['python_prefix']], [base], [python, uv],
+                    install=bool(dependencies), fork=True,
+                )
+                install_env = {
+                    'PATH': '/usr/bin:/bin', 'HOME': str(base), 'TMPDIR': str(temporary),
+                    'UV_CACHE_DIR': str(base / 'cache'), 'UV_PYTHON_DOWNLOADS': 'never',
+                }
+                commands = [('create_venv', [uv, '--no-config', 'venv', '--python', python, env])]
+                if dependencies:
+                    common = ['--no-build', '--index-url', 'https://pypi.org/simple']
+                    commands += [
+                        ('resolve_dependencies', [uv, '--no-config', 'pip', 'compile', req, '--python', python,
+                         '--generate-hashes', '--output-file', lock, *common]),
+                        ('install_dependencies', [uv, '--no-config', 'pip', 'sync', lock, '--python', env / 'bin/python',
+                         '--require-hashes', '--link-mode', 'copy', *common]),
+                    ]
+                for step, command in commands:
+                    await self._run_stage(
+                        execution_id, 'prepare_environment', step, command,
+                        policy=policy, cwd=base, env=install_env, timeout=120,
                     )
-                    if code:
-                        raise ValueError('Python 环境准备失败：' + stderr[-2000:])
                 shutil.rmtree(base / 'cache', ignore_errors=True)
                 pending = base / 'ready.json'
                 pending.write_text(json.dumps(base.name))
@@ -193,8 +234,10 @@ class MacOSVenvPythonBackend:
         if any(not PACKAGE.fullmatch(package) for package in dependencies):
             raise ValueError('依赖必须是包名或 package==version')
         execution_id = plan['id']
+        phase, step = 'prepare_environment', 'prepare_cache'
         try:
             venv = await self._environment(execution_id, profile, dependencies)
+            phase, step = 'execute_script', 'stage_files'
             work = root / ('work_result' if request['mode'] == 'workspace_copy' else 'native_work')
             if request['mode'] == 'workspace_copy':
                 shutil.copytree(root / 'seed', work, dirs_exist_ok=True)
@@ -222,21 +265,41 @@ class MacOSVenvPythonBackend:
                 base = mappings.get('/' + prefix)
                 args.append(str(base / suffix) if base is not None and '..' not in Path(suffix).parts
                             and not suffix.startswith('/') else arg)
-            code, stdout, stderr, truncated = await self._run_process(
-                execution_id, [python, '-I', '-B', '-c', BOOTSTRAP, app / '__entry__.py', *args],
+            step = 'run_python'
+            result = await self._run_stage(
+                execution_id, phase, step,
+                [python, '-I', '-B', '-c', BOOTSTRAP, app / '__entry__.py', *args],
                 policy=policy, cwd=work, env=env, timeout=request['timeout_seconds'],
             )
-            (root / 'logs.txt').write_text('STDOUT\n' + stdout + '\nSTDERR\n' + stderr)
-            return {
-                'execution_status': 'succeeded' if code == 0 else 'failed', 'exit_code': code,
-                'stdout_tail': stdout, 'stderr_tail': stderr, 'logs_truncated': truncated,
-                'logs_ref': execution_id + '/logs.txt',
-            }
-        except TimeoutError:
-            for name in ('outputs', 'work_result'):
-                shutil.rmtree(root / name, ignore_errors=True)
-            return {'execution_status': 'timed_out', 'exit_code': None,
-                    'stdout_tail': '', 'stderr_tail': '运行或环境准备超时', 'logs_ref': None}
+        except StageFailure as exc:
+            result = exc.result
+            if result['execution_status'] == 'timed_out':
+                for name in ('outputs', 'work_result'):
+                    shutil.rmtree(root / name, ignore_errors=True)
+        except (OSError, ValueError) as exc:
+            result = dict(phase=phase, step=step, execution_status='failed',
+                          error_code='setup_failed', exit_code=None, stderr_tail=str(exc))
         finally:
             for name in ('native_work', 'native_tmp'):
                 shutil.rmtree(root / name, ignore_errors=True)
+
+        result.setdefault('phase', phase)
+        result.setdefault('step', step)
+        result.setdefault('logs_truncated', False)
+        result['script_attempted'] = (
+            result['phase'] == 'execute_script' and result['step'] == 'run_python'
+            and result.get('error_code') != 'process_start_failed'
+        )
+        for key in ('stdout_tail', 'stderr_tail'):
+            result[key] = redact_diagnostics(result.get(key, ''))
+        result['logs_ref'] = None
+        try:
+            (root / 'logs.txt').write_text(
+                f"{result['phase']}/{result['step']}\nSTDOUT\n"
+                + result['stdout_tail'] + '\nSTDERR\n' + result['stderr_tail'],
+                encoding='utf-8',
+            )
+            result['logs_ref'] = execution_id + '/logs.txt'
+        except OSError:
+            pass  # The tool result still carries the diagnostic tails.
+        return result
