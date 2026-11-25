@@ -60,7 +60,7 @@ class StepSpec(PlanObject):
     goal: Text
     constraints: list[Text] = Field(default_factory=list)
     criteria: list[Text] = Field(default_factory=list)
-    local_reviews: dict[str, Criterion] = Field(default_factory=dict)
+    local_reviews: dict[str, Criterion] = Field(default_factory=dict, max_length=30)
     criterion_refs: list[str] = Field(default_factory=list)
     wait_for: list[Wait] = Field(default_factory=list)
 
@@ -130,4 +130,10 @@ class FinishStep(PlanObject):
     deliveries: list[Delivery] = Field(default_factory=list, max_length=30)
     milestones: list[Milestone] = Field(default_factory=list, max_length=30)
     blocker_changes: list[Blocker] = Field(default_factory=list, max_length=30)
-    criterion_claims: list[Claim] = Field(default_factory=list, max_length=30)
+    criterion_claims: list[Claim] = Field(default_factory=list, max_length=60)
+
+    @model_validator(mode="after")
+    def check_text(self):
+        if not self.final_text.strip():
+            raise ValueError("final_text 不能为空白")
+        return self

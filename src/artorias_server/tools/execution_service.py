@@ -221,6 +221,11 @@ class ExecutionService:
         try:
             result=await self._planned_backend(plan).run(plan,root)
             result=dict(result,execution_id=eid,publish_status='not_requested',artifacts=[],published=[],conflicts=[])
+            if result.get('phase') and (
+                result['execution_status'] == 'timed_out' or not result.get('script_attempted', True)
+            ):
+                self.repo.save(eid,'failed',result)
+                return result
             outputs=scan(root/'outputs')
             work=scan(root/'work_result') if plan['request']['mode']=='workspace_copy' else {}
             items=[]

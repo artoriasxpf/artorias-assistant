@@ -6,6 +6,7 @@ from .budget import RequestBudget
 from .model_activity import ModelActivity
 from .checkpoints import SQLiteCheckpointProvider
 from .tool_errors import ToolErrorBoundary
+from .step_repair import repair_submission
 from artorias_server.workspace.factory import WorkspaceFactory
 from artorias_server.tools.registry import build_tools
 
@@ -50,18 +51,22 @@ class DeepAgentRuntime:
             from artorias_server.tasks.models import FinishStep
             from artorias_server.tasks.verification import resolve
 
-            @tool(args_schema=FinishStep, return_direct=True)
-            def finish_step(**kwargs):
-                """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional."""
-                submission=FinishStep.model_validate(kwargs)
+            def validate_submission(args):
+                submission=FinishStep.model_validate(args)
                 step=self.store.query('SELECT * FROM task_steps WHERE run=? AND key=?',
                                       (run['id'],run['task_step_id']))[0]
                 resolve(self.store,run,step,submission)
+                return submission
+
+            @tool(args_schema=FinishStep, return_direct=True)
+            def finish_step(**kwargs):
+                """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional."""
+                submission = validate_submission(kwargs)
                 finished.append(submission)
                 return submission.final_text
 
             tools.append(finish_step)
-            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对本步涉及的标准填写 id、claim 和自然语言 reason。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对 criterion_refs 指定的标准和必选 local_reviews 填写 id、claim 和自然语言 reason。未指定 criterion_refs 时填写快照中全部必选标准。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
 
         thread_id=run.get('thread_id',run['id'])
         async with self.checkpoint_provider.open() as saver:
@@ -142,10 +147,20 @@ class DeepAgentRuntime:
                     if getattr(m,'type',None)=='ai' and not getattr(m,'tool_calls',[]):
                         text=text_content(m.content);break
             if run.get('task_id'):
-                if len(finished)!=1:
-                    raise ValueError('Task execution requires one valid finish_step')
-                yield 'step.submitted',finished[0].model_dump()
-                text=finished[0].final_text
+                if len(finished) == 1:
+                    submission = finished[0]
+                else:
+                    history = state.values.get('messages', [])
+                    problem = '需要单独提交一次有效的 finish_step'
+                    for message in reversed(history):
+                        if message.type == 'tool' and message.name == 'finish_step' and message.status == 'error':
+                            problem = str(message.content)[:1500]
+                            break
+                    submission = await repair_submission(
+                        model, finish_step, validate_submission, history, emit, problem,
+                    )
+                yield 'step.submitted',submission.model_dump()
+                text=submission.final_text
             yield 'assistant.final',{'text':text}
 
 def text_content(content):

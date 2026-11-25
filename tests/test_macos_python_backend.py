@@ -48,3 +48,57 @@ def test_native_backend_stages_output_without_direct_write(tmp_path):
     assert result['execution_status'] == 'succeeded', result
     assert external.read_text() == 'original'
     assert (root / 'outputs' / 'result.txt').read_text() == 'candidate'
+
+
+@pytest.mark.parametrize(
+    'failed_step,expected_phase,expected_code',
+    [
+        ('create_venv', 'prepare_environment', 'process_start_failed'),
+        ('resolve_dependencies', 'prepare_environment', 'nonzero_exit'),
+        ('install_dependencies', 'prepare_environment', 'timeout'),
+        ('run_python', 'execute_script', 'nonzero_exit'),
+    ],
+)
+def test_native_failure_stage_reaches_tool_result(tmp_path, monkeypatch, failed_step, expected_phase, expected_code):
+    from artorias_device.tools.macos_python import ProcessTimeout
+    from test_python_execution import execute, setup
+
+    backend = MacOSVenvPythonBackend(tmp_path / 'cache')
+    monkeypatch.setattr(backend, 'profile', lambda: {
+        'python': sys.executable, 'uv': '/some/uv', 'python_prefix': sys.base_prefix,
+        'backend': 'macos-venv', 'location': 'device',
+    })
+    phases = iter(['create_venv', 'resolve_dependencies', 'install_dependencies', 'run_python'])
+    calls = []
+
+    async def mock_process(*args, **kwargs):
+        step = next(phases)
+        calls.append(step)
+        if step != failed_step:
+            return 0, '', '', False
+        if expected_code == 'timeout':
+            raise ProcessTimeout('resolving', 'while downloading wheel', False)
+        if expected_code == 'process_start_failed':
+            raise FileNotFoundError('sandbox launcher missing')
+        return 1, '', 'diagnostic detail token=example-secret', False
+
+    monkeypatch.setattr(backend, '_run_process', mock_process)
+    ws, service, _ = setup(tmp_path, backend)
+    plan = service.prepare(ws, 'native', {'path': 'script.py', 'dependencies': ['testpkg']})
+    result = execute(service, ws, plan)
+    assert result['phase'] == expected_phase
+    assert result['step'] == failed_step
+    assert result['error_code'] == expected_code
+    assert calls[-1] == failed_step
+    assert result['script_attempted'] == ('run_python' in calls)
+    assert result['publish_status'] == 'not_requested'
+    assert not result['published']
+    assert result['logs_ref']
+    logs = (tmp_path / 'data' / 'executions' / result['logs_ref']).read_text()
+    assert result['stderr_tail'] in logs
+    assert 'example-secret' not in logs
+    if expected_code == 'timeout':
+        assert result['execution_status'] == 'timed_out'
+        assert result['stderr_tail'] == 'while downloading wheel'
+    if expected_phase == 'prepare_environment':
+        assert not list(backend.cache.iterdir())

@@ -97,8 +97,16 @@ def resolve(store, run, step, result):
     ]:
         if set(entry.evidence_refs) - evidence.keys():
             raise ValueError("Unknown evidence reference")
-    if len({c.id for c in result.criterion_claims}) != len(result.criterion_claims):
+    claim_ids = {claim.id for claim in result.criterion_claims}
+    if len(claim_ids) != len(result.criterion_claims):
         raise ValueError("Duplicate claim")
+    required_claims = set(spec["criterion_refs"]) or {
+        key for key, rule in rules.items() if rule["required"]
+    }
+    required_claims.update(key for key, rule in local.items() if rule["required"])
+    missing = required_claims - claim_ids
+    if missing:
+        raise ValueError("criterion_claims 缺少标准：" + ", ".join(sorted(missing)))
     for claim in result.criterion_claims:
         rule = local.get(claim.id) or rules.get(claim.id)
         if not rule or (claim.id not in local and spec["criterion_refs"] and claim.id not in spec["criterion_refs"]):

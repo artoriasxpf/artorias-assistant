@@ -1,6 +1,8 @@
+import json
+
 from langchain_core.messages import AIMessage
-from artorias_server.tasks.models import Criterion, FinishStep, Item, RequirementPatch
-from artorias_server.tasks.verification import resolve
+from artorias_server.tasks.models import Claim, Criterion, FinishStep, Item, RequirementPatch
+from artorias_server.tasks.verification import assess
 
 
 def user_rule(text):
@@ -38,8 +40,13 @@ def submission(text):
 
 def deliver(repo, run, step, text):
     result = submission(text)
-    evidence, *_ = resolve(repo.store, run, step, result)
-    return repo.deliver(run, step, result, evidence, [])
+    criteria = json.loads(step["effective_requirements"])["criteria"]
+    result.criterion_claims = [
+        Claim(id=key, claim="partial", reason="Fixture delivery")
+        for key, criterion in criteria.items() if criterion["required"]
+    ]
+    evidence, assessments = assess(repo.store, run, step, result)
+    return repo.deliver(run, step, result, evidence, assessments)
 
 
 def finish_message(text):

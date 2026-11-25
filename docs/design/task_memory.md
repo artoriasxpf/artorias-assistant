@@ -96,7 +96,9 @@ milestones 按业务键合并，blockers 按稳定 ID 开启或解除（内部�
 
 自评写入 Task progress 的 assessment_heads。claim 表达模型判断，verdict 保持 pending。普通任务完整交付后进入 needs_review，Run 可结束，用户可在后续消息提出修改。只有显式 user 标准产生确认待办。普通依赖使用 depends_on，wait_for 只等待显式用户确认。声明部分或未完成的必选标准仍需后续工作。用户需要确认指定文件时，交付项给出发布工具返回的 artifact_id，确认标准通过同名字段选择文件。
 
-执行器把 finish_step 注册为终止工具，schema 为以下提交对象。普通文本交付仅需正文、执行结果和适用标准的自评。程序校验成功后终止工具循环；校验出错返回可修复的字段错误。常规路径使用执行模型最后一次响应提交，无需再次调用模型。
+执行器把 finish_step 注册为终止工具。必填字段为 step_outcome 和非空白 final_text。有 criterion_refs 时必须覆盖这些标准，未指定时覆盖快照中的全部必选标准。必选 local_reviews 也要自评。每条声明含 id、claim、reason，标准版本从快照读取。无适用标准时可以省略 criterion_claims。
+
+提交缺失或无效时，Runtime 使用同一步的执行记录和校验错误，最多请求两次补交。补交仅提供 finish_step 工具，复用工具结果。有效提交进入交付事务，更新进展、摘要和执行次数。重试耗尽时 Step 记录 failed，本步未提交的标准保持 pending，已保存的历史结论和已有摘要保留。
 
 ```json
 {
