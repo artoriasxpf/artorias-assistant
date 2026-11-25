@@ -17,13 +17,6 @@ def initial_requirements(item):
     criteria = {
         f"C{i}": {**c.model_dump(), "v": 1} for i, c in enumerate(initial.criteria, 1)
     }
-    if not any(c["required"] for c in criteria.values()):
-        criteria["signoff"] = {
-            "v": 1,
-            "text": "用户接受本次交付",
-            "required": True,
-            "verification": {"method": "user", "question": "是否接受本次交付？"},
-        }
     return {
         "goal": initial.goal,
         "constraints": {

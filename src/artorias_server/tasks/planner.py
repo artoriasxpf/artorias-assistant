@@ -15,8 +15,8 @@ chat 不建任务；tasks 必须有任务。key 唯一，depends_on 仅引用本
 new/followup 填 initial_requirements，初始 criteria 顺序编号 C1、C2，约束 K1、K2。
 continue/refine 提供 task_patch.expected_revision，永久变更给 operations 和本次用户原文 evidence。
 add 由系统分配 ID，可使用 client_ref。临时要求只写 step_spec。引用已有条目须核对版本。
-验收方式 program 只用注册的规则；semantic 提供 rubric；user 只用于确需用户确认。
-依赖交付用 depends_on；必须等验收通过再继续时用 step_spec.wait_for，指向生产者标准和产物角色。
+总结、分析和整理默认由执行模型自评，省略 verification。仅可确定性检查的标准用 program 的注册规则；仅明确需要用户确认的标准用 user。普通交付无需签收。
+依赖交付用 depends_on；必须等验收通过再继续时用 step_spec.wait_for，只指向生产者 program 或 user 标准和产物角色。
 仅本步需要的用户确认放入 local_reviews。文字答复的产物角色为 response。
 位置意图保留用户原文，避免猜测绝对路径。
 '''

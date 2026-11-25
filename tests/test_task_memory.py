@@ -21,7 +21,7 @@ def review_run(tmp_path):
     preview.step_spec.local_reviews["layout"] = user_rule("确认此预览？")
     final = plan_item("final", "全量结果", depends_on=["preview"])
     final.step_spec.wait_for = [Wait(step_key="preview", criterion_ref="layout")]
-    independent = plan_item("other", "其他工作")
+    independent = plan_item("other", "其他工作", criteria=["明确签收"])
     calls = []
 
     async def planner(payload):
@@ -34,8 +34,10 @@ def review_run(tmp_path):
             result = submission(key)
             if key == "preview":
                 result.criterion_claims = [
-                    Claim(id="layout", v=1, claim="met", evidence_refs=["response"])
+                    Claim(id="layout", claim="met", reason="预览已交付")
                 ]
+            elif key == "other":
+                result.criterion_claims = [Claim(id="C1", claim="met", reason="等待签收")]
             yield "step.submitted", result.model_dump()
 
     runtime = TaskRuntime(tmp_path, store, Engine(), planner)
@@ -154,9 +156,10 @@ def test_final_review_http_and_evidence(tmp_path):
         )
 
 
-def test_semantic_verdict_uses_separate_reviewer(tmp_path):
-    from artorias_server.tasks.verification import assess, SemanticVerdict
-    from artorias_server.tasks.models import Criterion
+@pytest.mark.parametrize("policy,expected", [(None, "needs_review"), ({"method":"program","rule":"published"}, "open")])
+def test_plain_text_delivery_does_not_prove_publication(tmp_path, policy, expected):
+    from artorias_server.tasks.verification import assess
+    from artorias_server.tasks.models import Criterion, FinishStep
 
     store = Store(tmp_path / "app.sqlite")
     sid = store.session()
@@ -164,30 +167,18 @@ def test_semantic_verdict_uses_separate_reviewer(tmp_path):
     run = store.claim()
     runtime = TaskRuntime(tmp_path, store, engine=object())
     item = plan_item("a", "分析")
-    item.initial_requirements.criteria = [
-        Criterion(
-            text="解释原因",
-            verification={"method": "semantic", "rubric": "包含可核对的原因"},
-        )
-    ]
+    item.initial_requirements.criteria = [Criterion(text="完成分析", **({"verification": policy} if policy else {}))]
     runtime.repo.install(run, Plan(kind="tasks", items=[item]), [])
     step = store.query("SELECT * FROM task_steps")[0]
-    result = submission("只有结论")
-    result.criterion_claims = [
-        Claim(id="C1", v=1, claim="met", evidence_refs=["response"])
-    ]
-
-    class Reviewer:
-        def with_structured_output(self, schema):
-            return self
-
-        async def ainvoke(self, messages):
-            assert "只有结论" in messages[-1][1]
-            return SemanticVerdict(met=False, reason="缺少原因")
-
-    evidence, verdicts = asyncio.run(assess(store, run, step, result, Reviewer))
-    assert runtime.repo.deliver(run, step, result, evidence, verdicts) == "open"
-    assert (
-        store.query("SELECT verdict FROM task_criterion_assessments")[0]["verdict"]
-        == "unmet"
-    )
+    result = FinishStep(step_outcome="completed", final_text="结论及原因",
+                        criterion_claims=[Claim(id="C1", claim="met", reason="正文已说明原因")])
+    evidence, verdicts = asyncio.run(assess(store, run, step, result))
+    assert runtime.repo.deliver(run, step, result, evidence, verdicts) == expected
+    assert list(evidence) == ["response"]
+    assert not store.query("SELECT id FROM task_review_requests")
+    progress = json.loads(store.query("SELECT progress FROM business_tasks")[0]["progress"])
+    head = progress["assessment_heads"]["C1"]
+    assert head["claim"] == "met"
+    assert head["verdict"] == ("unmet" if policy else "pending")
+    if not policy:
+        assert head["method"] == "self" and head["reason"] == "正文已说明原因"

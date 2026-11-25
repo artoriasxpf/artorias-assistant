@@ -52,7 +52,7 @@ class DeepAgentRuntime:
 
             @tool(args_schema=FinishStep, return_direct=True)
             def finish_step(**kwargs):
-                """Submit this step's final answer and evidence. Use response to cite final_text."""
+                """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional."""
                 submission=FinishStep.model_validate(kwargs)
                 step=self.store.query('SELECT * FROM task_steps WHERE run=? AND key=?',
                                       (run['id'],run['task_step_id']))[0]
@@ -61,7 +61,7 @@ class DeepAgentRuntime:
                 return submission.final_text
 
             tools.append(finish_step)
-            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text 和证据；当前答复引用名为 response。'
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。对本步涉及的标准填写 id、claim 和自然语言 reason。普通文字无需证据编号或 deliveries。程序检查文件或要求审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
 
         thread_id=run.get('thread_id',run['id'])
         async with self.checkpoint_provider.open() as saver:

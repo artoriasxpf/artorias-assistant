@@ -117,6 +117,9 @@ class TaskRepository:
                     local = json.loads(producer['scope'])['step_spec']['local_reviews']
                     if wait.criterion_ref not in rules and wait.criterion_ref not in local:
                         raise ValueError('Unknown dependency criterion')
+                    policy = (local.get(wait.criterion_ref) or rules[wait.criterion_ref])["verification"]
+                    if policy["method"] not in ("program", "user"):
+                        raise ValueError("A gated dependency requires program or user verification")
                     version = rules.get(wait.criterion_ref,{}).get('v',1)
                     c.execute("INSERT INTO task_step_waits(run,consumer,producer,criterion_id,criterion_version,artifact_role,state) VALUES(?,?,?,?,?,?,'pending')",
                               (run['id'],item.key,wait.step_key,wait.criterion_ref,version,wait.artifact_role))

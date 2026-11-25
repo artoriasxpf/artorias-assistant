@@ -47,11 +47,20 @@ def refresh(c, task_id, search):
         status = "needs_review"
     elif required and all(x == "met" for x in required):
         status = "done"
-    elif not required and task["execution_count"]:
+    elif task["execution_count"] and progress.get("last_delivery", {}).get("outcome") == "completed" and (
+        not required or all(
+            progress["assessment_heads"][key]["verdict"] == "met"
+            or (rule["verification"]["method"] in ("self", "semantic")
+                and progress["assessment_heads"][key].get("claim") == "met")
+            for key, rule in rules.items() if rule["required"]
+        )
+    ):
         status = "needs_review"
     inputs = [task["goal"], json.loads(task["constraints"]), rules, status, progress]
     fingerprint = digest(dump(inputs))
     parts = [task["goal"], status]
+    if progress.get("last_delivery"):
+        parts.append(progress["last_delivery"]["summary"])
     parts.extend("阻塞：" + b["text"] for b in progress["blockers"])
     parts.extend(m["text"] for m in progress["milestones"][-3:])
     parts.extend(
@@ -111,6 +120,8 @@ def deliver_result(c, search, run, step, result, evidence, verdicts):
     progress = json.loads(task["progress"])
     ref = {"run": run["id"], "key": step["key"]}
     if applicable:
+        progress["last_delivery"] = dict(step_ref=ref, outcome=result.step_outcome,
+                                         summary=result.delivery_summary or result.final_text[:240])
         for value in result.milestones:
             replace_by(
                 progress["milestones"], "key", dict(value.model_dump(), step_ref=ref)
@@ -163,6 +174,9 @@ def deliver_result(c, search, run, step, result, evidence, verdicts):
                 "v": version,
                 "verdict": item["verdict"],
                 "assessment_id": aid,
+                "method": item["method"],
+                "claim": item["claim"],
+                "reason": item["reason"],
             }
         role = ev.get("role", "response")
         state = {"met": "satisfied", "unmet": "needs_replan", "pending": "pending"}[

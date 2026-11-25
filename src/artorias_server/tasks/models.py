@@ -25,9 +25,8 @@ class SheetCheck(PlanObject):
     params: Rows
 
 
-class Semantic(PlanObject):
-    method: Literal["semantic"]
-    rubric: Text
+class SelfAssessment(PlanObject):
+    method: Literal["self"] = "self"
 
 
 class UserReview(PlanObject):
@@ -38,7 +37,7 @@ class UserReview(PlanObject):
 class Criterion(PlanObject):
     text: Text
     required: bool = True
-    verification: Published | SheetCheck | Semantic | UserReview
+    verification: Published | SheetCheck | SelfAssessment | UserReview = Field(default_factory=SelfAssessment)
 
 
 class Initial(PlanObject):
@@ -123,28 +122,28 @@ class Delivery(PlanObject):
 class Milestone(PlanObject):
     key: Text
     text: Text
-    evidence_refs: list[Text] = Field(min_length=1)
+    evidence_refs: list[Text] = Field(default_factory=lambda: ["response"], min_length=1)
 
 
 class Blocker(PlanObject):
     op: Literal["open", "resolve"]
     id: Text
     text: Text
-    evidence_refs: list[Text] = Field(min_length=1)
+    evidence_refs: list[Text] = Field(default_factory=lambda: ["response"], min_length=1)
 
 
 class Claim(PlanObject):
     id: Text
-    v: int = Field(ge=1)
     claim: Literal["met", "partial", "unmet"]
-    evidence_refs: list[Text] = Field(min_length=1, max_length=1)
+    reason: Text
+    artifact_id: Text | None = Field(default=None, description="Published delivery for a program check or explicit file review only")
 
 
 class FinishStep(PlanObject):
     schema_version: Literal[2] = 2
     step_outcome: Literal["completed", "partial", "blocked", "failed"]
     final_text: str = Field(min_length=1, max_length=100000)
-    delivery_summary: Text
+    delivery_summary: Text | None = None
     deliveries: list[Delivery] = Field(default_factory=list, max_length=30)
     milestones: list[Milestone] = Field(default_factory=list, max_length=30)
     blocker_changes: list[Blocker] = Field(default_factory=list, max_length=30)
