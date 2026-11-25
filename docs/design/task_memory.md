@@ -38,8 +38,7 @@ repository.install 在事务中绑定 Task 与 Workspace、应用持久需求变
   "criteria": {"C1": {
     "v": 2, "text": "发布含500条数据行的Excel明细",
     "required": true,
-    "verification": {"method": "program", "rule": "published_xlsx_rows",
-      "params": {"sheet": "明细", "data_rows": 500, "header_rows": 1}}
+    "verification": {"method": "self"}
   }},
   "progress": {
     "milestones": [{"key": "preview_delivered", "text": "十行预览已交付",
@@ -53,7 +52,7 @@ repository.install 在事务中绑定 Task 与 Workspace、应用持久需求变
 }
 ```
 
-verification.method 取 self（默认）、program、user。程序验收规则用注册表按 rule 校验 params（表名、表头是否计数等必须明确）；模型不能指定可执行代码。self 记录模型自述理由，user 记录待确认问题。文本、方法、阈值或必选性改变均递增条目 v。验证结论独立于规则正文，assessment_heads 汇总最近的验收记录与对应 Step 的模型声明。
+verification.method 取 self（默认）或 user（用户明确要求确认）。Planner 将工作表或数据行数等要求写在标准正文中。self 记录模型自述理由，user 记录待确认问题。文本、方法、阈值或必选性改变均递增条目 v。验证结论独立于规则正文，assessment_heads 汇总最近的验收记录与对应 Step 的模型声明。
 
 milestones 按业务键合并，blockers 按稳定 ID 开启或解除（内部字段 id、text、state、step_ref），deliverables 按角色与产物版本归并。投影保留未解决阻塞、当前有效交付物与最近重要里程碑；历史完整明细按 Step 分页，不能截掉尚未解决的事项。现有每 Task 最多 30 条有效约束和 30 条有效标准的上限继续作为显式校验，达到时让 planner 合并重复项或建议拆分独立交付任务；禁止静默丢弃。
 
@@ -71,8 +70,7 @@ milestones 按业务键合并，blockers 按稳定 ID 开启或解除（内部�
     "task_patch": {"expected_revision": 2, "operations": [{
       "op": "replace", "field": "criteria", "id": "C1",
       "value": {"text": "发布含500条数据行的Excel明细", "required": true,
-        "verification": {"method": "program", "rule": "published_xlsx_rows",
-          "params": {"sheet": "明细", "data_rows": 500, "header_rows": 1}}},
+        "verification": {"method": "self"}},
       "evidence": "最终改交500行Excel"
     }]},
     "step_spec": {
@@ -96,7 +94,7 @@ milestones 按业务键合并，blockers 按稳定 ID 开启或解除（内部�
 {"step_outcome":"completed","final_text":"销量下降主要来自渠道 A。","criterion_claims":[{"id":"C1","claim":"met","reason":"正文指出了主要渠道。"}]}
 ```
 
-自评写入 Task progress 的 assessment_heads。claim 表达模型判断，verdict 保持 pending。普通任务完整交付后进入 needs_review，Run 可结束，用户可在后续消息提出修改。只有显式 user 标准产生确认待办。普通依赖使用 depends_on，严格门控 wait_for 限于 program 或 user。声明部分或未完成的必选标准仍需后续工作。程序检查已发布文件时，交付项给出工具返回的 artifact_id，标准通过同名字段选择文件。
+自评写入 Task progress 的 assessment_heads。claim 表达模型判断，verdict 保持 pending。普通任务完整交付后进入 needs_review，Run 可结束，用户可在后续消息提出修改。只有显式 user 标准产生确认待办。普通依赖使用 depends_on，wait_for 只等待显式用户确认。声明部分或未完成的必选标准仍需后续工作。用户需要确认指定文件时，交付项给出发布工具返回的 artifact_id，确认标准通过同名字段选择文件。
 
 执行器把 finish_step 注册为终止工具，schema 为以下提交对象。普通文本交付仅需正文、执行结果和适用标准的自评。程序校验成功后终止工具循环；校验出错返回可修复的字段错误。常规路径使用执行模型最后一次响应提交，无需再次调用模型。
 
@@ -126,7 +124,7 @@ StepResultV2 {
 }
 ```
 
-证据按所属用户、Session、Task、Workspace、产物版本校验，再从发布日志或结果正文核实。只生成候选文件可证明“已生成”，对“已交付”须查发布成功。部分进展记入 milestone；验收 verdict 取 pending、met、unmet。明确提交的最终产物未达标才记 unmet。检查器不可用或信息不足保持 pending 并记录原因。self 由程序关联本次 response，独立保存 claim、reason 与待验收的 verdict；user 评审等明确答复。评审可在事务外执行，落库时再次核对条目与产物版本。每个幂等键包含标准版本、证据版本及评审事件标识。
+证据按所属用户、Session、Task、Workspace、产物版本校验，再从发布日志或结果正文核实。只生成候选文件可证明“已生成”，对“已交付”须查发布成功。部分进展记入 milestone；验收 verdict 取 pending、met、unmet。self 由程序关联本次 response，使用相关交互和工具事实生成的 claim、reason 推进 Task。自评的 verdict 保持 pending。user 的 verdict 由用户决定更新为 met 或 unmet。评审可在事务外执行，落库时再次核对条目与产物版本。每个幂等键包含标准版本、证据版本及评审事件标识。
 
 ## 5. 合并规则与贯穿示例
 
@@ -135,13 +133,13 @@ StepResultV2 {
 | Plan 持久 delta | goal、constraints、criteria、revision | 程序做增量合并。修订 C1 后旧结论留历史，新版本回到 pending；退休项退出当前摘要 |
 | Step 的临时 goal、constraints、criteria | Step 快照 | 不向 Task 回填。失败也不撤销已经由用户确认的持久要求 |
 | Step 的交付和阻塞 | progress | 校验证据后按业务键更新当前投影。重复 (run,key) 返回已保存结果；同键不同内容作为冲突处理 |
-| 模型 claim、程序检查、用户确认 | assessments、assessment_heads | claim 仅触发相应验收。采用与当前条目及交付物版本匹配的有效评审。修订后的旧证据可重新验收 |
+| 模型 claim、用户确认 | assessments、assessment_heads | 自评更新进展和摘要。显式用户确认绑定当前标准与交付物版本 |
 | Step 终态 | execution_count、Task.status | Step 完成可对应 Task.open。全部必选项 met、交付条件满足且无阻塞才可 done。无显式标准的任务由明确验收策略或用户确认结束，避免空集合自动完成。待用户验收用 needs_review |
 | 有效 Task 投影变化 | summary、summary_input_hash；必要时搜索 outbox | 按第 6 节规则更新。Step 原文只进入交付历史 |
 
-**例一：计划与交付。** 原 Task 为“交付完整销售明细”，C1 v1 要求 CSV，K1 要求金额两位小数。用户说“先给我看前十行，最终改交500行Excel”。安装计划后 C1 变为 v2，K1 保留，Step 的“十行”只进入局部快照。执行结果引用已发布的 A10。程序写入预览里程碑，C1 v2 仍 pending，Task 为 open。下一个 Step 发布 A500，检查器核对发布记录、指定工作表和实际 500 条数据行，才将 C1 v2 判 met。确认其余必选条件和阻塞后结束 Task。
+**例一：计划与交付。** 原 Task 为“交付完整销售明细”，C1 v1 要求 CSV，K1 要求金额两位小数。用户说“先给我看前十行，最终改交500行Excel”。安装计划后 C1 变为 v2，K1 保留，Step 的“十行”只进入局部快照。执行结果引用已发布的 A10。程序写入预览里程碑，C1 v2 仍 pending，Task 为 open。下一个 Step 发布 A500，模型依据发布和行数统计的工具结果将 C1 v2 自评为 met。其余必选条件已完成且无阻塞时，Task 进入 needs_review。
 
-**例二：晚到和重试。** A500 的检查尚未完成时，用户将 C1 改为 1000 行，版本成为 v3。晚到的 met 归入 C1 v2 的历史，不会完成 v3。对于仍相关的真实交付可以保留事实，不能用旧 Step 重开已解除阻塞、覆盖新的当前交付物或降级新状态。自 base_revision 以来无法确认兼容的进展只记历史。重放相同 Step 或异步评审不重复计数或入队。用户只说“还是 Excel”且数量等要求未变时，保留原 ID、版本及证据。
+**例二：晚到和重试。** A500 的 Step 尚未交付时，用户将 C1 改为 1000 行，版本成为 v3。晚到的自评归入 C1 v2 的历史，不会完成 v3。对于仍相关的真实交付可以保留事实，不能用旧 Step 重开已解除阻塞、覆盖新的当前交付物或降级新状态。自 base_revision 以来无法确认兼容的进展只记历史。重放相同 Step 或异步评审不重复计数或入队。用户只说“还是 Excel”且数量等要求未变时，保留原 ID、版本及证据。
 
 ## 6. 一次 Run 的执行与 summary 更新点
 
@@ -157,7 +155,7 @@ flowchart TD
     H --> G
     G -->|文字交付| N["关联 response 并记录模型自评"]
     N --> J
-    G -->|严格验收| I["检查发布记录或创建确认待办"]
+    G -->|显式请求确认| I["校验交付引用并创建确认待办"]
     I -->|提交字段有误| G
     I -->|有效| J["交付事务：存结果和验收，合并 progress，推导状态"]
     J -->|还有就绪 Step| F
@@ -170,7 +168,7 @@ flowchart TD
 
 安装事务、交付事务及后续验收事务共用同一个刷新函数。创建 Task 时初始化摘要；以后取规范化 summary_inputs，包括目标、有效约束与验收定义/状态、重要里程碑、当前主要交付物、未解除阻塞和状态。按稳定键排序，排除时间戳、调用次数、工具日志、临时 Step 条件及用户答复原文。加入模板版本后计算 hash，相同直接返回，不同则用确定性模板渲染并同事务保存摘要和 hash。建议首版摘要上限 1000 中文字符，优先保留目标、阻塞、主要交付及待验收项；全部要求和证据另有精确读取入口。禁止把历史摘要反复输入模型滚动改写。
 
-示例：创建“交付完整明细，待发布 CSV” → Plan 改成“待发布 500 行 Excel” → Step 发布预览后“十行预览已交付，全量待验收” → 验收通过后“500 行 Excel 已发布并通过验收”。工具内部试读、重试、单纯关联旧 Task 不改变该摘要。搜索索引单独比较其文档投影，内容变化才写现有事务 outbox；搜索服务延迟不影响本轮读取。
+示例：创建“交付完整明细，待发布 CSV” → Plan 改成“待发布 500 行 Excel” → Step 发布预览后“十行预览已交付，全量待验收” → 完整交付后“500 行 Excel 已发布，自评完成”。工具内部试读、重试、单纯关联旧 Task 不改变该摘要。搜索索引单独比较其文档投影，内容变化才写现有事务 outbox；搜索服务延迟不影响本轮读取。
 
 ## 7. 代码落点、初始化与验证
 
@@ -178,11 +176,11 @@ flowchart TD
 2. **运行与回写**：在 runtime 工具装配处加入 Step 专属 finish_step，绑定服务端 run/key/task。executor.py 接收终止信号并保持原 SSE 最终正文；区分 waiting、失败及正常交付。repository.py 抽出要求、结果及验收的确定性合并函数。长评审用持久待办与幂等回调；服务端异常且没有有效 finish_step 时记录中断或失败，不凭最终文本宣布通过。
 3. **上下文与索引**：context.py 改读 progress 对象，加载当前目标、必须约束、本步引用的标准及版本、必要阻塞和交付引用。完整历史保留分页读取。results.py 继续返回纯文本。integrations/search/tasks/projection.py 从条目取 text，升级 projection_version，并通过现有快照重建机制重建 tasks 集合。
 4. **空库启动**：首次启动直接执行新 DDL。使用新的 ARTORIAS_DATA 或自行清理原运行数据后再启动。结构变更涉及业务库和图 checkpoint，程序不会删除用户文件。
-5. **验收**：覆盖重复标准、替换与退休、Goal 更新但执行失败、仅生成预览、发布冲突、500 行实际不合格、人工确认、标准修订后旧评审晚到、同 Run 多 Step、同 Step 重放、无关日志不刷新摘要、Search 暂停恢复、相同协议下的进程重启与 checkpoint 恢复。重点断言持久要求、证据版本、进度与摘要，以及实际 outbox 条数；只检查最终聊天文本无法验证上述行为。
+5. **验收**：覆盖重复标准、替换与退休、Goal 更新但执行失败、仅生成预览、发布冲突、自评部分完成或未完成、人工确认、标准修订后旧评审晚到、同 Run 多 Step、同 Step 重放、无关日志不刷新摘要、Search 暂停恢复、相同协议下的进程重启与 checkpoint 恢复。重点断言持久要求、证据版本、进度与摘要，以及实际 outbox 条数；只检查最终聊天文本无法验证上述行为。
 
 ## 8. 页面确认与依赖唤醒
 
-**交付、验收和调度各有自己的完成条件。** Step 提交 finish_step 后可以完成交付。Runtime 对每个相关 criterion 按 verification.method 分派；执行模型提交 claim 沿用本次调用，程序检查由注册的验收器执行，user 验收生成页面待办。只有计划明确要求“验收通过后继续”的后继 Step 才等待该结论。最终交付只等用户签收时，Run 可以正常结束，Task 保持 needs_review。
+**交付、验收和调度各有自己的完成条件。** Step 提交 finish_step 后可以完成交付。Runtime 对每个相关 criterion 按 verification.method 分派；执行模型提交 claim 沿用本次调用，user 验收生成页面待办。只有计划明确要求“验收通过后继续”的后继 Step 才等待该结论。最终交付只等用户签收时，Run 可以正常结束，Task 保持 needs_review。
 
 ### 8.1 计划依赖和持久化
 
@@ -235,7 +233,7 @@ flowchart TD
 
 - **进入等待。** 调度器扫描当前 Run 全部可运行 Step；遇到单个待验收项仍可执行其他独立项。仅当尚有未终结 Step 且均不可运行时，把 Run 置为 waiting，记录原因 assessment，释放 worker。已经交付的生产 Step 无需恢复模型 checkpoint。工具在执行中断点等待的路径继续使用原 checkpoint。
 - **用户决定事务。** 以 pending 为前提更新 review，追加一次 assessment，更新匹配证据版本的 waits，重新计算 progress、Task 状态和摘要，按需入搜索 outbox。所有依赖满足的消费者通过条件更新转为 ready；把对应等待 Run 置为可领取并持久化唤醒任务（若 Run 行本身是调度队列，直接更新该行）。事件与状态同事务落库。用户只确认最后一份交付时只更新 Task，已经结束的 Run 不重新入队。
-- **防止漏唤醒。** 注册等待与读取已有验收结论在同一事务内完成。停车前重查就绪条件，避免确认先到、worker 后停车。使用持久状态领取及幂等键；进程重启扫描 ready 和满足条件的 waiting 记录。重复 SSE、重复点击或两个 worker 竞争只产生一次有效转换。程序检查与用户确认使用同一组依赖状态。
+- **防止漏唤醒。** 注册等待与读取已有验收结论在同一事务内完成。停车前重查就绪条件，避免确认先到、worker 后停车。使用持久状态领取及幂等键；进程重启扫描 ready 和满足条件的 waiting 记录。重复 SSE、重复点击或两个 worker 竞争只产生一次有效转换。
 - **拒绝与旧结果。** “需要修改”保存用户反馈，将相应依赖转为 needs_replan，由后续修订 Step 生成新版本并重新申请验收；原全量 Step 不放行。旧页面请求不改变新版本，取消的 Run 不被迟到的确认唤醒。待用户处理期间不占用 worker，也不因超时自动通过。
 
 ### 8.4 实施与验收补充
@@ -253,7 +251,7 @@ flowchart TD
 | Plan 生成前 | 本轮原文、有限最近对话、同 Session 候选的 ID、关联来源、目标、短摘要和 revision。可被修改的候选附有效条目 ID、版本和短文本；对引用含糊或候选被截断的变更，先按 ID 补读或澄清 | integrations/search/tasks/recall.py 组装候选，tasks/planner.py 同步更新提示词、schema 和纠错提示。提交时事务内再校验版本 |
 | Step 首次执行 | Task 与 Workspace 绑定、当时的要求快照、本步目标和局部约束、所有适用的必守约束、所涉及标准及验收方式、相关未解阻塞、已满足的依赖和交付引用 | tasks/context.py 从新版 progress 对象选择字段。tasks/executor.py 在依赖就绪后构建并保存快照。执行模型的工具 schema 中加入 finish_step，其 claim 引用本步可见的标准与证据 |
 | Step 内工具循环 | 沿用本步快照，增量加入本轮工具调用和结果。默认只附交付预览、版本与 result_ref；确需复用全文时按引用分页获取 | runtime/service.py 与 tasks/results.py 约定同一种引用格式，统一使用 run_id 与 step_key。按依赖过滤后获取投影，避免先加载同 Run 所有交付全文 |
-| 独立评审与最终签收 | 自评复用本次执行上下文。程序检查及最终用户签收可直接处理事件并更新投影 | 评审回调复用第 8 节回写逻辑；只有后继 Step 需要运行时才构建执行上下文 |
+| 独立评审与最终签收 | 自评复用本次执行上下文。用户签收可直接处理事件并更新投影 | 评审回调复用第 8 节回写逻辑；只有后继 Step 需要运行时才构建执行上下文 |
 
 **快照与恢复。** 使用 task-memory-v2 选择策略，按 (run,key) 保存首次构造的上下文。后继 Step 就绪时读取验收和证据版本；已经执行的 Step 保留原要求快照，用于审计。工具审批沿用同一 checkpoint，交付写回时再次核对当前 Task revision。
 
@@ -280,7 +278,7 @@ flowchart TD
 ## 11. 本地实现与运行边界
 
 - 首次安装只接受 V2 计划；Task 数据库存储列名统一为 criteria。普通任务无强制签收。提交结构化结果后可结束 Run；需要阻塞后继时，由 planner 显式声明 wait_for。
-- 内置程序规则为 published 和 published_xlsx_rows。文件交付证据可引用本步成功发布的 Python artifact_id，或同一 Task、Run 内已提交的 Workspace change_id；文本证据引用 response。程序对文件的历史版本做核验。用户从确认卡片可读取完整文本或下载相应版本。
+- 文件引用的校验用于定位可回读的交付版本。文件交付证据可引用本步成功发布的 Python artifact_id，或同一 Task、Run 内已提交的 Workspace change_id；文本证据引用 response。程序对文件的历史版本做核验。用户从确认卡片可读取完整文本或下载相应版本。
 - finish_step 只注册到 Task 图。self 自评不触发独立模型请求。user 持久等待，页面通过 Session 事件游标重放恢复待办。所有用户决定按本地单用户授权处理。多租户身份系统、分布式 worker 租约及独立评审队列属于云端扩展。
 - 需要修改时保留意见和未通过的证据，将受影响的后继标为 needs_replan，下轮规划可继续原 Task。当前执行器不自动循环重做主观验收失败的产物。
 - 物理表定义以 task_schema.sql 为准。确认记录以 assessment_id 关联标准与证据，提交的 decision_key 与 state 共同实现重复点击幂等。result_json 中 verified_deliveries 按 evidence_ref 索引，含 role、version 与可用的 change_id、execution_id；完成时间由 Step 的 updated_at 记录。独立 Search 服务维持搜索库，业务事务通过 outbox 推送新版搜索文档。

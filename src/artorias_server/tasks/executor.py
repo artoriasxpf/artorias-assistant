@@ -87,7 +87,7 @@ class TaskRuntime:
                 if approval is None:
                     if submission is None:
                         raise ValueError('Missing structured step result')
-                    evidence,verdicts=await assess(self.store,run,step,submission)
+                    evidence,verdicts=assess(self.store,run,step,submission)
                     status=self.repo.deliver(run,step,submission,evidence,verdicts)
             except asyncio.CancelledError:
                 with self.store.tx() as c:c.execute("UPDATE task_steps SET status='interrupted' WHERE run=? AND key=?",(run['id'],step['key']))

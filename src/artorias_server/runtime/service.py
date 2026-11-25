@@ -61,7 +61,7 @@ class DeepAgentRuntime:
                 return submission.final_text
 
             tools.append(finish_step)
-            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。对本步涉及的标准填写 id、claim 和自然语言 reason。普通文字无需证据编号或 deliveries。程序检查文件或要求审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对本步涉及的标准填写 id、claim 和自然语言 reason。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
 
         thread_id=run.get('thread_id',run['id'])
         async with self.checkpoint_provider.open() as saver:

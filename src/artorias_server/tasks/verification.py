@@ -1,47 +1,10 @@
 """Resolve evidence from this execution only. User-facing claims are proposals."""
 
-import asyncio
 import hashlib
 import json
 from pathlib import Path
-from zipfile import ZipFile, BadZipFile
-from xml.etree import ElementTree as XML
 
 from .memory import digest
-
-
-def count_rows(path, params):
-    with ZipFile(path) as archive:
-        if sum(i.file_size for i in archive.infolist()) > 96_000_000:
-            raise ValueError("Workbook exceeds inspection budget")
-        workbook = XML.fromstring(archive.read("xl/workbook.xml"))
-        sheet = next(
-            (
-                s
-                for s in workbook.findall(".//{*}sheet")
-                if s.get("name") == params["sheet"]
-            ),
-            None,
-        )
-        if sheet is None:
-            return -1
-        rid = next(v for k, v in sheet.attrib.items() if k.endswith("}id"))
-        relationships = XML.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-        target = next(r.attrib["Target"] for r in relationships if r.get("Id") == rid)
-        member = target.lstrip("/") if target.startswith("/") else "xl/" + target
-        count = 0
-        with archive.open(member) as source:
-            for _, node in XML.iterparse(source, events=("end",)):
-                if node.tag.endswith("}row"):
-                    if any(
-                        cell.find("{*}v") is not None
-                        or cell.find("{*}is") is not None
-                        or cell.find("{*}f") is not None
-                        for cell in node.findall("{*}c")
-                    ):
-                        count += 1
-                    node.clear()
-        return max(0, count - params["header_rows"])
 
 
 def resolve(store, run, step, result):
@@ -52,7 +15,6 @@ def resolve(store, run, step, result):
             "role": "response",
         }
     }
-    paths = {}
     if result.deliveries:
         tables = {
             t["name"]
@@ -74,7 +36,6 @@ def resolve(store, run, step, result):
                         != change["after_hash"]
                     ):
                         raise ValueError("Workspace blob changed")
-                    paths[delivery.artifact_id] = blob
                     evidence[delivery.artifact_id] = dict(
                         artifact_id=delivery.artifact_id,
                         role=delivery.role,
@@ -112,7 +73,6 @@ def resolve(store, run, step, result):
                             != item["sha256"]
                         ):
                             raise ValueError("Artifact content changed")
-                        paths[aid] = path
                         evidence[aid] = dict(
                             artifact_id=aid,
                             version=item["sha256"],
@@ -143,43 +103,29 @@ def resolve(store, run, step, result):
         rule = local.get(claim.id) or rules.get(claim.id)
         if not rule or (claim.id not in local and spec["criterion_refs"] and claim.id not in spec["criterion_refs"]):
             raise ValueError("Criterion outside this step")
-        if rule["verification"]["method"] in ("program", "user") and claim.artifact_id and claim.artifact_id not in evidence:
+        if rule["verification"]["method"] == "user" and claim.artifact_id and claim.artifact_id not in evidence:
             raise ValueError("Criterion refers to an undeclared delivery")
-    return evidence, paths, rules, local
+    return evidence, rules, local
 
 
-async def assess(store, run, step, result):
-    evidence, paths, rules, local = resolve(store, run, step, result)
-    verdicts = []
+def assess(store, run, step, result):
+    evidence, rules, local = resolve(store, run, step, result)
+    assessments = []
     for claim in result.criterion_claims:
         rule = local.get(claim.id) or rules[claim.id]
         policy = rule["verification"]
-        method = policy["method"]
-        if method == "semantic":  # Previously persisted text rubric.
-            method = "self"
-        aid = (claim.artifact_id or "response") if method in ("program", "user") else "response"
-        item = dict(id=claim.id, v=rule.get("v", 1), local=claim.id in local,
-                    method=method, evidence_ref=aid, verdict="pending", reason=claim.reason,
-                    claim=claim.claim)
-        if method == "user" and claim.claim == "met":
-            item["question"] = policy["question"]
-        elif method == "program" and claim.claim == "met":
-            valid = aid in paths
-            if valid and policy["rule"] == "published_xlsx_rows":
-                try:
-                    count = await asyncio.to_thread(
-                        count_rows, paths[aid], policy["params"]
-                    )
-                    valid = count == policy["params"]["data_rows"]
-                except (
-                    ValueError,
-                    KeyError,
-                    OSError,
-                    XML.ParseError,
-                    StopIteration,
-                    BadZipFile,
-                ):
-                    valid = False
-            item.update(verdict="met" if valid else "unmet", reason=policy["rule"])
-        verdicts.append(item)
-    return evidence, verdicts
+        user_review = policy["method"] == "user"
+        assessment = dict(
+            id=claim.id,
+            v=rule.get("v", 1),
+            local=claim.id in local,
+            method="user" if user_review else "self",
+            evidence_ref=claim.artifact_id if user_review and claim.artifact_id else "response",
+            verdict="pending",
+            reason=claim.reason,
+            claim=claim.claim,
+        )
+        if user_review and claim.claim == "met":
+            assessment["question"] = policy["question"]
+        assessments.append(assessment)
+    return evidence, assessments

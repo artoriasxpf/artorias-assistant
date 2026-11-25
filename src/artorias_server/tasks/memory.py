@@ -50,7 +50,7 @@ def refresh(c, task_id, search):
     elif task["execution_count"] and progress.get("last_delivery", {}).get("outcome") == "completed" and (
         not required or all(
             progress["assessment_heads"][key]["verdict"] == "met"
-            or (rule["verification"]["method"] in ("self", "semantic")
+            or (rule["verification"]["method"] != "user"
                 and progress["assessment_heads"][key].get("claim") == "met")
             for key, rule in rules.items() if rule["required"]
         )
@@ -67,7 +67,11 @@ def refresh(c, task_id, search):
         d["role"] + " " + d["artifact_id"] for d in progress["deliverables"][-3:]
     )
     parts.extend(
-        v["text"] + " " + progress["assessment_heads"][k]["verdict"]
+        v["text"] + " " + (
+            "自评 " + progress["assessment_heads"][k]["claim"]
+            if progress["assessment_heads"][k].get("method") == "self"
+            else progress["assessment_heads"][k]["verdict"]
+        )
         for k, v in rules.items()
     )
     parts.extend(v["text"] for v in inputs[1].values())

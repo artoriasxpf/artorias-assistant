@@ -94,27 +94,6 @@ def test_cancel_deactivates_pending_review(tmp_path):
     assert store.claim() is None
 
 
-def test_xlsx_actual_rows(tmp_path):
-    from zipfile import ZipFile
-    from artorias_server.tasks.verification import count_rows
-
-    path = tmp_path / "data.xlsx"
-    with ZipFile(path, "w") as z:
-        z.writestr(
-            "xl/workbook.xml",
-            '<workbook xmlns:r="urn:r"><sheets><sheet name="Sales" r:id="r1"/></sheets></workbook>',
-        )
-        z.writestr(
-            "xl/_rels/workbook.xml.rels",
-            '<Relationships><Relationship Id="r1" Target="worksheets/s.xml"/></Relationships>',
-        )
-        z.writestr(
-            "xl/worksheets/s.xml",
-            '<worksheet xmlns="urn:x"><sheetData><row><c><v>header</v></c></row><row><c><v>1</v></c></row><row/></sheetData></worksheet>',
-        )
-    assert count_rows(path, dict(sheet="Sales", header_rows=1)) == 1
-
-
 def test_final_review_http_and_evidence(tmp_path):
     from fastapi.testclient import TestClient
     from artorias_server.api.app import create_http_app
@@ -156,8 +135,11 @@ def test_final_review_http_and_evidence(tmp_path):
         )
 
 
-@pytest.mark.parametrize("policy,expected", [(None, "needs_review"), ({"method":"program","rule":"published"}, "open")])
-def test_plain_text_delivery_does_not_prove_publication(tmp_path, policy, expected):
+@pytest.mark.parametrize(
+    "claim,expected",
+    [("met", "needs_review"), ("partial", "open"), ("unmet", "open")],
+)
+def test_self_assessment_updates_task(tmp_path, claim, expected):
     from artorias_server.tasks.verification import assess
     from artorias_server.tasks.models import Criterion, FinishStep
 
@@ -167,18 +149,27 @@ def test_plain_text_delivery_does_not_prove_publication(tmp_path, policy, expect
     run = store.claim()
     runtime = TaskRuntime(tmp_path, store, engine=object())
     item = plan_item("a", "分析")
-    item.initial_requirements.criteria = [Criterion(text="完成分析", **({"verification": policy} if policy else {}))]
+    item.initial_requirements.criteria = [Criterion(text="完成分析")]
     runtime.repo.install(run, Plan(kind="tasks", items=[item]), [])
     step = store.query("SELECT * FROM task_steps")[0]
     result = FinishStep(step_outcome="completed", final_text="结论及原因",
-                        criterion_claims=[Claim(id="C1", claim="met", reason="正文已说明原因")])
-    evidence, verdicts = asyncio.run(assess(store, run, step, result))
+                        criterion_claims=[Claim(id="C1", claim=claim, reason="根据本步正文自评")])
+    evidence, verdicts = assess(store, run, step, result)
     assert runtime.repo.deliver(run, step, result, evidence, verdicts) == expected
     assert list(evidence) == ["response"]
     assert not store.query("SELECT id FROM task_review_requests")
     progress = json.loads(store.query("SELECT progress FROM business_tasks")[0]["progress"])
     head = progress["assessment_heads"]["C1"]
-    assert head["claim"] == "met"
-    assert head["verdict"] == ("unmet" if policy else "pending")
-    if not policy:
-        assert head["method"] == "self" and head["reason"] == "正文已说明原因"
+    assert head["claim"] == claim
+    assert head["verdict"] == "pending"
+    assert head["method"] == "self" and head["reason"] == "根据本步正文自评"
+    summary = store.query("SELECT summary FROM business_tasks")[0]["summary"]
+    assert f"完成分析 自评 {claim}" in summary
+
+
+def test_planner_rejects_program_verification():
+    from pydantic import ValidationError
+    from artorias_server.tasks.models import Criterion
+
+    with pytest.raises(ValidationError):
+        Criterion(text="发布文件", verification={"method": "program", "rule": "published"})

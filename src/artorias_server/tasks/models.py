@@ -8,23 +8,6 @@ class PlanObject(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class Rows(PlanObject):
-    sheet: Text
-    data_rows: int = Field(ge=0)
-    header_rows: int = Field(default=1, ge=0)
-
-
-class Published(PlanObject):
-    method: Literal["program"]
-    rule: Literal["published"]
-
-
-class SheetCheck(PlanObject):
-    method: Literal["program"]
-    rule: Literal["published_xlsx_rows"]
-    params: Rows
-
-
 class SelfAssessment(PlanObject):
     method: Literal["self"] = "self"
 
@@ -37,7 +20,7 @@ class UserReview(PlanObject):
 class Criterion(PlanObject):
     text: Text
     required: bool = True
-    verification: Published | SheetCheck | SelfAssessment | UserReview = Field(default_factory=SelfAssessment)
+    verification: SelfAssessment | UserReview = Field(default_factory=SelfAssessment)
 
 
 class Initial(PlanObject):
@@ -136,7 +119,7 @@ class Claim(PlanObject):
     id: Text
     claim: Literal["met", "partial", "unmet"]
     reason: Text
-    artifact_id: Text | None = Field(default=None, description="Published delivery for a program check or explicit file review only")
+    artifact_id: Text | None = Field(default=None, description="Published delivery for an explicit file review only")
 
 
 class FinishStep(PlanObject):
