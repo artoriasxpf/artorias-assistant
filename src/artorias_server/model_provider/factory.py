@@ -8,8 +8,8 @@ def create_model(settings: ModelSettings | None = None):
         from langchain_openai import ChatOpenAI
         return ChatOpenAI(**kwargs)
     if settings.provider=="deepseek":
-        from langchain_deepseek import ChatDeepSeek
-        return ChatDeepSeek(**kwargs)
+        from .deepseek import DeepSeekChatModel
+        return DeepSeekChatModel(**kwargs)
     if settings.provider=="anthropic":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(**kwargs,max_tokens=settings.max_tokens)

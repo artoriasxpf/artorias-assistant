@@ -4,6 +4,7 @@ The all-in-one profile points this adapter at the existing app.sqlite to retain
 atomic file journal/event commits and compatibility. A standalone device may
 use its own database; network replication of these records is not implemented.
 """
+import json
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -27,6 +28,9 @@ class SQLiteWorkspaceJournal:
                     root TEXT NOT NULL, blob_root TEXT NOT NULL)''',
             ):
                 c.execute(statement)
+            columns = {r[1] for r in c.execute('PRAGMA table_info(workspace_operations)')}
+            if 'move_data' not in columns:
+                c.execute('ALTER TABLE workspace_operations ADD COLUMN move_data TEXT')
             # Only this adapter's ordinary tables. Never inspect/alter FTS internals.
             now = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
             for table in ('workspace_bindings','workspace_operations','changes','events','resource_changes'):
@@ -85,6 +89,9 @@ class SQLiteWorkspaceJournal:
                           (op['id'],resource['backend'],resource['location_id'],op['root'],resource['blob_root'],resource.get('task_id'),resource.get('workspace_id')))
             keys = ('id','root','session','run','path','before_hash','after_hash','before_mode','after_mode','reverts','kind','status')
             c.execute('INSERT INTO workspace_operations('+','.join(keys)+') VALUES('+','.join('?' for _ in keys)+')', tuple(op[k] for k in keys))
+            if op.get('move_data'):
+                c.execute('UPDATE workspace_operations SET move_data=? WHERE id=?',
+                          (op['move_data'], op['id']))
 
     def finish(self, op):
         with self.tx() as c:
@@ -110,4 +117,13 @@ class SQLiteWorkspaceJournal:
         return rows[0] if rows else None
 
     def list_changes(self, session_id):
-        return self._query('SELECT * FROM changes WHERE session=? ORDER BY rowid DESC', (session_id,))
+        rows = self._query('''SELECT c.*, o.move_data FROM changes c
+            LEFT JOIN workspace_operations o ON o.id=c.id WHERE c.session=? ORDER BY c.rowid DESC''',
+            (session_id,))
+        for row in rows:
+            move = row.pop('move_data')
+            if move:
+                details = json.loads(move)
+                row.update(kind='file.moved', source=details['source'], destination=details['destination'],
+                           version=details['version'])
+        return rows

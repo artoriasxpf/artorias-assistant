@@ -70,6 +70,16 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         return executor.delete(path)
 
     @tool
+    def project_move(source: str, destination: str, expected_source_version: str | None = None) -> dict:
+        """Move or rename one regular file on the same client, including across
+        authorized local workspaces. Both paths require write access. Destination
+        is the full new file path, must not exist, and its parent must exist.
+        No file content is returned. Pass a known source version to check for edits.
+        The change_id identifies the move for undo.
+        """
+        return executor.move(source, destination, expected_source_version)
+
+    @tool
     def project_authorize(path: str, access: Literal['read', 'write'] = 'write') -> dict:
         """Ask for Run-scoped access to a local absolute directory and its descendants.
         Request read for listing or reading, and write for changes. Retry the file
@@ -103,4 +113,5 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         )
         return await executor.run_python(tool_call_id, request, interrupt, emit)
 
-    return [project_tree, project_list, project_read, project_write, project_edit, project_delete, project_authorize, run_python]
+    return [project_tree, project_list, project_read, project_write, project_edit,
+            project_delete, project_move, project_authorize, run_python]

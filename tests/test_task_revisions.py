@@ -1,4 +1,5 @@
 from task_fixtures import plan_item, deliver
+import asyncio
 import json
 import pytest
 from artorias_server.storage.sqlite import Store
@@ -72,6 +73,38 @@ def test_stale_and_invalid_patch_atomicity(tmp_path):
     plan.items[0].task_patch.operations[0].evidence = '用户没有说过的话'
     with pytest.raises(ValueError): repo.install(next_run, plan, fresh)
     assert not store.query('SELECT * FROM task_steps WHERE run=?', (next_run['id'],))
+
+
+@pytest.mark.parametrize('patch', [
+    {},
+    {'expected_revision': 0},
+    {'operations': [{'op': 'replace', 'field': 'constraints', 'id': 'K1',
+                     'value': '法语', 'evidence': '改为法语'}]},
+])
+def test_model_plan_binds_revision_from_candidates(tmp_path, monkeypatch, patch):
+    from langchain_core.messages import AIMessage
+    from artorias_server.tasks import planner
+
+    store, repo, sid, first = setup(tmp_path)
+    previous, _, _ = change(store, repo, sid, first['task'])
+    store.finish(previous, 'completed')
+    store.submit(sid, '改为法语', 'three')
+    run = store.claim()
+    candidates = repo.candidates(sid, '报告')
+
+    class Model:
+        async def ainvoke(self, messages):
+            return AIMessage(content=json.dumps({'kind': 'tasks', 'items': [{
+                'key': 'next', 'relation': 'refine', 'task_id': first['task'],
+                'task_patch': patch, 'step_spec': {'goal': '更新报告'},
+            }]}))
+
+    monkeypatch.setattr(planner, 'create_model', Model)
+    plan = asyncio.run(planner.TaskPlanner(store).plan(run, candidates))
+    saved = repo.install(run, plan, candidates)
+    assert saved.items[0].task_patch.expected_revision == 1
+    step = store.query('SELECT base_revision,applied_revision FROM task_steps WHERE run=?', (run['id'],))[0]
+    assert step == {'base_revision': 1, 'applied_revision': 2 if patch.get('operations') else 1}
 
 
 def test_remove_preserves_unmentioned(tmp_path):

@@ -93,6 +93,112 @@ def test_connector_unavailable_never_falls_back(tmp_path,monkeypatch):
     assert not (tmp_path/'project/a').exists()
 
 
+def test_project_move_tool_across_local_workspaces_and_undo(tmp_path, monkeypatch):
+    from artorias_server.tools.registry import build_tools
+
+    db, sid, cat, local, cloud = setup(tmp_path, monkeypatch)
+    archive = cat.register('archive', str(tmp_path / 'archive'))
+    archived = tmp_path / 'archive'
+    archived.mkdir()
+    ws = WorkspaceService(db, sid, 'run')
+    ws.write('original.md', 'content', expected=None)
+    move = next(tool for tool in build_tools(ws, lambda *_: None) if tool.name == 'project_move')
+    source = tmp_path / 'project' / 'original.md'
+    destination = archived / 'renamed.md'
+    target = f"workspace://{archive['id']}/renamed.md"
+    original_inode = source.stat().st_ino
+    destination.write_text('existing')
+    with pytest.raises(FileExistsError):
+        move.invoke({'source': 'original.md', 'destination': target})
+    assert source.read_text() == 'content' and destination.read_text() == 'existing'
+    destination.unlink()
+    with pytest.raises(ValueError, match='版本冲突'):
+        move.invoke({'source': 'original.md', 'destination': target, 'expected_source_version': 'stale'})
+    with pytest.raises(PermissionError):
+        move.invoke({'source': 'original.md', 'destination': str(tmp_path / 'unauthorized.md')})
+    with pytest.raises(ConnectorUnavailable):
+        move.invoke({'source': 'original.md', 'destination': f"workspace://{cloud['id']}/original.md"})
+
+    result = move.invoke({'source': 'original.md', 'destination': target,
+                          'expected_source_version': ws.head('original.md')})
+    assert not source.exists() and destination.stat().st_ino == original_inode
+    change = next(row for row in ws.registry.list_changes(sid) if row['id'] == result['change_id'])
+    assert change['source']['workspace_id'] == local['id']
+    assert change['destination']['workspace_id'] == archive['id']
+    assert change['kind'] == 'file.moved'
+    cat.select(sid, archive['id'])
+    WorkspaceService(db, sid).revert(result['change_id'])
+    assert source.read_text() == 'content' and not destination.exists()
+
+
+def test_project_move_cross_volume_copy_and_interrupted_source_removal(tmp_path, monkeypatch):
+    from artorias_device.workspace import moves
+
+    db, sid, cat, _, _ = setup(tmp_path, monkeypatch)
+    archive = cat.register('archive', str(tmp_path / 'archive'))
+    destination = tmp_path / 'archive' / 'result.bin'
+    destination.parent.mkdir()
+    ws = WorkspaceService(db, sid, 'run')
+    source = tmp_path / 'project' / 'original.bin'
+    source.parent.mkdir(exist_ok=True)
+    data = b'\x00\xff' * 500_001
+    source.write_bytes(data)
+    source.chmod(0o640)
+    original_identity = moves._identity
+
+    def other_volume(path):
+        identity = original_identity(path)
+        if identity is not None and path == source:
+            identity[0] = -1
+        return identity
+
+    monkeypatch.setattr(moves, '_identity', other_volume)
+    target = f"workspace://{archive['id']}/result.bin"
+    original_unlink = Path.unlink
+
+    def fail_source_removal(path, *args, **kwargs):
+        if path == source:
+            raise OSError('simulated interruption')
+        return original_unlink(path, *args, **kwargs)
+
+    with monkeypatch.context() as failure:
+        failure.setattr(Path, 'unlink', fail_source_removal)
+        with pytest.raises(OSError, match='simulated interruption'):
+            ws.move('original.bin', target)
+    assert source.read_bytes() == destination.read_bytes() == data
+    assert destination.stat().st_mode & 0o777 == 0o640
+    assert db.query("SELECT status FROM workspace_operations WHERE kind='file.moved'") == [{'status': 'pending'}]
+    with pytest.raises(ValueError, match='未解决'):
+        ws.delete(target)
+
+    # Once the duplicate is removed, recovery sees the original state and
+    # clears the pending move. The next attempt can finish without data loss.
+    destination.unlink()
+    result = ws.move('original.bin', target)
+    assert result['change_id']
+    assert not source.exists() and destination.read_bytes() == data
+
+
+def test_project_case_only_rename_recovers_journal_after_disk_change(tmp_path, monkeypatch):
+    db, sid, _, _, _ = setup(tmp_path, monkeypatch)
+    ws = WorkspaceService(db, sid, 'run')
+    ws.write('Report.md', 'body', expected=None)
+    journal = ws.registry.changes
+
+    def interrupt(_):
+        raise OSError('simulated failure after rename')
+
+    with monkeypatch.context() as failure:
+        failure.setattr(journal, 'finish', interrupt)
+        with pytest.raises(OSError, match='simulated failure'):
+            ws.move('Report.md', 'report.md')
+    assert [entry.name for entry in (tmp_path / 'project').iterdir()] == ['report.md']
+    assert ws.read('report.md') == 'body'
+    change = next(row for row in journal.list_changes(sid) if row.get('kind') == 'file.moved')
+    ws.revert(change['id'])
+    assert [entry.name for entry in (tmp_path / 'project').iterdir()] == ['Report.md']
+
+
 def test_web_selection_grants_and_current_space(tmp_path,monkeypatch):
     from fastapi.testclient import TestClient
     from artorias_local_app.bootstrap import create_app

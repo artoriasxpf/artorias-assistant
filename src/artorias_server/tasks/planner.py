@@ -13,7 +13,7 @@ PLANNER = '''你是业务任务路由器，只返回符合 schema 的 JSON，不
 候选 recall_sources 标识 explicit（显式引用）、keyword（关键词）或 recent（近期）；命中和排序仅供参考，必须核对目标与本次意图。
 chat 不建任务；tasks 必须有任务。key 唯一，depends_on 仅引用本次其他 key，无环。
 new/followup 填 initial_requirements，初始 criteria 顺序编号 C1、C2，约束 K1、K2。
-continue/refine 提供 task_patch.expected_revision，永久变更给 operations 和本次用户原文 evidence。
+continue/refine 的 task_patch.expected_revision 由程序根据本轮候选绑定，模型省略该字段。永久变更给 operations 和本次用户原文 evidence。
 add 由系统分配 ID，可使用 client_ref。临时要求只写 step_spec。引用已有条目须核对版本。
 执行标准由执行模型根据相关历史交互、本步交付和实际工具结果自评，省略 verification。仅用户明确要求确认时使用 user。
 依赖交付用 depends_on；必须等验收通过再继续时用 step_spec.wait_for，只指向生产者 user 标准和产物角色。
@@ -36,6 +36,16 @@ def _validation_feedback(error):
     return json.dumps(issues, ensure_ascii=False)
 
 
+def _bind_candidate_revisions(plan: Plan, candidates) -> Plan:
+    revisions = {candidate['id']: candidate['revision'] for candidate in candidates}
+    for item in plan.items:
+        if item.relation in ('continue', 'refine') and item.task_id in revisions:
+            # Bind the version actually seen by the planner. The repository
+            # still compares it with the live row inside the write transaction.
+            item.task_patch.expected_revision = revisions[item.task_id]
+    return plan
+
+
 class TaskPlanner:
     def __init__(self, store, planner=None):
         self.store, self.planner = store, planner
@@ -46,7 +56,7 @@ class TaskPlanner:
         schema=Plan.model_json_schema()
         if self.planner:
             check_budget({'system':PLANNER,'schema':schema,'payload':payload})
-            return await self.planner(payload)
+            return _bind_candidate_revisions(await self.planner(payload), candidates)
         from artorias_server.runtime.service import text_content
         schema_prompt=PLANNER+'\nJSON schema:\n'+json.dumps(schema,ensure_ascii=False)
         user_content=json.dumps(payload,ensure_ascii=False)
@@ -69,8 +79,10 @@ class TaskPlanner:
             if len(lines)>2 and lines[0].strip().lower() in ('```json','```') and lines[-1].strip()=='```':
                 raw='\n'.join(lines[1:-1])
             try:
-                return Plan.model_validate_json(raw,strict=True)
+                plan = Plan.model_validate_json(raw,strict=True)
             except ValidationError as error:
                 feedback=_validation_feedback(error)
                 if attempt==1:
                     raise ValueError(f'任务规划校验失败，已尝试纠正一次。{feedback}') from None
+            else:
+                return _bind_candidate_revisions(plan, candidates)

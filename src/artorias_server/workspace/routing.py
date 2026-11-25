@@ -1,4 +1,5 @@
 """Resolve and authorize each operation; never reinterpret a rollback via current Session."""
+import json
 from pathlib import Path
 from .catalog import WorkspaceCatalog
 from .connectors import ConnectorRegistry
@@ -96,6 +97,20 @@ class WorkspaceService:
 
     def delete(self,path):
         ws,p,_,_=self._resolve(path,'write');return ws.delete(p)
+
+    def move(self, source, destination, *, expected_source_version=None, reverts=None):
+        origin, src, source_space, _ = self._resolve(source, 'write')
+        target, dst, destination_space, destination_path = self._resolve(destination, 'write')
+        if (source_space['kind'] != 'device_fs' or destination_space['kind'] != 'device_fs'
+                or source_space['location_id'] != destination_space['location_id']):
+            raise ConnectorUnavailable('移动要求源和目标位于同一客户端的本机文件系统')
+        move_to = getattr(origin, 'move_to', None)
+        if move_to is None:
+            raise ConnectorUnavailable('当前客户端连接器不支持文件移动')
+        result = move_to(src, target, dst, expected_version=expected_source_version, reverts=reverts)
+        return dict(result, source=source, destination=destination,
+                    resource={'backend': destination_space['kind'], 'location_id': destination_space['location_id'],
+                              'path': str(destination_path)})
     def files(self):
         w=self.workspace
         self.catalog.authorize(w['location_id'],w['root'],'read',self.run)
@@ -103,6 +118,15 @@ class WorkspaceService:
     def revert(self,cid):
         record=self.registry.find_change(cid,self.session)
         if not record:raise ValueError('变更不存在')
+        if record.get('move_data'):
+            if record['status'] != 'committed':
+                raise ValueError('只能撤销已完成的移动')
+            if record['location_id'] != self.catalog.device_id:
+                raise ConnectorUnavailable('原移动所在客户端不可用')
+            details = json.loads(record['move_data'])
+            result = self.move(details['destination']['path'], details['source']['path'],
+                               expected_source_version=details['version'], reverts=cid)
+            return result['change_id']
         backend=record['backend'] or 'device_fs';location=record['location_id'] or self.catalog.device_id
         target=Path(record['root'])/record['path']
         if backend=='cloud_storage':

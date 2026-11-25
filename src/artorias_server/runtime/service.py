@@ -85,6 +85,7 @@ class DeepAgentRuntime:
                 system_prompt=(
                     '你是 Artorias 个人助理。先用 project_tree 小范围浏览；truncated 为真时缩小目录或分层查看。'
                     '只有需要完整的单层列表时才用 project_list。用 project_read 分页读取，用 project_write 或 project_edit 修改。'
+                    '用 project_move 移动或改名本机文件，提供完整目标文件路径；改名无需读取正文。'
                     '分析多个文件或长文件时，每批最多调用 3 次 project_read，每次 limit 不超过 2000。'
                     '每批返回后先分析本批，在简短的中间回复里记下要点和来源路径、页范围，再发起下一批读取。'
                     '需要续读时使用该文件上一页的 next_offset 和 version 作为 offset 和 expected_version。'
@@ -97,7 +98,7 @@ class DeepAgentRuntime:
             )
             result=None
             from langgraph.types import Command
-            config={'configurable':{'thread_id':thread_id},'recursion_limit':50}
+            config={'configurable':{'thread_id':thread_id},'recursion_limit':200}
             payload=Command(resume=run['decision']) if run.get('decision') else {'messages':messages}
             seen_calls=set()
             seen_results=set()
