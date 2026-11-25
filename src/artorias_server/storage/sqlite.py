@@ -68,13 +68,23 @@ class Store:
                 c.execute("UPDATE jobs SET status='running' WHERE run=?",(row['id'],));c.execute("UPDATE runs SET status='running' WHERE id=?",(row['id'],))
                 result=dict(row)
                 decision=c.execute('SELECT value FROM decisions WHERE run=?',(row['id'],)).fetchone()
-                if decision:result['decision']=decision[0]
+                if decision:
+                    value = decision[0]
+                    result['decision'] = json.loads(value) if value.startswith('{') else value
                 return result
     def finish(self,run,status,text=None,*,approval=None):
         with self.tx() as c:
             c.execute('UPDATE runs SET status=? WHERE id=?',(status,run['id']))
             c.execute("UPDATE jobs SET status='done' WHERE run=?",(run['id'],))
             if text is not None:c.execute('INSERT INTO messages(id,session,run,role,content) VALUES(?,?,?,?,?)',(uid(),run['session'],run['id'],'assistant',text))
+            if status in ('failed', 'cancelled', 'completed', 'interrupted') and c.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='permission_requests'"
+            ).fetchone():
+                c.execute(
+                    """UPDATE permission_requests SET state='cancelled' WHERE run_id=?
+                       AND (state='pending' OR (state='approved' AND choice='approve'))""",
+                    (run['id'],),
+                )
             if approval is not None:
                 c.execute("INSERT INTO events(session,run,kind,payload) VALUES(?,?,'approval.requested',?)",
                           (run['session'],run['id'],json.dumps(approval,ensure_ascii=False)))
@@ -85,9 +95,27 @@ class Store:
             self.emit(run['session'],run['id'],'run.interrupted',{'reason':'进程中断；请核对已产生的文件，再发送新消息继续。'})
 
     def decide(self,rid,value,request_seq=None):
+        allowed = ('approve', 'remember', 'reject')
+        individual = isinstance(value, dict)
+        if not individual and value not in allowed:
+            raise ValueError('Invalid decision')
         with self.tx() as c:
             row=c.execute('SELECT session,status FROM runs WHERE id=?',(rid,)).fetchone()
-            if not row or row['status']!='waiting':raise ValueError('审批已处理或不存在')
+            if not row:
+                raise ValueError('审批不存在')
+            if request_seq is not None:
+                previous = c.execute(
+                    """SELECT payload FROM events WHERE run=? AND kind='approval.decided'
+                       AND json_extract(payload,'$.request_seq')=? ORDER BY seq DESC LIMIT 1""",
+                    (rid, request_seq),
+                ).fetchone()
+                if previous:
+                    payload = json.loads(previous['payload'])
+                    if payload.get('decisions' if individual else 'decision') == value:
+                        return
+                    raise ValueError('此审批已提交不同决定')
+            if row['status'] != 'waiting':
+                raise ValueError('审批已处理或不存在')
             request=c.execute(
                 "SELECT seq,payload FROM events WHERE session=? AND run=? AND kind='approval.requested' ORDER BY seq DESC LIMIT 1",
                 (row['session'],rid),
@@ -95,8 +123,25 @@ class Store:
             if request_seq is not None and (not request or request['seq']!=request_seq):
                 raise ValueError('审批请求已更新，请处理最新请求')
             pending=json.loads(request['payload']) if request else {}
+            items = pending.get('requests', [])
+            choices = value if individual else {item['request_id']: value for item in items}
+            if individual and (not items or set(choices) != {item['request_id'] for item in items}):
+                raise ValueError('请处理当前批次的所有审批项')
+            if value == 'remember' and len(items) != 1:
+                raise ValueError('请选择一项具体权限')
+            from artorias_server.permissions import record_decision
+            for item in items:
+                choice = choices[item['request_id']]
+                if choice not in allowed or (choice == 'remember' and not item.get('allow_remember')):
+                    raise ValueError('无效的权限决定')
+                if item.get('permission_request_id'):
+                    record_decision(c, item['permission_request_id'], row['session'], rid, choice)
+            resume_value = json.dumps({
+                key: 'approve' if choice == 'remember' else choice for key, choice in choices.items()
+            }) if individual else ('approve' if value == 'remember' else value)
             decision={
-                'decision':value,
+                'decision':None if individual else value,
+                **({'decisions': choices} if individual else {}),
                 'task_id':pending.get('task_id'),
                 'request_seq':request['seq'] if request else None,
                 'requests':[
@@ -104,7 +149,7 @@ class Store:
                     for item in pending.get('requests',[]) if isinstance(item,dict)
                 ],
             }
-            c.execute('INSERT INTO decisions(run,value) VALUES(?,?) ON CONFLICT(run) DO UPDATE SET value=excluded.value',(rid,value))
+            c.execute('INSERT INTO decisions(run,value) VALUES(?,?) ON CONFLICT(run) DO UPDATE SET value=excluded.value',(rid,resume_value))
             c.execute("UPDATE runs SET status='queued' WHERE id=?",(rid,))
             c.execute("UPDATE jobs SET status='queued' WHERE run=?",(rid,))
             c.execute("INSERT INTO events(session,run,kind,payload) VALUES(?,?,'approval.decided',?)",

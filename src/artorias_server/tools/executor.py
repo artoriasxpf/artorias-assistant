@@ -1,7 +1,8 @@
 """Deployment-owned executors; workspace routing stays with file operations."""
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from artorias_shared.approvals import ApprovalRequest
+from artorias_server.permissions import MissingPermission, fingerprint
 from artorias_shared.execution.models import OutputPolicy, PythonRequest
 from artorias_shared.ports.execution import ProjectWorkspacePort
 from artorias_shared.tools import ToolRequest, ToolResult
@@ -48,6 +49,42 @@ class WorkspaceToolExecutor:
         self.execution_service = execution_service
         self.sandbox = ToolExecutor(sandbox)
 
+    def _approval(self, call_id, resource, operation, approve, details):
+        ws = self.workspace
+        request_id = ws.permissions.request(ws, call_id, resource, operation)
+        if request_id is None:
+            return False
+        if approve({**details, 'permission_request_id': request_id,
+                    'allow_remember': True}) == 'reject':
+            return False
+        return ws.permissions.claim(request_id)
+
+    def file_operation(self, call_id, path, action, directory, operation, approve):
+        ws = self.workspace
+        if not hasattr(ws, 'permissions'):
+            return operation()
+        try:
+            workspace, target = ws._target(path, directory=directory)
+            ws._authorize(workspace, target, action, directory)
+        except MissingPermission as error:
+            resource = error.resource
+        else:
+            return operation()
+
+        details = {'kind': 'file_access', 'path': resource['root'], 'access': action,
+                   'resource_kind': resource['resource_kind'],
+                   'location_id': resource['location_id'], 'workspace_id': resource['workspace_id']}
+        choice = self._approval(call_id, resource, 'file_operation', approve, details)
+        if not choice:
+            return {'rejected': True}
+        if choice == 'remember':
+            return operation()
+        token = ws.once.set(resource)
+        try:
+            return operation()
+        finally:
+            ws.once.reset(token)
+
     def list_directory(self, path):
         return {'path': path, 'entries': self.workspace.list_directory(path)}
 
@@ -70,7 +107,7 @@ class WorkspaceToolExecutor:
     def delete(self, path):
         return self.workspace.delete(path)
 
-    def authorize(self, path, access, approve):
+    def authorize(self, path, access, approve, call_id=None):
         if not hasattr(self.workspace, 'grant_access'):
             raise ConnectorUnavailable('当前工作空间不支持本机目录授权')
         target = PurePosixPath(path)
@@ -79,6 +116,18 @@ class WorkspaceToolExecutor:
         if access not in ('read', 'write'):
             raise ValueError('access 必须为 read 或 write')
         request = ApprovalRequest('file_access', path, {'access':access, 'scope':'当前 Run；包含目录下的文件'})
+        if call_id and hasattr(self.workspace, 'permissions'):
+            ws = self.workspace
+            canonical = str(Path(path).resolve())
+            ws.catalog._safe_root(canonical)
+            resource = dict(location_id=ws.catalog.device_id, action=access,
+                            resource_kind='directory', root=canonical)
+            if not self._approval(call_id, resource, 'explicit_directory', approve,
+                                  {**request.to_payload(), 'path': canonical, 'approve_scope': 'run'}):
+                return {'rejected': True}
+            if ws.permissions.matching(ws.session, resource):
+                return {'path': canonical, 'access': access, 'scope': 'session'}
+            return ws.grant_access(canonical, access)
         if approve(request.to_payload()) != 'approve':
             return {'rejected': True}
         return self.workspace.grant_access(path, access)
@@ -96,7 +145,17 @@ class WorkspaceToolExecutor:
             result = await self.sandbox.run_python(self.workspace, request.path)
         else:
             plan = service.prepare(self.workspace, call_id, request)
-            if approve(service.approval(plan)) != 'approve':
+            if hasattr(self.workspace, 'permissions'):
+                ws = self.workspace
+                rule = service.permission_rule(ws, plan)
+                resource = dict(location_id=rule['location_id'], workspace_id=rule['workspace_id'],
+                                action='execute', resource_kind='command', rule=rule,
+                                rule_hash=fingerprint(rule))
+                if not ws.permissions.matching(ws.session, resource) and not self._approval(
+                    call_id, resource, plan['plan_hash'], approve, {**service.approval(plan), 'rule': rule},
+                ):
+                    return service.reject(plan)
+            elif approve(service.approval(plan)) != 'approve':
                 return service.reject(plan)
             result = await service.execute(self.workspace, plan)
         emit('tool.result', {**result, 'call_id':call_id, 'name':'run_python'})

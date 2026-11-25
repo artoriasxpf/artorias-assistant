@@ -40,7 +40,7 @@ class DeepAgentRuntime:
                 '其他目标由调度器执行。依赖结果可引用，不要重复执行。'
                 '如与原始用户消息冲突，遵循用户要求并报告冲突。不要虚报完成。\n'
                 +json.dumps(run['task_context'],ensure_ascii=False)})
-        messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；无权限先 project_authorize，拒绝后不得重试同一授权。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
+        messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；缺少文件权限时工具会申请授权；拒绝后停止对该目标重复申请。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
         tools=list(self.tool_factory(ws,emit))
         if run.get('task_id'):
             from artorias_server.tasks.results import result_tool
@@ -67,7 +67,7 @@ class DeepAgentRuntime:
                     '需要续读时使用该文件上一页的 next_offset 和 version 作为 offset 和 expected_version。'
                     '完成各批分析后再汇总；明确标注未读完、读取失败或版本变化的文件。工具结果只有预览时，不把省略的正文算作已分析。'
                     '相对路径走已绑定的本机或云端工作空间，用户给出本机绝对路径时保留它。'
-                    '本机路径未授权时先用 project_authorize 请求最小权限；拒绝后不得重试同一授权。'
+                    '文件工具会申请最小权限。Python 准备需要额外本机目录权限时可用 project_authorize；拒绝后不得重复申请。'
                     '覆盖已有文件前先读取。执行 Python 用 run_python，默认由绑定空间决定执行位置，等待用户审批。'
                     '不要声称未实际执行的操作成功。不要自行拆分业务 Task。'
                 ),

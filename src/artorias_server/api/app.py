@@ -90,8 +90,7 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
     def cancel(rid:str):return service.cancel_run(rid)
     @app.post('/api/runs/{rid}/decision')
     def decision(rid:str,body:dict):
-        value=body.get('decision')
-        if value not in ('approve','reject'):raise ValueError('Invalid decision')
+        value=body.get('decisions', body.get('decision'))
         return service.decide(rid,value,body.get('request_seq'))
     @app.get('/api/sessions/{sid}/workspace')
     def workspace(sid:str):
@@ -154,10 +153,59 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
     @app.post('/api/workspaces')
     def register_workspace(body:dict):
         # This authenticated local UI action is the owner's persistent grant.
-        return catalog.register(body['name'],body['root'],body.get('kind','device_fs'))
+        return catalog.register(body['name'],body['root'],body.get('kind','device_fs'),
+                                persistent=body.get('persistent', True) is True)
     @app.post('/api/sessions/{sid}/workspace')
     def select_workspace(sid:str,body:dict):
         return catalog.select(sid,body['workspace_id'])
+    from artorias_server.permissions import Permissions
+    Permissions(store)
+
+    @app.post('/api/sessions/{sid}/permissions/workspace')
+    def allow_session_workspace(sid: str, body: dict):
+        from artorias_shared.ids import uid
+
+        store.require(sid)
+        workspace = catalog.get(body['workspace_id'])
+        access = body['access']
+        if access not in ('read', 'write'):
+            raise ValueError('access 必须为 read 或 write')
+        with store.tx() as db:
+            existing = db.execute(
+                """SELECT id FROM permission_grants WHERE session_id=? AND workspace_id=?
+                   AND resource_kind='directory' AND root=? AND action=? AND revoked_at IS NULL""",
+                (sid, workspace['id'], workspace['root'], access),
+            ).fetchone()
+            if existing:
+                return {'id': existing['id']}
+            grant_id = uid()
+            db.execute(
+                """INSERT INTO permission_grants
+                   (id,session_id,workspace_id,location_id,action,resource_kind,root)
+                   VALUES (?,?,?,?,?,'directory',?)""",
+                (grant_id, sid, workspace['id'], workspace['location_id'], access, workspace['root']),
+            )
+        return {'id': grant_id}
+
+    @app.get('/api/sessions/{sid}/permissions')
+    def session_permissions(sid: str):
+        store.require(sid)
+        return store.query(
+            'SELECT * FROM permission_grants WHERE session_id=? AND revoked_at IS NULL ORDER BY created_at',
+            (sid,),
+        )
+
+    @app.post('/api/sessions/{sid}/permissions/{gid}/revoke')
+    def revoke_session_permission(sid: str, gid: str):
+        store.require(sid)
+        with store.tx() as db:
+            updated = db.execute(
+                """UPDATE permission_grants SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                   WHERE id=? AND session_id=? AND revoked_at IS NULL""",
+                (gid, sid),
+            )
+        return {'revoked': bool(updated.rowcount)}
+
     @app.get('/api/workspace-grants')
     def grants():return store.query('SELECT * FROM workspace_grants')
     @app.post('/api/workspace-grants/{gid}/revoke')
