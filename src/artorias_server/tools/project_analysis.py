@@ -2,7 +2,7 @@
 from collections import Counter, OrderedDict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
@@ -17,6 +17,8 @@ from artorias_shared.ids import uid
 from artorias_shared.workspace import ConnectorUnavailable
 from .files import json_bytes
 
+page_request = ContextVar("project_page_request", default=None)
+
 OUTPUT_BYTES = 24 * 1024
 TEXT_BYTES = 1_000_000
 PAGE_ENTRIES = 2_000
@@ -30,6 +32,7 @@ class Arguments(BaseModel):
 
 
 class InventoryArguments(Arguments):
+    snapshot_page: bool = Field(default=False, description="Replayable inventory page with exact entries and stable cursor. Use default filters.")
     root: PathArgument = '.'
     include: list[Glob] = Field(default_factory=list, max_length=20)
     exclude: list[Glob] = Field(default_factory=list, max_length=20)
@@ -40,6 +43,7 @@ class InventoryArguments(Arguments):
 
 
 class SearchArguments(Arguments):
+    snapshot_page: bool = Field(default=False, description="Replayable page of literal matches. Use root and query with default filters.")
     root: PathArgument | None = None
     inventory_id: str | None = Field(default=None, max_length=80)
     query: str = Field(min_length=1, max_length=256)
@@ -156,6 +160,35 @@ class ProjectAnalysis:
         self.workspace = workspace
         self.files = files
         self.scope = tuple(getattr(workspace, field, None) for field in ('session', 'run', 'task', 'step'))
+
+    def snapshot_page(self, args):
+        options = args.model_dump(exclude_defaults=True)
+        allowed = {'root', 'cursor', 'query', 'snapshot_page'}
+        if options.keys() - allowed:
+            raise ValueError('快照分页支持 root、cursor 和搜索 query；其他选项请使用普通模式')
+        endpoint, path, _ = self.workspace.analysis_root(args.root or '.')
+        request_id = page_request.get() or uid()
+        if isinstance(args, SearchArguments):
+            read = getattr(endpoint, 'analysis_search_page', None)
+            options = {'query': args.query}
+        else:
+            read = getattr(endpoint, 'analysis_inventory_page', None)
+            options = {'limit': 8}
+        if read is None:
+            return {'status': 'unsupported'}
+        return read(path, request_id=request_id, cursor=args.cursor, **options)
+
+    def byte_page(self, path, offset, limit, expected_version):
+        if offset < 0 or not 4 <= limit <= 4096 or (offset and not expected_version):
+            raise ValueError('字节分页需要有效的范围和续读版本')
+        endpoint, relative, _, _ = self.workspace._resolve(path, 'read')
+        read = getattr(endpoint, 'analysis_range', None)
+        if read is None:
+            return {'status': 'unsupported'}
+        options = dict(offset=offset, limit=limit, expected_version=expected_version)
+        if getattr(endpoint, 'analysis_range_async', False):
+            options['request_id'] = page_request.get() or uid()
+        return read(relative, **options)
 
     def inventory_options(self, token):
         return CACHED_SCANS.get(token, self.scope, 'inventory_id')

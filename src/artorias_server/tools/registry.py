@@ -57,6 +57,8 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         Report coverage and exclusions when using inventory to make recommendations.
         """
         args = InventoryArguments(**kwargs)
+        if args.snapshot_page:
+            return file_operation(args.root, 'read', True, lambda: analysis.snapshot_page(args))
         return measure('project_inventory', lambda: file_operation(
             args.root, 'read', True, lambda: analysis.inventory(args),
         ))
@@ -68,6 +70,8 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         If next_cursor is present, repeat the original options to continue.
         """
         args = SearchArguments(**kwargs)
+        if args.snapshot_page:
+            return file_operation(args.root or '.', 'read', True, lambda: analysis.snapshot_page(args))
         inventory = analysis.inventory_options(args.inventory_id) if args.inventory_id else None
         root = args.root or (inventory['root'] if inventory else '.')
         return measure('project_search', lambda: stopped('cursor_expired') if args.inventory_id and not inventory
@@ -111,12 +115,14 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
 
     @tool
     def project_read(path: str, offset: int = 0, limit: int = 2000,
-                     expected_version: str | None = None) -> dict:
+                     expected_version: str | None = None, unit: Literal["unicode_character", "byte"] = "unicode_character") -> dict:
         """Read one UTF-8 page from an authorized file. For the next page, pass
-        next_offset as offset and version as expected_version.
+        next_offset as offset and version as expected_version. For large files use byte pages
+        (limit 4–4096) and continue with next_start and the returned version.
         """
         return file_operation(path, 'read', False,
-                              lambda: executor.read(path, offset, limit, expected_version))
+                              lambda: analysis.byte_page(path, offset, limit, expected_version) if unit == 'byte'
+                              else executor.read(path, offset, limit, expected_version))
 
     @tool
     def project_write(path: str, content: str) -> dict:

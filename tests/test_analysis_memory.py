@@ -1,6 +1,8 @@
 import asyncio
 import json
 
+import pytest
+
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -19,13 +21,13 @@ class AnalysisModel(GenericFakeChatModel):
     def _generate(self, messages, *args, **kwargs):
         batch = None
         for message in reversed(messages):
-            if isinstance(message, ToolMessage) and message.name == 'analysis_next_batch':
+            if isinstance(message, ToolMessage) and message.name == 'project_read':
                 if message.content.startswith('{'):
                     batch = json.loads(message.content)
                     break
         names = [item.name for item in messages if isinstance(item, ToolMessage)]
         if batch:
-            assert batch['results'][0]['content'] == '示例文件\n'
+            assert batch['content'] == '示例文件\n'
             reply = AIMessage(content='', tool_calls=[{
                 'name': 'record_analysis_note', 'id': 'save-note',
                 'args': {'batch_id': batch['batch_id'], 'summary': '找到示例', 'findings': [
@@ -36,8 +38,8 @@ class AnalysisModel(GenericFakeChatModel):
             reply = finish_message('已核对示例文件')
         else:
             reply = AIMessage(content='', tool_calls=[{
-                'name': 'analysis_next_batch', 'id': 'read-batch',
-                'args': {'purpose': '读取示例', 'reads': [{'path': 'example.txt'}]},
+                'name': 'project_read', 'id': 'read-batch',
+                'args': {'path': 'example.txt', 'unit': 'byte'},
             }])
         return self._reply(reply, messages, *args, **kwargs)
 
@@ -78,8 +80,8 @@ def test_analysis_pipeline_commits_actual_presented_range(tmp_path, monkeypatch)
 
 def test_recovered_step_reuses_committed_note_and_replays_pending_batch(tmp_path, monkeypatch):
     from contextlib import aclosing
-    from artorias_server.analysis.repository import AnalysisRepository
-    from artorias_server.analysis.models import BatchInput, NoteInput
+    from artorias_server.tools.analysis.repository import AnalysisRepository
+    from artorias_server.tools.analysis.models import NoteInput
 
     monkeypatch.setenv('ARTORIAS_WORKSPACE', str(tmp_path / 'project'))
     data = tmp_path / 'data'
@@ -106,7 +108,7 @@ def test_recovered_step_reuses_committed_note_and_replays_pending_batch(tmp_path
     analysis = repo.attach(dict(run, task_id=step['task']), plan.items[0].analysis,
                            workspace.describe()['id'], 'review')
     # One committed batch from a prior model invocation, with provenance.
-    request = BatchInput(purpose='先前批次', reads=[{'path': 'example.txt'}])
+    request = {'tool': 'project_read', 'args': {'path': 'example.txt', 'unit': 'byte'}}
     batch = repo.plan(analysis['id'], 'first', request)
     identity = workspace.describe()
     receipt = [{'requested_path': 'example.txt', 'path': str(tmp_path / 'project' / 'example.txt'),
@@ -123,7 +125,7 @@ def test_recovered_step_reuses_committed_note_and_replays_pending_batch(tmp_path
     async def stop_after_read():
         async with aclosing(runtime.execute(run)) as events:
             async for kind, result in events:
-                if kind == 'tool.result' and result['name'] == 'analysis_next_batch':
+                if kind == 'tool.result' and result['name'] == 'project_read':
                     return json.loads(result['content'])['batch_id']
         raise AssertionError('没有返回读取批次')
 
@@ -233,3 +235,106 @@ def test_search_pages_replay_within_a_file(tmp_path, monkeypatch):
     assert first == endpoint.analysis_search_page(relative, request_id='a', cursor=None, query='needle')
     other = endpoint.analysis_search_page(relative, request_id='c', cursor=first['next_cursor'], query='other')
     assert other['status'] == 'cursor_expired'
+
+
+def test_analysis_policy_and_project_receipts(tmp_path, monkeypatch):
+    from artorias_server.permissions import tool_call
+    from artorias_server.tools.analysis.service import AnalysisSession
+    from artorias_server.tools.policy import READ_TOOLS, step_tools
+    from artorias_server.tools.registry import build_tools
+
+    monkeypatch.setenv('ARTORIAS_WORKSPACE', str(tmp_path / 'project'))
+    (tmp_path / 'data').mkdir()
+    store = Store(tmp_path / 'data' / 'state.sqlite')
+    session = store.session()
+    store.submit(session, '分析目录', 'run')
+    run = store.claim()
+    ws = create_workspace(store, session, run['id'])
+    ws.write('example.txt', 'first\nsecond\n')
+    analysis = AnalysisSession(store, dict(run, step_key='inspect', task_id='task', analysis_plan={
+        'analysis_type': 'document_directory', 'intent': 'summary', 'goal': '核对目录', 'roots': ['.'],
+    }), ws)
+    tools = build_tools(ws, lambda *_: None)
+    assert {t.name for t in step_tools(tools, None, True)} == READ_TOOLS
+    mixed = step_tools(tools, ['project_write'], True)
+    assert 'project_write' in {t.name for t in mixed}
+    assert 'run_python' not in {t.name for t in mixed}
+    bound = {t.name: t for t in analysis.bind_project_tools(mixed) + analysis.tools()}
+    cases = [
+        ('project_inventory', {'root': '.', 'snapshot_page': True}, 'metadata'),
+        ('project_search', {'query': 'first', 'snapshot_page': True}, 'snippet'),
+        ('project_tree', {}, 'metadata'),
+        ('project_list', {}, 'metadata'),
+        ('project_read', {'path': 'example.txt'}, 'content'),
+        ('project_read_many', {'items': [{'path': 'example.txt', 'line_start': 2}]}, 'content'),
+    ]
+    for i, (name, args, kind) in enumerate(cases):
+        token = tool_call.set(str(i))
+        try:
+            result = bound[name].invoke(args)
+            with pytest.raises(ValueError, match='先记录'):
+                bound['project_tree'].invoke({})
+            analysis.repo.presented(analysis.id, result)
+            bound['record_analysis_note'].invoke({'batch_id': result['batch_id'], 'summary': name})
+            row = json.loads(analysis.repo.notes(analysis.id, after=i)[0]['body_json'])['receipt'][0]
+            assert (row['kind'], row['status']) == (kind, 'ok')
+        finally:
+            tool_call.reset(token)
+    assert analysis.snapshot()['coverage']['full']
+    assert len(bound['read_analysis_notes'].invoke({'after': 2})['notes']) == 4
+
+
+@pytest.mark.parametrize("interrupt_after_write", [False, True])
+def test_mixed_analysis_writes_once_after_read_and_note(tmp_path, monkeypatch, interrupt_after_write):
+    monkeypatch.setenv('ARTORIAS_WORKSPACE', str(tmp_path / 'project'))
+    data = tmp_path / 'data'
+    data.mkdir()
+    store = Store(data / 'app.sqlite')
+    session = store.session()
+    store.submit(session, '核验文件并保存报告', 'run')
+    run = store.claim()
+    ws = create_workspace(store, session, run['id'])
+    ws.write('example.txt', '示例文件\n')
+
+    class ReportModel(AnalysisModel):
+        def _generate(self, messages, *args, **kwargs):
+            last = messages[-1]
+            if not isinstance(last, ToolMessage) or last.name == 'project_read':
+                return super()._generate(messages, *args, **kwargs)
+            if last.name == 'record_analysis_note':
+                call = {'name': 'read_analysis_notes', 'id': 'get-notes', 'args': {}}
+            elif last.name == 'read_analysis_notes':
+                note = json.loads(last.content)['notes'][0]['note']
+                call = {'name': 'project_write', 'id': 'save-report',
+                        'args': {'path': 'report.txt', 'content': note['summary']}}
+            else:
+                assert last.name == 'project_write' and last.status == 'success'
+                return self._reply(finish_message('报告已保存'), messages, *args, **kwargs)
+            return self._reply(AIMessage(content='', tool_calls=[call]), messages, *args, **kwargs)
+
+    async def planner(_):
+        item = plan_item(key='review', goal='保存报告', analysis={
+            'analysis_type': 'document_file', 'intent': 'summary', 'goal': '核验', 'roots': ['example.txt'],
+        })
+        return Plan(kind='tasks', items=[item.model_copy(update={'allowed_tool_groups': ['project_write']})])
+
+    model = ReportModel(messages=iter([]), disable_streaming=True)
+    runtime = TaskRuntime(data, store, engine=create_engine(data, store, model_factory=lambda: model), planner=planner)
+    if interrupt_after_write:
+        from contextlib import aclosing
+
+        async def stop_after_write():
+            async with aclosing(runtime.execute(run)) as events:
+                async for kind, detail in events:
+                    if kind == 'tool.result' and detail['name'] == 'project_write':
+                        return
+            pytest.fail('没有写入报告')
+
+        asyncio.run(stop_after_write())
+        store.recover()
+        assert store.query('SELECT status FROM runs') == [{'status': 'interrupted'}]
+        assert store.claim() is None
+    else:
+        asyncio.run(Scheduler(store, runtime).execute(run))
+        assert store.query('SELECT status FROM runs') == [{'status': 'completed'}], store.events(session, 0)
+    assert (tmp_path / 'project' / 'report.txt').read_text() == '找到示例'

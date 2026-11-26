@@ -53,30 +53,19 @@ MVP 建前四表，范围与引用先保存在 receipt_json、refs_json 中。�
 
 ## 4. 批次协议、工具与执行流程
 
-首版同一 Analysis 顺序提交批次，同一批内仍可并行读文件。分析模式在首次探查后以“上一批笔记 + 下一步读取计划”驱动。Runtime 在 I/O 前分配 batch_id 和 read_request_id。重试复用同一计划和 ID。一个逻辑批次可组合相关范围；搜索结果决定下一跳时允许分为相邻批次。简单目录清点只保存覆盖统计，需要做判断时再形成 Note。
+Planner 在 Step 上配置 `analysis` 后，Runtime 将批次记录器绑定到现有的 project 读取工具。每次调用创建一个批次，`project_read_many` 的多个范围属于同一批。新读取和最终交付前先提交当前笔记。目录树、清点样本和搜索片段只计入相应的证据类型。
 
-| 接口（拟新增） | 输入 | 输出和所有者 |
-|---|---|---|
-| analysis_next_batch | previous_note 可空、purpose、reads[]。reads 为带 kind 的 inventory/search/range 请求，沿用既有参数校验、预算、逐目标权限审批 | Server 先提交上批，再创建/复用新批；端点返回结果。返回 batch_id、只读回执摘要、短片段、错误项和续读提示。首批省略 previous_note |
-| record_analysis_note | batch_id、summary、findings[]、open_questions[]、可选 facets 与引用序号 | Server 按实际展示记录提交 Note。用于最后一批、挂起前或只提交不再读取。两条提交通道共用一个事务方法 |
-| read_analysis_notes | analysis 引用、可选来源/主题/符号/类型、分页与输出预算 | 在当前权限内返回笔记、来源与版本提示，可按引用取详情 |
-| list_analysis_sources（第二阶段） | analysis 引用、状态、过滤条件、页大小和游标 | 返回源清单、已分析范围、缺口和错误。读状态由程序计算 |
-| Endpoint.scan_page / read_range（第二阶段） | 可信身份、根、查询或版本化范围、稳定 request_id、可选 continuation | 返回同一请求可重放的页、版本、实际范围、观察结果与 next_cursor；不支持的能力显式返回 unsupported |
+| 工具 | 用途 |
+|---|---|
+| project_tree、project_list | 浏览目录结构 |
+| project_inventory、project_search | 轻量探索可用聚合、过滤或正则。完整枚举或可重放的字面搜索用 `snapshot_page=true`，返回稳定分页游标 |
+| project_read、project_read_many | 单文件分页或多个行、字符范围。大文件用 `project_read(unit="byte")`，续页带版本 |
+| record_analysis_note | 提交 batch_id、summary 和可选发现，refs 按返回项从 0 编号 |
+| read_analysis_notes | 按序号和可选路径回读当前分析已授权的笔记 |
 
-例：读取审批处理代码后，下一轮模型可以在一个工具调用中提交发现，并索取审批决定的落库逻辑。
+例如先调用 `project_read_many({"items":[{"path":"src/artorias_server/storage/sqlite.py","line_start":115,"line_count":44}]})`。工具返回真实片段及 batch_id 后，模型调用 `record_analysis_note({"batch_id":"<实际 ID>","summary":"审批决定在事务中写入","findings":[{"text":"写入点位于本次所读范围","refs":[0]}]})`。
 
-```json
-{
-  "previous_note": {
-    "batch_id": "b1",
-    "summary": "审批时 Step 进入 waiting。",
-    "findings": [{"text":"恢复时复用原 Run 和 Step 的图线程","basis":"observation","refs":[0]}],
-    "open_questions": ["审批决定在哪个事务中触发重新入队？"]
-  },
-  "purpose": "核对审批决定与 Job 状态变更",
-  "reads": [{"kind":"range","path":"src/artorias_server/storage/sqlite.py","line_start":115,"line_count":44}]
-}
-```
+实现位于 `artorias_server/tools/analysis/`。project 工具负责访问 workspace 与权限检查，分析适配器记录调用参数、实际范围、批次状态和笔记。摘要由已提交笔记按预算自动生成。Planner 通常将目录分析和文件发布拆为有依赖的两个 Step，写入 Step 通过前一步交付与 task_result_read 读取结果。单个分析 Step 默认只开放 project 读取，可通过 allowed_tool_groups 增加 project_write 或 execution；原有授权照常校验。发生副作用调用后，进程中断进入普通中断处理，避免新图线程重放写操作。
 
 ```mermaid
 flowchart TD
@@ -98,7 +87,7 @@ flowchart TD
 
 1. 状态按 planned → reading → returned → presented → committed 前进。returned 仅表明端点返回；请求预算层必须保证当前批次实际片段进入模型输入，或准确记录进一步截断后的范围，再标记 presented。模型请求失败时保留批次供重放。只要没有 Note 就不能算 analyzed。
 2. 提交前验证当前执行有写入权、批次属于该 Analysis、实际展示的版本/范围和引用序号有效。一个事务内写入 Note、更新已分析区间、标记 committed、推进已确认游标、递增版本。相同 batch_id 和内容摘要返回已有结果；已提交批次收到不同内容返回 conflict，可显式追加修正。纯模型置信度不改变覆盖数。
-3. 将“提交上批 + 登记下批计划”放同一事务，通过调用幂等键关联下一批。审批或端点 I/O 在提交后执行。网络超时时重试同一 request_id，禁止仅因响应丢失创建新批。
+3. 先提交上批笔记，随后按工具调用幂等键登记下一批计划。审批或端点 I/O 在提交后执行。网络超时时重试同一 request_id，禁止仅因响应丢失创建新批。
 4. 全部失败的读取记录原因与待办；“读过但没有相关发现”可提交空 findings 和一条简短说明。模型漏交 Note 时一次定向补交，携带原批次与已展示片段；仍失败则保留未提交状态和部分交付。对分析模式下直接调用的旧读取入口，统一产生回执并关联当前批次，或只向该模式暴露受控读取入口，防止绕过覆盖统计。
 5. 最后一批已提交后，程序核对范围缺口并对关键结论按版本回读。全覆盖任务存在错误或未支持格式时返回部分结果，列明缺口。业务交付走 finish_step → TaskRepository.deliver。分析 Note 的事务独立于最终交付，失败后可重新综合。最终交付绑定 analysis_id 和 revision，复用原有 Step 幂等检查。分析覆盖不足时将 Step 标记为部分交付。
 
@@ -134,7 +123,7 @@ MVP 支持新 Run 关联旧 Analysis 后按批次继续，使用新的 Step 关�
 
 | 交付阶段 | 代码落点与依赖 | 必须通过的验收 |
 |---|---|---|
-| 1．批次笔记与最终交付 | 新增 `artorias_server/analysis/{models,repository,service}.py` 和工具适配。接入任务执行器、工具注册、请求预算与交付；以现有小文本读取为基础 | 固定三个批次，第 2 批返回后中断；新 Run 复用第 1 批，重放第 2 批，完成第 3 批。并发重复提交只计一次；最后一次 Note 补交失败仍能读到先前结果 |
+| 1．批次笔记与最终交付 | 新增 `artorias_server/tools/analysis/{models,repository,service}.py` 和工具适配。接入任务执行器、工具注册、请求预算与交付；以现有小文本读取为基础 | 固定三个批次，第 2 批返回后中断；新 Run 复用第 1 批，重放第 2 批，完成第 3 批。并发重复提交只计一次；最后一次 Note 补交失败仍能读到先前结果 |
 | 2a．完整清单、大文件与摘要 | 扩展 `artorias_shared/workspace.py`、Device/Cloud Connector 和 `workspace/routing.py`；加入 sources/ranges/summaries、端点页重放与动态上下文构建 | 100 MB UTF-8 日志含中文、跨缓冲字符与超长行；单页峰值读取内存受缓冲预算限制。目录全量跨页无漏计；混入缺权、陈旧、失败和重复范围后，覆盖并集仍正确。旧 Note 被修正或撤权后摘要失效 |
 | 2b．挂起与原 Step 恢复 | 扩展 Scheduler、Store 的领取/恢复、执行段及依赖通知。独立验收，生产云端需共享业务存储与 checkpoint | 端点返回前后分别杀 Worker；换 Worker 继续同一 run/key。重复、丢失、乱序通知只完成一次。用户取消后迟到回调无法复活 Job |
 | 3．代码增强与跨任务复用 | 设备或云端符号索引，Server 笔记查询和可选 Search 集成。分开启用 | 同名符号、动态调用、测试定义与实际测试结果可区分；Follow-up 在授权和版本有效时复用，撤权后无摘要或片段泄露 |
@@ -143,8 +132,8 @@ MVP 支持新 Run 关联旧 Analysis 后按批次继续，使用新的 Step 关�
 
 ## 9. 当前实现与运行范围
 
-- 默认启用 Analysis Memory。Task Planner 为长分析输出 `analysis` 时进入只读分析链路。设置 `ARTORIAS_ANALYSIS_MEMORY=0` 可关闭新建入口，已关联的 Step 仍可继续。
-- `analysis_next_batch` 支持字节、Unicode 字符和行范围，以及目录清单和文字搜索。大文件使用 UTF-8 字节范围，每项最多 4 KiB；字符和行模式沿用小文件读工具。端点清单和搜索页保存在本地 SQLite。清单按首次枚举快照分页，遇到深度、条目或目录时间上限时报告不完整。正文搜索沿用每文件 1 MB 上限，超过上限时可改用字节范围分析。
+- 默认启用 Analysis Memory。Task Planner 为长分析输出 `analysis` 时为 project 工具启用批次记忆。设置 `ARTORIAS_ANALYSIS_MEMORY=0` 可关闭新建入口，已关联的 Step 仍可继续。
+- project 读取工具支持字节、Unicode 字符和行范围，以及目录清单和文字搜索。大文件使用 UTF-8 字节范围，每项最多 4 KiB；字符和行模式沿用小文件读工具。端点清单和搜索页保存在本地 SQLite。清单按首次枚举快照分页，遇到深度、条目或目录时间上限时报告不完整。正文搜索沿用每文件 1 MB 上限，超过上限时可改用字节范围分析。
 - Server 保存已展示回执、已提交笔记和覆盖区间。滚动摘要使用确定性的有界提取，并附来源版本和续读位置。每次组装时重校权限，较早的笔记按页读取。最终报告按模型提示回读关键来源，覆盖率由程序按范围并集计算。
 - 本地 Scheduler 支持原 Run 和 Step 续跑。审批用原图线程，普通中断和端点等待通过新的图执行段加载笔记和待重放批次。异步端点返回 `status=pending` 和 `operation_id` 后释放 Worker，调度器按退避间隔再次领取，由 Connector 用原 request_id 查询或重放。原生本地能力为同步读取，异步接口用模拟端点测试。云端多 Worker 租约、独立远程 Connector 和推送式依赖通知仍需部署适配。
 - 版本变化时，回读返回 stale。续扫游标过期时，由当前分析重新清点，报告覆盖缺口并保留已提交笔记。同 Session、Task 和 Workspace 下，兼容未完成计划可由新 Run 关联。代码符号索引和跨 Task 搜索属于第三阶段。

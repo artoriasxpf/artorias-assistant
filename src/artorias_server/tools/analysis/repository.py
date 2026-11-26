@@ -124,10 +124,8 @@ class AnalysisRepository:
             self._commit(db, analysis_id, note)
 
     def plan(self, analysis_id, call_id, request):
-        plan_json = encode(request.model_dump(exclude={'previous_note'}))
+        plan_json = encode(request)
         with self.store.tx() as db:
-            if request.previous_note:
-                self._commit(db, analysis_id, request.previous_note)
             existing = db.execute('SELECT * FROM analysis_batches WHERE analysis_id=? AND call_id=?',
                                   (analysis_id, call_id)).fetchone()
             pending = db.execute("""SELECT * FROM analysis_batches WHERE analysis_id=?

@@ -61,7 +61,7 @@ class TaskRuntime:
             task_revision=self.store.query('SELECT revision FROM business_tasks WHERE id=?',(step['task'],))[0]['revision']
             if task_revision != step['applied_revision']:
                 raise ValueError('任务要求已修改，当前步骤需要重新规划')
-            scoped=dict(run,step_key=step['key'],analysis_plan=json.loads(step['scope']).get('analysis'),task_step_id=step.get('id',step['key']),task_id=step['task'],thread_id=run['id']+':'+step['key'],task_context=self.context.build(run,step))
+            scoped=dict(run,allowed_tool_groups=json.loads(step['scope']).get('allowed_tool_groups'),step_key=step['key'],analysis_plan=json.loads(step['scope']).get('analysis'),task_step_id=step.get('id',step['key']),task_id=step['task'],thread_id=run['id']+':'+step['key'],task_context=self.context.build(run,step))
             if step['status']!='waiting':scoped.pop('decision',None)
             if step['status']=='waiting':
                 if not scoped.get('decision'):

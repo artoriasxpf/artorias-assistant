@@ -3,7 +3,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Text = Annotated[str, Field(min_length=1, max_length=2000)]
 
-from artorias_server.analysis.models import AnalysisPlan
+from artorias_server.tools.analysis.models import AnalysisPlan
 
 
 class PlanObject(BaseModel):
@@ -77,6 +77,7 @@ class Item(PlanObject):
     task_patch: RequirementPatch = Field(default_factory=RequirementPatch)
     input_locations: list[LocationIntent] = Field(default_factory=list)
     output_target: LocationIntent | None = None
+    allowed_tool_groups: list[Literal["project_read", "project_write", "execution"]] | None = None
     analysis: AnalysisPlan | None = None
 
     @model_validator(mode="after")

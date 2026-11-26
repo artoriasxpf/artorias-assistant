@@ -45,6 +45,8 @@ class DeepAgentRuntime:
                 +json.dumps(run['task_context'],ensure_ascii=False)})
         messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；缺少文件权限时工具会申请授权；拒绝后停止对该目标重复申请。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
         tools=list(self.tool_factory(ws,emit))
+        from artorias_server.tools.policy import READ_TOOLS, step_tools
+        tools = step_tools(tools, run.get('allowed_tool_groups'), run.get('analysis_plan'))
         finished = []
         tool_names = {getattr(tool, 'name', None) for tool in tools}
         file_guidance = (
@@ -78,6 +80,8 @@ class DeepAgentRuntime:
             @tool(args_schema=FinishStep, return_direct=True)
             def finish_step(**kwargs):
                 """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional."""
+                if analysis and analysis.repo.pending(analysis.id):
+                    raise ValueError("请先调用 record_analysis_note 提交当前批次，再交付")
                 submission = validate_submission(kwargs)
                 finished.append(submission)
                 return submission.final_text
@@ -97,19 +101,21 @@ class DeepAgentRuntime:
                 (run['id'], run.get('step_key')),
             ))
         if analysis_plan and analysis_enabled:
-            from artorias_server.analysis.service import AnalysisContext, AnalysisPrompt, AnalysisSession
+            from artorias_server.tools.analysis.service import AnalysisContext, AnalysisPrompt, AnalysisSession
             analysis = AnalysisSession(self.store, run, ws)
             segment = self.store.begin_analysis(run['id'], run['step_key'])
             analysis.segment = segment
             thread_id += f':analysis:{segment}'
-            tools = [*analysis.tools(), finish_step]
+            tools = [*analysis.bind_project_tools(tools), *analysis.tools()]
             middleware = [AnalysisPrompt(analysis), RequestBudget(), AnalysisContext(analysis),
                           ModelActivity(), ToolErrorBoundary()]
-            file_guidance = (
-                '这是只读分析。用 analysis_next_batch 按范围读取、搜索或清点，按工具返回的游标和版本续读。'
-                '每批用 previous_note 或 record_analysis_note 提交发现与问题；最终答复前提交最后一批。'
-                '恢复时先完成未提交批次。引用只用当前批次 ref。查阅历史用 read_analysis_notes。'
-                '交付前回读关键结论的原文并核对版本。列出覆盖范围、来源和无法验证的结论。只完成当前分析目标。'
+            file_guidance += (
+                '每次 project 读取自动创建持久化批次。一次只发一个读取调用，多个范围用 project_read_many。'
+                '收到 batch_id 后先用 record_analysis_note 提交摘要。refs 按返回条目从零编号。'
+                '大型文件用 project_read(unit="byte")；完整目录清点用 project_inventory(snapshot_page=true)。'
+                '可重放的字面搜索用 project_search(snapshot_page=true)。清点与搜索不代表已读正文。'
+                '恢复时按 pending.plan_json 原工具与参数重放。如为旧版 reads 计划，调用其中任一 project 读取以恢复。'
+                '查阅历史用 read_analysis_notes。记录最后一批再交付，报告覆盖、来源及未核验部分。'
             )
         async with self.checkpoint_provider.open() as saver:
             internal_files=FilesystemMiddleware(
@@ -154,7 +160,7 @@ class DeepAgentRuntime:
             metrics = dict(model_requests=0, request_bytes=0, input_tokens=0, output_tokens=0,
                            estimated_requests=0, measured_requests=0, tool_calls=0)
             from langgraph.errors import GraphRecursionError
-            from artorias_server.analysis.models import DeferredAnalysis, ExhaustedAnalysis
+            from artorias_server.tools.analysis.models import DeferredAnalysis, ExhaustedAnalysis
             try:
                 async for mode,chunk in agent.astream(payload,config=config,stream_mode=['messages','values','custom','debug']):
                     if mode == 'debug':
@@ -202,6 +208,8 @@ class DeepAgentRuntime:
             except (DeferredAnalysis, GraphRecursionError) as error:
                 if analysis is None:
                     raise
+                if self.store.query("SELECT 1 FROM analysis_executions WHERE run_id=? AND state='side_effect'", (run['id'],)):
+                    raise ValueError('本步已尝试写入或执行。请核对副作用后继续，已提交笔记保留。') from error
                 yield 'analysis.suspended', {
                     'dependency_id': str(error) if isinstance(error, DeferredAnalysis) else None,
                     'step_key': run['step_key'],
@@ -251,6 +259,14 @@ class DeepAgentRuntime:
                         if message.type == 'tool' and message.name == 'finish_step' and message.status == 'error':
                             problem = str(message.content)[:1500]
                             break
+                    if analysis:
+                        from langchain_core.messages import SystemMessage
+                        history = [
+                            message.model_copy(update={'content': '本次分析已保存的结论见分析快照。', 'artifact': None})
+                            if message.type == 'tool' and message.name in READ_TOOLS | {'read_analysis_notes'}
+                            else message for message in history
+                        ]
+                        history.append(SystemMessage(content=json.dumps(analysis.snapshot(), ensure_ascii=False)))
                     submission = await repair_submission(
                         model, finish_step, validate_submission, history, emit, problem,
                     )
@@ -260,6 +276,7 @@ class DeepAgentRuntime:
                 incomplete = (progress['pending'] is not None or not progress['committed_batches']
                               or bool(coverage.get('failures') or coverage.get('unavailable_batches'))
                               or (analysis.plan.coverage_policy == 'full' and not coverage['full']))
+                text = submission.final_text
                 if incomplete:
                     text = ('部分分析结果。已保存的批次可在后续运行中继续使用。\n\n' + text)[:100000]
                     outcome = 'partial' if submission.step_outcome == 'completed' else submission.step_outcome

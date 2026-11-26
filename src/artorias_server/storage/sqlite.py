@@ -69,7 +69,7 @@ class Store:
                             (run_id,)).fetchone()
             if row['step_key'] != step_key:
                 raise ValueError('Analysis execution belongs to a different step')
-            c.execute("UPDATE analysis_executions SET state='active' WHERE run_id=?", (run_id,))
+            c.execute("UPDATE analysis_executions SET state='active' WHERE run_id=? AND state!='side_effect'", (run_id,))
             return row['segment']
 
     def _suspend_analysis(self, c, run_id, dependency_id):
