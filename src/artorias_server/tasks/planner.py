@@ -16,6 +16,8 @@ task_patch.scope 区分 persistent 永久修改和 execution 本次例外，expe
 operations 仅使用 add/replace/remove，约束和验收点使用稳定 id。evidence 必须逐字引用本次用户输入。
 含糊的撤销或冲突必须 clarify。没有需求变更时省略 task_patch，或写成 "task_patch":{"operations":[]}；不能写成 "task_patch":null。source_message_id 由程序绑定，不能编造。
 input_locations/output_target 记录用户的位置意图，Downloads 这样的名称保留原文，不能猜测物理绝对路径。
+大文件、目录或仓库分批分析时可填写 analysis，roots 必须使用用户给出的路径或工作空间相对路径。
+分析与修改分别规划，分析条目只读，修改条目依赖分析的结果。普通短问答省略 analysis。
 criteria 是本次执行可检查的验收点，不等于用户确认。严禁把所有历史目标都重新执行。
 '''
 

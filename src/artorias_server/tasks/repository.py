@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
                     (run['id'],item.key,tid,item.model_dump_json(),source[0],revision,applied,patch.model_dump_json(),json.dumps(effective,ensure_ascii=False),json.dumps(baseline,ensure_ascii=False)))
         return plan
 
-    def deliver(self, run, step, final):
+    def deliver(self, run, step, final, *, analysis_result=None):
         with self.store.tx() as c:
             current = c.execute('SELECT status FROM task_steps WHERE run=? AND key=?', (run['id'], step['key'])).fetchone()
             if current['status'] == 'delivered': return
@@ -126,4 +126,11 @@ CREATE TABLE IF NOT EXISTS context_snapshots(run TEXT, key TEXT, body TEXT NOT N
             status = 'needs_review' if row['revision'] == step['applied_revision'] else row['status']
             c.execute('UPDATE business_tasks SET status=?,summary=?,progress=?,execution_count=execution_count+1 WHERE id=?',
                 (status,final,json.dumps(progress[-20:],ensure_ascii=False),step['task']))
+            if analysis_result:
+                c.execute('UPDATE analyses SET status=? WHERE id=? AND revision=?',
+                          ('open' if analysis_result['partial'] else 'completed',
+                           analysis_result['analysis_id'], analysis_result['revision']))
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name='analysis_executions'").fetchone():
+                c.execute('DELETE FROM analysis_executions WHERE run_id=? AND step_key=?',
+                          (run['id'], step['key']))
             c.execute('DELETE FROM decisions WHERE run=?',(run['id'],))

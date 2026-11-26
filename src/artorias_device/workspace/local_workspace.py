@@ -184,6 +184,18 @@ class LocalWorkspace:
         from .analysis import read_text
         return read_text(self, path, max_bytes=max_bytes, versioned=versioned)
 
+    def analysis_range(self, path, **options):
+        from .analysis import read_range
+        return read_range(self, path, **options)
+
+    def analysis_inventory_page(self, path, **options):
+        from .analysis import inventory_page
+        return inventory_page(self, path, **options)
+
+    def analysis_search_page(self, path, **options):
+        from .analysis import search_page
+        return search_page(self, path, **options)
+
     def analysis_search(self, path, **options):
         from .analysis import search_text
         return search_text(self, path, **options)

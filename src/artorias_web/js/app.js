@@ -454,7 +454,7 @@ function renderEvent(event) {
       runs.set(run, 'running');
       closeApproval(run);
     }
-    if (kind === 'approval.requested') runs.set(run, 'waiting');
+    if (kind === 'approval.requested' || kind === 'analysis.suspended') runs.set(run, 'waiting');
     if (kind === 'approval.decided') runs.set(run, 'queued');
     if (kind === 'run.completed') promoteStream(run, null);
     // A tool call or a new task step finalizes the current model output bubble.
@@ -474,6 +474,7 @@ function renderEvent(event) {
   }
   if (kind === 'run.failed') $('status').textContent = payload.error || '运行失败';
   else if (kind === 'approval.requested') $('status').textContent = '等待审批';
+  else if (kind === 'analysis.suspended') $('status').textContent = '分析已保存，等待继续…';
   else if (kind === 'run.started') $('status').textContent = '处理中…';
   else if (TERMINAL.has(kind) && !activeRun()) $('status').textContent = '';
   updateComposer();

@@ -39,7 +39,7 @@ class TaskRuntime:
         results=[]
         for step in steps:
             if step['status']=='delivered':results.append(step['result']);continue
-            scoped=dict(run,task_step_id=step.get('id',step['key']),task_id=step['task'],thread_id=run['id']+':'+step['key'],task_context=self.context.build(run,step))
+            scoped=dict(run,step_key=step['key'],task_step_id=step.get('id',step['key']),task_id=step['task'],thread_id=run['id']+':'+step['key'],task_context=self.context.build(run,step))
             if step['status']!='waiting':scoped.pop('decision',None)
             if step['status']=='waiting':
                 if not scoped.get('decision'):
@@ -51,10 +51,16 @@ class TaskRuntime:
                 yield 'task.started',{'task_id':step['task'],'key':step['key']}
             final=''
             approval=None
+            analysis_result = None
             try:
                 async with aclosing(self.engine.execute(scoped)) as events:
                     async for kind,payload in events:
                         if kind=='assistant.final': final=payload['text'];continue
+                        if kind == 'analysis.result':
+                            analysis_result = payload
+                        if kind == 'analysis.suspended':
+                            yield kind, payload
+                            return
                         if kind=='approval.requested':
                             approval=dict(payload,task_id=step['task'])
                             break
@@ -73,7 +79,7 @@ class TaskRuntime:
                     c.execute("UPDATE task_steps SET status='waiting' WHERE run=? AND key=?",(run['id'],step['key']))
                 yield 'approval.requested',approval
                 return
-            self.repo.deliver(run, step, final)
+            self.repo.deliver(run, step, final, analysis_result=analysis_result)
             results.append(final)
             yield 'task.delivered',{'task_id':step['task'],'text':final,'status':'needs_review'}
         yield 'assistant.final',{'text':'\n\n'.join(results)}

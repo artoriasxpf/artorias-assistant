@@ -61,8 +61,50 @@ class Store:
     def emit(self,s,run,kind,payload):
         with self.tx() as c:c.execute('INSERT INTO events(session,run,kind,payload) VALUES(?,?,?,?)',(s,run,kind,json.dumps(payload,ensure_ascii=False)))
     def events(self,s,after):return self.query('SELECT * FROM events WHERE session=? AND seq>? ORDER BY seq LIMIT 100',(s,after))
+    def begin_analysis(self, run_id, step_key):
+        with self.tx() as c:
+            c.execute("""INSERT INTO analysis_executions(run_id,step_key,segment,state)
+                VALUES(?,?,0,'active') ON CONFLICT(run_id) DO NOTHING""", (run_id, step_key))
+            row = c.execute('SELECT step_key,segment FROM analysis_executions WHERE run_id=?',
+                            (run_id,)).fetchone()
+            if row['step_key'] != step_key:
+                raise ValueError('Analysis execution belongs to a different step')
+            c.execute("UPDATE analysis_executions SET state='active' WHERE run_id=?", (run_id,))
+            return row['segment']
+
+    def _suspend_analysis(self, c, run_id, dependency_id):
+        changed = c.execute("""UPDATE analysis_executions
+            SET state='waiting',segment=segment+1,dependency_id=?,ready_at=unixepoch()+CASE WHEN ? IS NULL THEN 0 ELSE min(60, 2 << min(segment,5)) END
+            WHERE run_id=? AND state='active' AND segment<32
+                AND started_at>=unixepoch()-3600""",
+            (dependency_id, dependency_id, run_id))
+        if not changed.rowcount:
+            return False
+        c.execute("UPDATE runs SET status='analysis_waiting' WHERE id=? AND status='running'", (run_id,))
+        c.execute("UPDATE jobs SET status='done' WHERE run=?", (run_id,))
+        c.execute('DELETE FROM decisions WHERE run=?', (run_id,))
+        c.execute("""UPDATE task_steps SET status='interrupted' WHERE run=? AND key=(
+            SELECT step_key FROM analysis_executions WHERE run_id=?) AND status!='delivered'""",
+            (run_id, run_id))
+        return True
+
+    def suspend_analysis(self, run, dependency_id):
+        with self.tx() as c:
+            return self._suspend_analysis(c, run['id'], dependency_id)
+
+    def _queue_due_analysis(self, c):
+        if not c.execute("SELECT 1 FROM sqlite_master WHERE name='analysis_executions'").fetchone():
+            return
+        ready = c.execute("""UPDATE analysis_executions SET state='queued' WHERE state='waiting'
+            AND ready_at<=unixepoch() AND run_id IN (
+                SELECT id FROM runs WHERE status='analysis_waiting') RETURNING run_id""").fetchall()
+        for row in ready:
+            c.execute("UPDATE runs SET status='queued' WHERE id=?", (row[0],))
+            c.execute("UPDATE jobs SET status='queued' WHERE run=?", (row[0],))
+
     def claim(self):
         with self.tx() as c:
+            self._queue_due_analysis(c)
             row=c.execute("SELECT r.* FROM runs r JOIN jobs j ON j.run=r.id WHERE j.status='queued' AND r.status='queued' AND NOT EXISTS (SELECT 1 FROM runs blocked WHERE blocked.session=r.session AND blocked.id!=r.id AND blocked.status='waiting') ORDER BY j.rowid LIMIT 1").fetchone()
             if row:
                 c.execute("UPDATE jobs SET status='running' WHERE run=?",(row['id'],));c.execute("UPDATE runs SET status='running' WHERE id=?",(row['id'],))
@@ -76,6 +118,10 @@ class Store:
         with self.tx() as c:
             c.execute('UPDATE runs SET status=? WHERE id=?',(status,run['id']))
             c.execute("UPDATE jobs SET status='done' WHERE run=?",(run['id'],))
+            if status != 'waiting' and c.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='analysis_executions'"
+            ).fetchone():
+                c.execute('DELETE FROM analysis_executions WHERE run_id=?', (run['id'],))
             if text is not None:c.execute('INSERT INTO messages(id,session,run,role,content) VALUES(?,?,?,?,?)',(uid(),run['session'],run['id'],'assistant',text))
             if status in ('failed', 'cancelled', 'completed', 'interrupted') and c.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='permission_requests'"
@@ -89,8 +135,16 @@ class Store:
                 c.execute("INSERT INTO events(session,run,kind,payload) VALUES(?,?,'approval.requested',?)",
                           (run['session'],run['id'],json.dumps(approval,ensure_ascii=False)))
     def recover(self):
-        # Never replay an uncertain side effect after a process crash.
         for run in self.query("SELECT * FROM runs WHERE status='running'"):
+            with self.tx() as c:
+                analysis_exists = c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name='analysis_executions'"
+                ).fetchone()
+                if analysis_exists and self._suspend_analysis(c, run['id'], None):
+                    # The fresh read-only segment can ask again for interrupted approvals.
+                    if c.execute("SELECT 1 FROM sqlite_master WHERE name='permission_requests'").fetchone():
+                        c.execute("DELETE FROM permission_requests WHERE run_id=? AND state='pending'", (run['id'],))
+                    continue
             self.finish(run,'interrupted')
             self.emit(run['session'],run['id'],'run.interrupted',{'reason':'进程中断；请核对已产生的文件，再发送新消息继续。'})
 

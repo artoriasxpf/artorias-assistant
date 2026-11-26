@@ -1,4 +1,5 @@
 import json
+import os
 from artorias_shared.ids import uid
 from deepagents import create_deep_agent
 from deepagents.middleware.filesystem import FilesystemMiddleware
@@ -62,6 +63,31 @@ class DeepAgentRuntime:
             from artorias_server.tasks.results import result_tool
             tools.append(result_tool(self.store,run['session'],run['task_id']))
         thread_id=run.get('thread_id',run['id'])
+        analysis = None
+        middleware = [RequestBudget(), ModelActivity(), ToolErrorBoundary()]
+        analysis_plan = (run.get('task_context') or {}).get('execution_scope', {}).get('analysis')
+        analysis_enabled = os.environ.get('ARTORIAS_ANALYSIS_MEMORY', '1') != '0'
+        if analysis_plan and not analysis_enabled:
+            has_links = self.store.query("SELECT 1 FROM sqlite_master WHERE name='analysis_step_links'")
+            analysis_enabled = bool(has_links and self.store.query(
+                'SELECT 1 FROM analysis_step_links WHERE run_id=? AND step_key=?',
+                (run['id'], run.get('step_key')),
+            ))
+        if analysis_plan and analysis_enabled:
+            from artorias_server.analysis.service import AnalysisContext, AnalysisPrompt, AnalysisSession
+            analysis = AnalysisSession(self.store, run, ws)
+            segment = self.store.begin_analysis(run['id'], run['step_key'])
+            analysis.segment = segment
+            thread_id += f':analysis:{segment}'
+            tools = analysis.tools()
+            middleware = [AnalysisPrompt(analysis), RequestBudget(), AnalysisContext(analysis),
+                          ModelActivity(), ToolErrorBoundary()]
+            file_guidance = (
+                '这是只读分析。用 analysis_next_batch 按范围读取、搜索或清点，按工具返回的游标和版本续读。'
+                '每批用 previous_note 或 record_analysis_note 提交发现与问题；最终答复前提交最后一批。'
+                '恢复时先完成未提交批次。引用只用当前批次 ref。查阅历史用 read_analysis_notes。'
+                '交付前回读关键结论的原文并核对版本。列出覆盖范围、来源和无法验证的结论。只完成当前分析目标。'
+            )
         async with self.checkpoint_provider.open() as saver:
             internal_files=FilesystemMiddleware(
                 tools=['read_file'],
@@ -74,15 +100,15 @@ class DeepAgentRuntime:
             )
             agent=create_deep_agent(
                 model=model,tools=tools,checkpointer=saver,
-                middleware=[internal_files,RequestBudget(),ModelActivity(),ToolErrorBoundary()],
+                middleware=[internal_files, *middleware],
                 system_prompt=(
                     '你是 Artorias 个人助理。'
                     + file_guidance +
-                    '用 project_write 或 project_edit 修改文件。'
-                    '相对路径走已绑定的本机或云端工作空间，用户给出本机绝对路径时保留它。'
-                    '文件工具会申请最小权限。Python 准备需要额外本机目录权限时可用 project_authorize；拒绝后不得重复申请。'
-                    '覆盖已有文件前先读取。执行 Python 用 run_python，默认由绑定空间决定执行位置，等待用户审批。'
-                    '不要声称未实际执行的操作成功。不要自行拆分业务 Task。'
+                    ('分析工具会校验来源范围和权限。' if analysis else
+                     '用 project_write 或 project_edit 修改文件。相对路径走已绑定的本机或云端工作空间。'
+                     '用户给出本机绝对路径时保留它。拒绝授权后不得重复申请。'
+                     '覆盖已有文件前先读取。执行 Python 用 run_python，等待用户审批。')
+                    + '不要声称未实际执行的操作成功。不要自行拆分业务 Task。'
                 ),
             )
             result=None
@@ -103,6 +129,8 @@ class DeepAgentRuntime:
             invocation_id = uid()
             metrics = dict(model_requests=0, request_bytes=0, input_tokens=0, output_tokens=0,
                            estimated_requests=0, measured_requests=0, tool_calls=0)
+            from langgraph.errors import GraphRecursionError
+            from artorias_server.analysis.models import DeferredAnalysis, ExhaustedAnalysis
             try:
                 async for mode,chunk in agent.astream(payload,config=config,stream_mode=['messages','values','custom','debug']):
                     if mode == 'debug':
@@ -147,6 +175,17 @@ class DeepAgentRuntime:
                             seen_results.add(msg.tool_call_id)
                             if msg.tool_call_id not in detailed_results:
                                 yield 'tool.result',{'call_id':msg.tool_call_id,'name':msg.name,'status':msg.status,'content':msg.content}
+            except (DeferredAnalysis, GraphRecursionError) as error:
+                if analysis is None:
+                    raise
+                yield 'analysis.suspended', {
+                    'dependency_id': str(error) if isinstance(error, DeferredAnalysis) else None,
+                    'step_key': run['step_key'],
+                }
+                return
+            except ExhaustedAnalysis:
+                yield 'assistant.final', {'text': '分析已达到执行预算。已提交的批次笔记保留，可在后续运行中继续。'}
+                return
             finally:
                 emit('runtime.graph_metrics', dict(
                     metrics, thread_id=thread_id, invocation_id=invocation_id, graph_steps=len(steps),
@@ -165,6 +204,16 @@ class DeepAgentRuntime:
                 for m in reversed(result.get('messages',[])):
                     if getattr(m,'type',None)=='ai' and not getattr(m,'tool_calls',[]):
                         text=text_content(m.content);break
+            if analysis:
+                progress = analysis.snapshot()
+                coverage = progress['coverage']
+                incomplete = (progress['pending'] is not None or not progress['committed_batches']
+                              or bool(coverage.get('failures') or coverage.get('unavailable_batches'))
+                              or (analysis.plan.coverage_policy == 'full' and not coverage['full']))
+                if incomplete:
+                    text = '部分分析结果。已保存的批次可在后续运行中继续使用。\n\n' + text
+                yield 'analysis.result', {'analysis_id': analysis.id, 'revision': progress['committed_batches'],
+                                          'coverage': coverage, 'partial': incomplete}
             yield 'assistant.final',{'text':text}
 
 def text_content(content):

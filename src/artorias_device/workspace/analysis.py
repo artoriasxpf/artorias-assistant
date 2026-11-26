@@ -158,3 +158,166 @@ def search_text(workspace, relative, *, query, mode, context_lines, max_hits,
         if len(hits) == max_hits and index + 1 < len(lines):
             return dict(result, hits=hits, next_line=index + 1)
     return dict(result, hits=hits)
+
+
+def read_range(workspace, relative, *, offset, limit, expected_version=None):
+    """Read bounded UTF-8 byte ranges, binding continuations to the observation."""
+    import codecs
+
+    def observation(info):
+        return f'{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}'
+
+    with _open_relative(workspace.root, workspace.path(relative), directory=False) as fd:
+        info = os.fstat(fd)
+        version = observation(info)
+        if not stat.S_ISREG(info.st_mode):
+            return {'status': 'unsupported'}
+        if expected_version and expected_version != version:
+            return {'status': 'stale'}
+        if not 0 <= offset <= info.st_size or not 4 <= limit <= 4096:
+            return {'status': 'invalid_range'}
+        data = os.pread(fd, limit, offset)
+        if observation(os.fstat(fd)) != version:
+            return {'status': 'stale'}
+    if b'\0' in data:
+        return {'status': 'binary'}
+    decoder = codecs.getincrementaldecoder('utf-8')()
+    try:
+        content = decoder.decode(data, final=offset + len(data) >= info.st_size)
+    except UnicodeDecodeError:
+        return {'status': 'invalid_utf8_range'}
+    remaining, _ = decoder.getstate()
+    end = offset + len(data) - len(remaining)
+    return {'status': 'ok', 'version': version, 'version_kind': 'observation',
+            'unit': 'byte', 'start': offset, 'end': end, 'total': info.st_size,
+            'next_start': end if end < info.st_size else None, 'content': content}
+
+
+def inventory_page(workspace, relative, *, request_id, cursor, limit):
+    """Store metadata pages in the endpoint's journal area for retry by request ID."""
+    import json
+    import sqlite3
+    from contextlib import closing
+    from uuid import uuid4
+
+    scope = json.dumps([workspace.session, str(workspace.root), relative])
+    db_path = workspace.blobs / 'analysis-pages.sqlite'
+    with closing(sqlite3.connect(db_path, timeout=10)) as db, db:
+        db.execute("""CREATE TABLE IF NOT EXISTS inventory_pages(
+            request_id TEXT PRIMARY KEY, cursor TEXT UNIQUE, scope TEXT NOT NULL,
+            parent TEXT, page_size INTEGER NOT NULL, position INTEGER NOT NULL,
+            snapshot_id TEXT NOT NULL, payload TEXT NOT NULL,
+            timestamp REAL NOT NULL DEFAULT (unixepoch()))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS inventory_entries(
+            snapshot_id TEXT NOT NULL, ordinal INTEGER NOT NULL, entry TEXT NOT NULL,
+            PRIMARY KEY(snapshot_id,ordinal))""")
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('DELETE FROM inventory_pages WHERE timestamp < unixepoch() - 86400')
+        db.execute("""DELETE FROM inventory_entries WHERE snapshot_id NOT IN (
+            SELECT snapshot_id FROM inventory_pages)""")
+        old = db.execute(
+            'SELECT scope,parent,page_size,payload FROM inventory_pages WHERE request_id=?',
+            (request_id,),
+        ).fetchone()
+        if old:
+            if old[:3] != (scope, cursor, limit):
+                return {'status': 'conflict'}
+            return json.loads(old[3])
+        position = 0
+        snapshot_id = request_id
+        if cursor:
+            prior = db.execute('SELECT position,snapshot_id FROM inventory_pages WHERE cursor=? AND scope=?',
+                               (cursor, scope)).fetchone()
+            if not prior:
+                return {'status': 'cursor_expired'}
+            position, snapshot_id = prior
+        else:
+            count = db.execute('SELECT count(*) FROM inventory_entries').fetchone()[0]
+            if count >= 250_000:
+                return {'status': 'inventory_quota'}
+            db.executemany('INSERT INTO inventory_entries VALUES(?,?,?)', (
+                (snapshot_id, n, json.dumps(item, ensure_ascii=False))
+                for n, item in enumerate(entries(workspace, relative, max_depth=32, include_hidden=False))
+            ))
+        page = [json.loads(row[0]) for row in db.execute(
+            """SELECT entry FROM inventory_entries WHERE snapshot_id=? AND ordinal>=?
+                ORDER BY ordinal LIMIT ?""", (snapshot_id, position, limit + 1)
+        )]
+        next_cursor = uuid4().hex if len(page) > limit else None
+        page = page[:limit]
+        result = {'status': 'ok', 'entries': page, 'next_cursor': next_cursor,
+                  'snapshot_id': snapshot_id,
+                  'incomplete': any('stop_reason' in entry or entry.get('error') or
+                                    entry.get('depth_limited') or entry.get('skip')
+                                    for entry in page)}
+        db.execute("""INSERT INTO inventory_pages(
+            request_id,cursor,scope,parent,page_size,position,snapshot_id,payload)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (request_id, next_cursor, scope, cursor, limit, position + len(page),
+             snapshot_id, json.dumps(result, ensure_ascii=False)))
+        return result
+
+
+def search_page(workspace, relative, *, request_id, cursor, query):
+    """Search one persisted inventory page, resuming within a file when needed."""
+    import json
+    import sqlite3
+    from contextlib import closing
+    from uuid import uuid4
+
+    scope = json.dumps([workspace.session, str(workspace.root), relative, query])
+    with closing(sqlite3.connect(workspace.blobs / 'analysis-search.sqlite', timeout=10)) as db, db:
+        db.execute("""CREATE TABLE IF NOT EXISTS search_pages(
+            request_id TEXT PRIMARY KEY, cursor TEXT UNIQUE, scope TEXT NOT NULL,
+            parent TEXT, payload TEXT NOT NULL, continuation TEXT NOT NULL,
+            timestamp REAL NOT NULL DEFAULT (unixepoch()))""")
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('DELETE FROM search_pages WHERE timestamp < unixepoch() - 86400')
+        old = db.execute('SELECT scope,parent,payload FROM search_pages WHERE request_id=?',
+                         (request_id,)).fetchone()
+        if old:
+            return json.loads(old[2]) if old[:2] == (scope, cursor) else {'status': 'conflict'}
+        if cursor:
+            row = db.execute('SELECT continuation FROM search_pages WHERE cursor=? AND scope=?',
+                             (cursor, scope)).fetchone()
+            if not row:
+                return {'status': 'cursor_expired'}
+            state = json.loads(row[0])
+        else:
+            state = {'page_id': request_id, 'page_cursor': None, 'position': 0,
+                     'line': 0, 'observation': None}
+        page = inventory_page(workspace, relative, request_id='search:' + state['page_id'],
+                              cursor=state['page_cursor'], limit=8)
+        if page['status'] != 'ok':
+            return page
+        hits, gaps = [], []
+        deadline = monotonic() + 2
+        while state['position'] < len(page['entries']) and len(hits) < 8 and monotonic() < deadline:
+            item = page['entries'][state['position']]
+            if item.get('type') == 'file':
+                try:
+                    result = search_text(
+                        workspace, str(Path(relative) / item['path']), query=query, mode='literal',
+                        context_lines=0, max_hits=8 - len(hits), start_line=state['line'],
+                        observation=state['observation'], timeout_seconds=max(0, deadline - monotonic()),
+                        max_bytes=MAX_TEXT_BYTES,
+                    )
+                except (OSError, ValueError):
+                    result = {'status': 'unreadable'}
+                hits.extend(dict(hit, path=item['path']) for hit in result.get('hits', []))
+                if 'next_line' in result:
+                    state.update(line=result['next_line'], observation=result['observation'])
+                    break
+                if result['status'] != 'ok':
+                    gaps.append({'path': item['path'], 'status': result['status']})
+            state.update(position=state['position'] + 1, line=0, observation=None)
+        more = state['position'] < len(page['entries']) or bool(page['next_cursor'])
+        if state['position'] >= len(page['entries']) and page['next_cursor']:
+            state.update(page_id=request_id, page_cursor=page['next_cursor'], position=0)
+        next_cursor = uuid4().hex if more else None
+        payload = {'status': 'ok', 'hits': hits, 'gaps': gaps, 'next_cursor': next_cursor,
+                   'incomplete': page['incomplete'] or bool(gaps)}
+        db.execute('INSERT INTO search_pages(request_id,cursor,scope,parent,payload,continuation) VALUES(?,?,?,?,?,?)',
+                   (request_id, next_cursor, scope, cursor, json.dumps(payload, ensure_ascii=False),
+                    json.dumps(state)))
+        return payload

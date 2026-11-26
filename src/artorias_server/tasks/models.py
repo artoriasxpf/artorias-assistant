@@ -1,6 +1,8 @@
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Literal
 
+from artorias_server.analysis.models import AnalysisPlan
+
 
 class PlanObject(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -34,6 +36,7 @@ class Item(PlanObject):
     task_patch: RequirementPatch = Field(default_factory=RequirementPatch)
     input_locations: list[LocationIntent] = Field(default_factory=list, max_length=10)
     output_target: LocationIntent | None = None
+    analysis: AnalysisPlan | None = None
 
 class Plan(PlanObject):
     kind: Literal['chat', 'tasks', 'clarify']
