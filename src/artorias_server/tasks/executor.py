@@ -61,7 +61,7 @@ class TaskRuntime:
             task_revision=self.store.query('SELECT revision FROM business_tasks WHERE id=?',(step['task'],))[0]['revision']
             if task_revision != step['applied_revision']:
                 raise ValueError('任务要求已修改，当前步骤需要重新规划')
-            scoped=dict(run,task_step_id=step.get('id',step['key']),task_id=step['task'],thread_id=run['id']+':'+step['key'],task_context=self.context.build(run,step))
+            scoped=dict(run,allowed_tool_groups=json.loads(step['scope']).get('allowed_tool_groups'),step_key=step['key'],analysis_plan=json.loads(step['scope']).get('analysis'),task_step_id=step.get('id',step['key']),task_id=step['task'],thread_id=run['id']+':'+step['key'],task_context=self.context.build(run,step))
             if step['status']!='waiting':scoped.pop('decision',None)
             if step['status']=='waiting':
                 if not scoped.get('decision'):
@@ -73,6 +73,7 @@ class TaskRuntime:
                 yield 'task.started',{'task_id':step['task'],'key':step['key']}
             submission=None
             approval=None
+            analysis_result = None
             try:
                 async with aclosing(self.engine.execute(scoped)) as events:
                     async for kind,payload in events:
@@ -80,6 +81,11 @@ class TaskRuntime:
                             submission=FinishStep.model_validate(payload)
                             continue
                         if kind=='assistant.final':continue
+                        if kind == 'analysis.result':
+                            analysis_result = payload
+                        if kind == 'analysis.suspended':
+                            yield kind, payload
+                            return
                         if kind=='approval.requested':
                             approval=dict(payload,task_id=step['task'])
                             break
@@ -88,7 +94,7 @@ class TaskRuntime:
                     if submission is None:
                         raise ValueError('Missing structured step result')
                     evidence,verdicts=assess(self.store,run,step,submission)
-                    status=self.repo.deliver(run,step,submission,evidence,verdicts)
+                    status=self.repo.deliver(run,step,submission,evidence,verdicts,analysis_result=analysis_result)
             except asyncio.CancelledError:
                 with self.store.tx() as c:c.execute("UPDATE task_steps SET status='interrupted' WHERE run=? AND key=?",(run['id'],step['key']))
                 yield 'task.interrupted',{'task_id':step['task'],'key':step['key'],'reason':'cancelled'}

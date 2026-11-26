@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS resource_changes(change_id TEXT PRIMARY KEY, task_id 
             if not c.execute("SELECT 1 FROM workspaces WHERE location_id='cloud-default' AND root='personal'").fetchone():
                 c.execute('INSERT INTO workspaces(id,name,location_id,root) VALUES(?,?,?,?)',(uid(),'默认云端空间','cloud-default','personal'))
                 c.execute('INSERT INTO workspace_grants(id,location_id,root,access,scope_run) VALUES(?,?,?,?,?)',(uid(),'cloud-default','personal','write',''))
-    def register(self, name, root, kind='device_fs', *, _legacy=False):
+    def register(self, name, root, kind='device_fs', *, _legacy=False, persistent=True):
         if kind not in ('device_fs','cloud_storage'): raise ValueError('未知空间类型')
         if kind=='device_fs':
             root=str(Path(root).expanduser().resolve())
@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS resource_changes(change_id TEXT PRIMARY KEY, task_id 
             old=c.execute('SELECT id FROM workspaces WHERE location_id=? AND root=?',(location,root)).fetchone()
             wid=old[0] if old else uid()
             c.execute('INSERT OR IGNORE INTO workspaces(id,name,location_id,root) VALUES(?,?,?,?)',(wid,name,location,root))
-            if not c.execute("SELECT 1 FROM workspace_grants WHERE location_id=? AND root=? AND access='write' AND scope_run=''",(location,root)).fetchone():
+            if persistent and not c.execute("SELECT 1 FROM workspace_grants WHERE location_id=? AND root=? AND access='write' AND scope_run=''",(location,root)).fetchone():
                 c.execute('INSERT INTO workspace_grants(id,location_id,root,access,scope_run) VALUES(?,?,?,?,?)',(uid(),location,root,'write',''))
         return self.get(wid)
     def _safe_root(self, root):

@@ -126,6 +126,14 @@ class TaskRepository:
             c.execute('UPDATE task_plans SET plan=? WHERE run=?',(plan.model_dump_json(),run['id']))
         return plan
 
-    def deliver(self, run, step, result, evidence, verdicts):
+    def deliver(self, run, step, result, evidence, verdicts, *, analysis_result=None):
         with self.store.tx() as c:
-            return deliver_result(c, self.search, run, step, result, evidence, verdicts)
+            status = deliver_result(c, self.search, run, step, result, evidence, verdicts)
+            if analysis_result:
+                c.execute('UPDATE analyses SET status=? WHERE id=? AND revision=?',
+                          ('open' if analysis_result['partial'] else 'completed',
+                           analysis_result['analysis_id'], analysis_result['revision']))
+            if c.execute("SELECT 1 FROM sqlite_master WHERE name='analysis_executions'").fetchone():
+                c.execute('DELETE FROM analysis_executions WHERE run_id=? AND step_key=?',
+                          (run['id'], step['key']))
+            return status

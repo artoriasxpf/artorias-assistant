@@ -261,7 +261,7 @@ function prominentFields(kind, payload) {
   if (kind === 'tool.result') return [['Call ID', p.call_id], ['工具', p.name], ['状态', p.status], ...taskField(p), ...execFields(p)];
   if (kind.startsWith('approval.')) {
     const fields = [...taskField(p)];
-    if (p.decision) fields.push(['决定', p.decision === 'approve' ? '批准' : '拒绝']);
+    if (p.decision) fields.push(['决定', ({approve: '批准', remember: '在此会话记住', reject: '拒绝'})[p.decision]]);
     if (p.reason) fields.push(['原因', p.reason]);
     if (p.request_seq !== undefined) fields.push(['Request Seq', p.request_seq]);
     return fields;
@@ -415,20 +415,31 @@ function eventCard(event) {
   if (kind === 'approval.requested') {
     const actions = element('div', undefined, 'event-actions');
     approvals.set(run, actions);
-    for (const decision of ['approve', 'reject']) {
-      const button = element('button', decision === 'approve' ? '批准' : '拒绝');
-      button.onclick = handle(async () => {
-        for (const control of actions.children) control.disabled = true;
-        try {
-          await api(`runs/${run}/decision`, { decision, request_seq: event.seq });
-          actions.remove();
-        } catch (error) {
-          for (const control of actions.children) control.disabled = false;
-          throw error;
-        }
-      });
-      actions.append(button);
+    const requests = payload.requests || [];
+    const controls = new Map();
+    for (const request of requests) {
+      const label = element('label', request.path || request.kind || '审批');
+      const select = element('select');
+      const defaultLabel = request.approve_scope === 'run' ? '本轮允许' : '允许此次';
+      select.add(new Option('拒绝', 'reject'));
+      select.add(new Option(defaultLabel, 'approve'));
+      if (request.allow_remember) select.add(new Option('在此会话记住', 'remember'));
+      label.append(select);
+      actions.append(label);
+      controls.set(request.request_id, select);
     }
+    const submit = element('button', '提交决定');
+    submit.onclick = handle(async () => {
+      submit.disabled = true;
+      try {
+        const choices = Object.fromEntries([...controls].map(([id, select]) => [id, select.value]));
+        await api(`runs/${run}/decision`, { decisions: choices, request_seq: event.seq });
+        actions.remove();
+      } finally {
+        submit.disabled = false;
+      }
+    });
+    actions.append(submit);
     entry.article.append(actions);
   }
 }
@@ -487,7 +498,7 @@ function renderEvent(event) {
       closeApproval(run);
     }
     if (kind === 'task.awaiting_review') runs.delete(run);
-    if (kind === 'approval.requested') runs.set(run, 'waiting');
+    if (kind === 'approval.requested' || kind === 'analysis.suspended') runs.set(run, 'waiting');
     if (kind === 'approval.decided') runs.set(run, 'queued');
     if (kind === 'run.completed') promoteStream(run, null);
     // A tool call or a new task step finalizes the current model output bubble.
@@ -507,6 +518,7 @@ function renderEvent(event) {
   }
   if (kind === 'run.failed') $('status').textContent = payload.error || '运行失败';
   else if (kind === 'approval.requested') $('status').textContent = '等待审批';
+  else if (kind === 'analysis.suspended') $('status').textContent = '分析已保存，等待继续…';
   else if (kind === 'run.started') $('status').textContent = '处理中…';
   else if (TERMINAL.has(kind) && !activeRun()) $('status').textContent = '';
   updateComposer();

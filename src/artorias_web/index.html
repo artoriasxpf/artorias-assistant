@@ -20,6 +20,7 @@
         <h1 id="sessionTitle">新会话</h1>
         <div class="header-actions">
           <button id="files" type="button">项目文件</button>
+          <button id="permissions" type="button">会话权限</button>
           <button id="changes" type="button">变更记录</button>
         </div>
       </header>
@@ -61,6 +62,11 @@
         <datalist id="localRoots"></datalist>
         <input id="cloudRoot" list="cloudRoots" placeholder="例如 personal/reports" autocomplete="off" hidden>
         <datalist id="cloudRoots"></datalist>
+        <label for="workspaceAccess">此会话的目录权限</label>
+        <select id="workspaceAccess">
+          <option value="read">只读</option>
+          <option value="write">读写（含覆盖和删除）</option>
+        </select>
         <p id="workspaceHint" class="dialog-hint"></p>
         <p id="workspaceError" role="alert" hidden></p>
         <div class="dialog-actions">

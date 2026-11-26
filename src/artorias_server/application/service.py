@@ -12,6 +12,5 @@ class AssistantService:
         self.scheduler.cancel(run)
         return {"requested":True}
     def decide(self,run,decision,request_seq=None):
-        if decision not in ("approve","reject"):raise ValueError("Invalid decision")
         self.repository.decide(run,decision,request_seq)
         return {"accepted":True}

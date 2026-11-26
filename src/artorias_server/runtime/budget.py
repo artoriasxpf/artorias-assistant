@@ -5,6 +5,7 @@ import os
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.utils.function_calling import convert_to_openai_tool
+from langgraph.config import get_stream_writer
 
 
 def _request_limit():
@@ -53,6 +54,21 @@ def _result_excerpt(message, limit):
         except ValueError:
             pass
         else:
+            if isinstance(payload, dict) and message.name in (
+                'project_inventory', 'project_search', 'project_read_many',
+            ):
+                excerpt = {key: payload[key] for key in (
+                    'stop_reason', 'truncated', 'next_cursor', 'inventory_id',
+                ) if key in payload}
+                excerpt['sources'] = [
+                    {key: _clip(value, 140) if isinstance(value, str) else value
+                     for key, value in row.items() if key in (
+                         'path', 'unit', 'start', 'count', 'next_start', 'version', 'status', 'line',
+                     )}
+                    for row in payload.get('items', payload.get('hits', []))[:8]
+                ]
+                excerpt['compacted'] = True
+                return json.dumps(excerpt, ensure_ascii=False)
             if isinstance(payload, dict) and ('files' in payload or 'content' in payload):
                 # Keep paging cursors and source identity usable independently of the excerpt.
                 excerpt = {key: payload[key] for key in (
@@ -93,7 +109,7 @@ def _batch_note(message, results, *, compact=False):
         call = calls[result.tool_call_id]
         args = call['args']
         source = ', '.join(f'{key}={_clip(str(args[key]), 150)}'
-                           for key in ('path', 'offset', 'working_directory', 'run_id', 'step_key') if key in args)
+                           for key in ('path', 'root', 'offset', 'working_directory', 'run_id', 'step_key') if key in args)
         preview = _clip(_result_excerpt(result, 180), 100) if compact else _result_excerpt(result, 180)
         lines.append(f"- {call['name']} [{result.status}] {source}: {preview}")
     if len(results) > shown:
@@ -160,7 +176,8 @@ class RequestBudget(AgentMiddleware):
         }
         limit = _request_limit()
         messages = _fit_messages(request.messages, envelope, limit)
-        check_budget({**envelope, 'messages': [m.model_dump() for m in messages]}, limit)
+        request_bytes = check_budget({**envelope, 'messages': [m.model_dump() for m in messages]}, limit)
+        get_stream_writer()({'kind': 'runtime.request_metrics', 'payload': {'request_bytes': request_bytes}})
         if messages is not request.messages:
             request = request.override(messages=messages)
         return await handler(request)

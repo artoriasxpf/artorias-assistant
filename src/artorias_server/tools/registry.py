@@ -1,12 +1,19 @@
 """Expose workspace executors as DeepAgents tools."""
+import os
 from typing import Annotated, Literal
+from time import monotonic
 
 from langchain_core.tools import InjectedToolCallId, tool
 from langgraph.types import interrupt
+from artorias_server.permissions import tool_call
 from pydantic import BaseModel, ConfigDict, Field
 
 from artorias_shared.execution.models import InputResource, OutputPolicy, PythonRequest
 from .executor import WorkspaceToolExecutor
+from .project_analysis import (
+    InventoryArguments, ProjectAnalysis, ReadArguments, SearchArguments, stopped,
+)
+from .files import json_bytes
 
 
 class RunPythonArguments(PythonRequest):
@@ -21,6 +28,68 @@ class DirectoryArguments(BaseModel):
 def build_tools(ws, emit, *, sandbox=None, execution_service=None):
     executor = WorkspaceToolExecutor(ws, sandbox=sandbox, execution_service=execution_service)
 
+    def file_operation(path, action, directory, operation):
+        call_id = tool_call.get()
+        if not call_id:
+            return operation()
+        return executor.file_operation(call_id, path, action, directory, operation, interrupt)
+
+    analysis = ProjectAnalysis(ws, executor.files)
+
+    def measure(name, operation):
+        started = monotonic()
+        result = operation()
+        if result.get('rejected'):
+            result = stopped('permission_denied')
+        emit('runtime.tool_metrics', {
+            'name': name, 'call_id': tool_call.get(),
+            'duration_ms': round((monotonic() - started) * 1000, 2),
+            'serialized_bytes': len(json_bytes(result)),
+            'hits': len(result.get('hits', [])),
+            'coverage': result['coverage'], 'stop_reason': result['stop_reason'],
+        })
+        return result
+
+    @tool(args_schema=InventoryArguments)
+    def project_inventory(**kwargs) -> dict:
+        """Summarize directory contents using metadata only. Paths in samples are
+        relative to root. For the next page, repeat the options with next_cursor.
+        Report coverage and exclusions when using inventory to make recommendations.
+        """
+        args = InventoryArguments(**kwargs)
+        if args.snapshot_page:
+            return file_operation(args.root, 'read', True, lambda: analysis.snapshot_page(args))
+        return measure('project_inventory', lambda: file_operation(
+            args.root, 'read', True, lambda: analysis.inventory(args),
+        ))
+
+    @tool(args_schema=SearchArguments)
+    def project_search(**kwargs) -> dict:
+        """Search authorized paths by name, literal text, or line-oriented regex.
+        Return matching locations and short excerpts. Read source ranges to verify.
+        If next_cursor is present, repeat the original options to continue.
+        """
+        args = SearchArguments(**kwargs)
+        if args.snapshot_page:
+            return file_operation(args.root or '.', 'read', True, lambda: analysis.snapshot_page(args))
+        inventory = analysis.inventory_options(args.inventory_id) if args.inventory_id else None
+        root = args.root or (inventory['root'] if inventory else '.')
+        return measure('project_search', lambda: stopped('cursor_expired') if args.inventory_id and not inventory
+                       else file_operation(root, 'read', True, lambda: analysis.search(args, inventory)))
+
+    @tool(args_schema=ReadArguments)
+    def project_read_many(**kwargs) -> dict:
+        """Read up to eight authorized text ranges. Use 1-based lines or 0-based
+        Unicode character offsets. Resume with next_start and expected_version.
+        Inspect each item's status and the overall coverage. If one line exceeds the
+        byte budget, switch to character offsets.
+        """
+        args = ReadArguments(**kwargs)
+        paths = dict.fromkeys(item.path for item in args.items)
+        return measure('project_read_many', lambda: analysis.read_many(
+            args, executor.read_permissions(tool_call.get(), paths, interrupt),
+        ))
+
     @tool
     def project_tree(
         path: str = '.',
@@ -32,7 +101,9 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         two levels and 200 entries. Hidden names are excluded by default.
         If truncated is true, narrow the path or increase max_entries (up to 1000).
         """
-        return executor.tree(path, max_depth=max_depth, max_entries=max_entries, include_hidden=include_hidden)
+        return file_operation(path, 'read', True, lambda: executor.tree(
+            path, max_depth=max_depth, max_entries=max_entries, include_hidden=include_hidden,
+        ))
 
     @tool(args_schema=DirectoryArguments)
     def project_list(path: str = '.') -> dict:
@@ -40,34 +111,35 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         hidden entries. No recursion, pagination or truncation. Use project_tree
         first for large directories. Both tools omit symlinks and special files.
         """
-        return executor.list_directory(path)
+        return file_operation(path, 'read', True, lambda: executor.list_directory(path))
 
     @tool
     def project_read(path: str, offset: int = 0, limit: int = 2000,
-                     expected_version: str | None = None) -> dict:
+                     expected_version: str | None = None, unit: Literal["unicode_character", "byte"] = "unicode_character") -> dict:
         """Read one UTF-8 page from an authorized file. For the next page, pass
-        next_offset as offset and version as expected_version. For analysis, use
-        at most 3 reads per batch and limit each to 2000 characters. Record concise
-        findings with source paths and page ranges before reading the next batch.
+        next_offset as offset and version as expected_version. For large files use byte pages
+        (limit 4–4096) and continue with next_start and the returned version.
         """
-        return executor.read(path, offset, limit, expected_version)
+        return file_operation(path, 'read', False,
+                              lambda: analysis.byte_page(path, offset, limit, expected_version) if unit == 'byte'
+                              else executor.read(path, offset, limit, expected_version))
 
     @tool
     def project_write(path: str, content: str) -> dict:
         """Create or replace an authorized UTF-8 file with version history.
         Read an existing file before replacing it.
         """
-        return executor.write(path, content)
+        return file_operation(path, 'write', False, lambda: executor.write(path, content))
 
     @tool
     def project_edit(path: str, old: str, new: str) -> dict:
         """Replace one uniquely matching string in an authorized UTF-8 file."""
-        return executor.edit(path, old, new)
+        return file_operation(path, 'write', False, lambda: executor.edit(path, old, new))
 
     @tool
-    def project_delete(path: str) -> str:
+    def project_delete(path: str) -> str | dict:
         """Delete an authorized file while keeping its previous version."""
-        return executor.delete(path)
+        return file_operation(path, 'write', False, lambda: executor.delete(path))
 
     @tool
     def project_move(source: str, destination: str, expected_source_version: str | None = None) -> dict:
@@ -81,11 +153,11 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
 
     @tool
     def project_authorize(path: str, access: Literal['read', 'write'] = 'write') -> dict:
-        """Ask for Run-scoped access to a local absolute directory and its descendants.
+        """Ask for access to a local absolute directory and its descendants.
         Request read for listing or reading, and write for changes. Retry the file
         operation after approval. Do not repeat a denied authorization.
         """
-        return executor.authorize(path, access, interrupt)
+        return executor.authorize(path, access, interrupt, tool_call.get())
 
     @tool(args_schema=RunPythonArguments)
     async def run_python(
@@ -113,5 +185,8 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         )
         return await executor.run_python(tool_call_id, request, interrupt, emit)
 
-    return [project_tree, project_list, project_read, project_write, project_edit,
-            project_delete, project_move, project_authorize, run_python]
+    tools = [project_tree, project_list, project_read, project_write, project_edit,
+             project_delete, project_move, project_authorize, run_python]
+    if os.getenv('ARTORIAS_PROJECT_ANALYSIS', '1') == '1':
+        tools[:0] = [project_inventory, project_search, project_read_many]
+    return tools

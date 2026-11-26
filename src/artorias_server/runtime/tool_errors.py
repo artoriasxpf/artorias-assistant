@@ -18,6 +18,7 @@ import json
 
 from langchain.agents.middleware import AgentMiddleware
 from langchain_core.messages import ToolMessage
+from artorias_server.permissions import tool_call
 from langgraph.errors import GraphBubbleUp, is_invalid_resume
 
 _MAX_ERROR_CHARS = 4000
@@ -78,6 +79,7 @@ class ToolErrorBoundary(AgentMiddleware):
         )
 
     def wrap_tool_call(self, request, handler):
+        token = tool_call.set(request.tool_call.get('id'))
         try:
             result = handler(request)
             self._reset(request)
@@ -88,8 +90,11 @@ class ToolErrorBoundary(AgentMiddleware):
             if is_invalid_resume(exc):
                 raise
             return self._error(request, exc)
+        finally:
+            tool_call.reset(token)
 
     async def awrap_tool_call(self, request, handler):
+        token = tool_call.set(request.tool_call.get('id'))
         try:
             result = await handler(request)
             self._reset(request)
@@ -100,3 +105,5 @@ class ToolErrorBoundary(AgentMiddleware):
             if is_invalid_resume(exc):
                 raise
             return self._error(request, exc)
+        finally:
+            tool_call.reset(token)

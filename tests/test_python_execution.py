@@ -258,7 +258,7 @@ def test_real_graph_approval_resume_publishes_once(tmp_path):
     first=asyncio.run(collect(run))
     assert first[-1][0]=='approval.requested' and backend.calls==0
     assert first[-1][1]['requests'][0]['output']['target']=='out'
-    db.finish(run,'waiting');db.decide(run['id'],'approve')
+    db.finish(run,'waiting',approval=first[-1][1]);db.decide(run['id'],'approve')
     second=asyncio.run(collect(db.claim()))
     assert second[-1][0]=='assistant.final' and backend.calls==1
     assert ws.read_bytes('out/a.bin')==b'\x00\xff'
@@ -364,3 +364,54 @@ def test_permission_revoked_before_execution(tmp_path):
     result=execute(service,ws,plan)
     assert result['execution_status']=='stale_plan' and service.backend.calls==0
     assert not (service.root/plan['id']/'inputs').exists()
+
+
+def test_remembered_python_permission_matches_only_same_plan(tmp_path):
+    from artorias_server.permissions import fingerprint
+    from artorias_server.tools.executor import WorkspaceToolExecutor
+    from artorias_shared.execution.models import PythonRequest
+    from artorias_server.workspace.routing import WorkspaceService
+
+    backend = Backend()
+    ws, service, store = setup(tmp_path, backend)
+    request = PythonRequest(path='script.py')
+    plan = service.prepare(ws, 'first', request)
+    resource = service.permission_rule(ws, plan)
+    permission_id = ws.permissions.request(ws, 'first', dict(
+        location_id=resource['location_id'], workspace_id=resource['workspace_id'],
+        action='execute', resource_kind='command', rule=resource, rule_hash=fingerprint(resource),
+    ), plan['plan_hash'])
+    run = store.query('SELECT * FROM runs WHERE id=?', (ws.run,))[0]
+    store.finish(run, 'waiting', approval={'requests': [{
+        'request_id': 'interrupt', 'permission_request_id': permission_id, 'allow_remember': True,
+    }]})
+    store.decide(ws.run, 'remember')
+    store.claim()
+    store.finish(run, 'completed')
+    store.submit(ws.session, 'second execution', 'second')
+    next_run = store.claim()
+    next_ws = WorkspaceService(store, ws.session, next_run['id'], registry=ws.registry)
+    tool = WorkspaceToolExecutor(next_ws, execution_service=service)
+
+    def requires_no_approval(_):
+        pytest.fail('unchanged script should reuse its exact Session rule')
+
+    result = asyncio.run(tool.run_python('second', request, requires_no_approval, lambda *_: None))
+    assert result['execution_status'] == 'succeeded'
+    requests = []
+    result = asyncio.run(tool.run_python(
+        'different-args', PythonRequest(path='script.py', args=['new']),
+        lambda details: requests.append(details) or 'reject', lambda *_: None,
+    ))
+    assert result['execution_status'] == 'rejected'
+    assert requests[0]['rule']['request']['args'] == ['new']
+
+    _, version = next_ws.read_version('script.py')
+    next_ws.write('script.py', 'print(43)', expected=version)
+    result = asyncio.run(tool.run_python(
+        'changed-script', request,
+        lambda details: requests.append(details) or 'reject', lambda *_: None,
+    ))
+    assert result['execution_status'] == 'rejected'
+    assert requests[1]['script_sha256'] != plan['inputs'][0]['sha256']
+    assert backend.calls == 1

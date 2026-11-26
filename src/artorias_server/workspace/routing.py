@@ -1,6 +1,8 @@
 """Resolve and authorize each operation; never reinterpret a rollback via current Session."""
 import json
 from pathlib import Path
+from contextvars import ContextVar
+from artorias_server.permissions import MissingPermission, Permissions, covers
 from .catalog import WorkspaceCatalog
 from .connectors import ConnectorRegistry
 from artorias_shared.workspace import ConnectorUnavailable, WorkspaceContext, UNSET_VERSION
@@ -10,13 +12,15 @@ class WorkspaceService:
     def __init__(self, store, session, run=None, task=None, registry=None):
         self.store,self.session,self.run,self.task=store,session,run,task
         self.catalog=WorkspaceCatalog(store)
+        self.permissions = Permissions(store)
+        self.once = ContextVar("operation_file_permission", default=None)
         self.registry=registry or ConnectorRegistry()
         w=self.catalog.task_binding(task,session) if task else self.catalog.current(session)
         self.workspace=self.catalog.snapshot_run(run,session,task or '',w['id']) if run else w
         self.root=self.workspace['root']
     def describe(self):
         return {k:self.workspace[k] for k in ('id','name','kind','location_id','root')}
-    def _resolve(self, path, action, *, directory=False, create_default=False):
+    def _target(self, path, *, directory=False):
         if not isinstance(path,str) or not path or '\x00' in path:raise ValueError('路径不能为空')
         w=self.workspace
         if path.startswith('workspace://'):
@@ -26,19 +30,59 @@ class WorkspaceService:
             w=self.catalog.get(wid)
             if Path(path).is_absolute():raise ValueError('空间引用只能使用相对路径')
         elif Path(path).is_absolute():
-            # Absolute host paths explicitly refer to this installation's registered device.
-            w=dict(w,kind='device_fs',location_id=self.catalog.device_id,
-                   blob_root=str(self.catalog.data/'blobs'),id=None)
+            target = Path(path)
+            if w['kind'] != 'device_fs' or not target.is_relative_to(Path(w['root'])):
+                workspaces = self.store.query(
+                    "SELECT id,root FROM workspaces WHERE location_id=?", (self.catalog.device_id,),
+                )
+                matched = [entry for entry in workspaces if target.is_relative_to(Path(entry['root']))]
+                if matched:
+                    best = max(matched, key=lambda entry: len(Path(entry['root']).parts))
+                    w = self.catalog.get(best['id'])
+                else:
+                    w = dict(w, kind='device_fs', location_id=self.catalog.device_id,
+                             blob_root=str(self.catalog.data/'blobs'), id=None)
         p=Path(path)
         if '..' in p.parts or '\\' in path:raise ValueError('非法路径')
         target=p if p.is_absolute() else Path(w['root'])/p
-        grant=self.catalog.authorize(w['location_id'],str(target),action,self.run)
+        return w, target
+
+    def _authorize(self, workspace, target, action, directory=False):
+        resource = dict(location_id=workspace['location_id'], workspace_id=workspace.get('id'),
+                        action=action, root=str(target),
+                        resource_kind='directory' if directory else 'file')
+        temporary = self.once.get()
+        grant = self.permissions.matching(self.session, resource)
+        if workspace['kind'] == 'device_fs' and (temporary or grant):
+            if target.resolve() != target:
+                raise ValueError('请直接使用规范路径，不能授权符号链接')
+        if temporary and temporary.get('workspace_id') == resource['workspace_id'] and (
+            temporary['location_id'] == resource['location_id'] and covers(temporary, resource)
+        ):
+            return temporary
+        if grant:
+            return grant
+        try:
+            return self.catalog.authorize(workspace['location_id'], str(target), action, self.run)
+        except PermissionError as exc:
+            if workspace['kind'] == 'device_fs':
+                self.catalog._safe_root(str(target.resolve()))
+                if target.resolve() != target:
+                    raise ValueError('请直接使用规范路径，不能授权符号链接') from exc
+            raise MissingPermission(resource) from exc
+
+    def _resolve(self, path, action, *, directory=False, create_default=False):
+        w, target = self._target(path, directory=directory)
+        grant = self._authorize(w, target, action, directory)
         # Use the grant root as boundary; workspace is only the default resolution root.
-        routed=dict(w,root=grant['root'])
+        boundary = Path(grant['root'])
+        if grant.get('resource_kind') == 'file':
+            boundary = boundary.parent
+        routed=dict(w,root=str(boundary))
         if directory:routed['create_root']=create_default
         connector=self.registry.get(w['kind'],w['location_id'])
         ws=connector.open(routed,WorkspaceContext(self.session,self.run,self.task))
-        relative=target.relative_to(Path(grant['root'])).as_posix()
+        relative=target.relative_to(boundary).as_posix()
         if not directory:
             if relative=='.':raise ValueError('需要文件路径而不是授权目录')
             ws.path(relative)  # Endpoint enforces canonical path/symlink checks too.
@@ -86,6 +130,25 @@ class WorkspaceService:
             raise ConnectorUnavailable('目标连接器不支持目录树')
         return tree(relative, max_depth=max_depth, max_entries=max_entries, include_hidden=include_hidden)
 
+    def analysis_root(self, path):
+        endpoint, relative, workspace, target = self._resolve(path, 'read', directory=True, create_default=path=='.')
+        return endpoint, relative, (workspace['kind'], workspace['location_id'], workspace['id'], str(target))
+
+    def analysis_text(self, path, *, max_bytes, versioned):
+        endpoint, relative, workspace, target = self._resolve(path, 'read')
+        operation = getattr(endpoint, 'analysis_text', None)
+        if operation is None:
+            raise ConnectorUnavailable('目标连接器不支持有界文本读取')
+        result = operation(relative, max_bytes=max_bytes, versioned=versioned)
+        return result, f"{workspace['kind']}:{workspace['location_id']}:{target}"
+
+    def analysis_search(self, path, **options):
+        endpoint, relative, _, _ = self._resolve(path, 'read')
+        operation = getattr(endpoint, 'analysis_search', None)
+        if operation is None:
+            raise ConnectorUnavailable('目标连接器不支持有界正文搜索')
+        return operation(relative, **options)
+
     def write_bytes(self, path, content, *, expected, operation_id=None):
         ws,p,w,target=self._resolve(path,'write')
         result=ws.write_bytes(p,content,expected=expected,operation_id=operation_id)
@@ -113,7 +176,7 @@ class WorkspaceService:
                               'path': str(destination_path)})
     def files(self):
         w=self.workspace
-        self.catalog.authorize(w['location_id'],w['root'],'read',self.run)
+        self._authorize(w, Path(w['root']), 'read', True)
         return self.registry.get(w['kind'],w['location_id']).open(w,WorkspaceContext(self.session,self.run,self.task)).files()
     def revert(self,cid):
         record=self.registry.find_change(cid,self.session)
@@ -132,8 +195,8 @@ class WorkspaceService:
         if backend=='cloud_storage':
             loc=self.store.query('SELECT * FROM workspace_locations WHERE id=?',(location,))[0]
             logical=target.relative_to(Path(loc['root'])).as_posix()
-            self.catalog.authorize(location,logical,'write',self.run)
-        else:self.catalog.authorize(location,str(target),'write',self.run)
+            self._authorize(dict(id=record['workspace_id'], location_id=location, kind=backend), Path(logical), 'write')
+        else:self._authorize(dict(id=record['workspace_id'], location_id=location, kind=backend), target, 'write')
         # Original root and blob location are authoritative, including pre-v0.5 records.
         w=dict(id=record['workspace_id'],kind=backend,location_id=location,root=record['root'],blob_root=record['blob_root'] or str(self.catalog.data/'blobs'))
         connector=self.registry.get(backend,location)

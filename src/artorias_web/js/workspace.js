@@ -29,7 +29,7 @@ export function setupWorkspace(current, handle, nativePicker) {
     cloud.hidden = isLocal;
     $('spaceRootLabel').htmlFor = isLocal ? localInput.id : 'cloudRoot';
     $('workspaceHint').textContent = isLocal
-      ? (nativePicker ? '选择或新建本机文件夹。' : '输入本机文件夹的绝对路径。') + '使用新目录时会授予助手持续读写权限。'
+      ? (nativePicker ? '选择或新建本机文件夹。' : '输入本机文件夹的绝对路径。')
       : '输入云端逻辑目录，例如 personal/reports。';
     $('saveWorkspace').disabled = busy || !(isLocal ? localInput.value.trim() : cloud.value.trim());
   }
@@ -99,7 +99,10 @@ export function setupWorkspace(current, handle, nativePicker) {
       if (!root) throw Error('请选择或输入文件夹');
       const existing = spaces.find(space => space.kind === kind.value && space.root === root);
       const workspace = existing ?? await api('workspaces', {
-        kind: kind.value, root, name: root.split('/').filter(Boolean).pop() || root,
+        kind: kind.value, root, persistent: false, name: root.split('/').filter(Boolean).pop() || root,
+      });
+      await api(`sessions/${sessionId}/permissions/workspace`, {
+        workspace_id: workspace.id, access: $('workspaceAccess').value,
       });
       await api(`sessions/${sessionId}/workspace`, { workspace_id: workspace.id });
       await showWorkspace(sessionId, current);
@@ -132,6 +135,28 @@ export function setupWorkspace(current, handle, nativePicker) {
     }
     $('panel').append(pre);
   });
+  $('permissions').onclick = handle(async () => {
+    const id = current();
+    if (!id) return;
+    const grants = await api(`sessions/${id}/permissions`);
+    if (id !== current()) return;
+    openPanel('会话权限', grants.length ? '' : '此会话暂无单独授权。');
+    for (const grant of grants) {
+      const row = document.createElement('p');
+      const command = grant.rule_json ? JSON.parse(grant.rule_json).request : null;
+      const target = command ? [command.path, ...command.args].join(' ') : grant.root;
+      row.textContent = `${grant.action} · ${target} `;
+      const button = document.createElement('button');
+      button.textContent = '撤销';
+      button.onclick = handle(async () => {
+        await api(`sessions/${id}/permissions/${grant.id}/revoke`, {});
+        row.remove();
+      });
+      row.append(button);
+      $('panel').append(row);
+    }
+  });
+
   $('changes').onclick = handle(async () => {
     const id = current();
     if (!id) return;

@@ -183,6 +183,22 @@ class ExecutionService:
         except BaseException:
             shutil.rmtree(root,ignore_errors=True);raise
 
+    def permission_rule(self, ws, plan):
+        request = plan['request']
+        workspace = ws.describe()
+        target = plan['target'] if request['output']['target'] else 'managed_execution_artifacts'
+        code = [(entry['resource'], entry['staged'], entry['sha256']) for entry in plan['inputs']
+                if entry['staged'].startswith('app/')]
+        # Exact input mappings keep a directory permission from implicitly authorizing new inputs.
+        inputs = [(entry['resource'], entry['staged']) for entry in plan['inputs']]
+        return dict(
+            version=1, workspace_id=workspace['id'],
+            location_id=ws.catalog.device_id if self._plan_location(plan) == 'device' else 'cloud-default',
+            execution_location=self._plan_location(plan), profile=plan['profile'],
+            network=plan['network'], request=request, target=target,
+            code=[list(item) for item in code], inputs=[list(item) for item in inputs],
+        )
+
     def approval(self,plan):
         req=plan['request']
         return {'kind':'code_execution','execution_id':plan['id'],'path':req['path'],'plan_hash':plan['plan_hash'],

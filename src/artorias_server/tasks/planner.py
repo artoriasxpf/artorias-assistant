@@ -19,6 +19,8 @@ add 由系统分配 ID，可使用 client_ref。临时要求只写 step_spec。�
 依赖交付用 depends_on；必须等验收通过再继续时用 step_spec.wait_for，只指向生产者 user 标准和产物角色。
 仅本步需要的用户确认放入 local_reviews。文字答复的产物角色为 response。
 位置意图保留用户原文，避免猜测绝对路径。
+大文件、目录或仓库分批分析时可填写 analysis，roots 必须使用用户给出的路径或工作空间相对路径。
+分析与修改分别规划，分析条目只读，修改条目依赖分析的结果。写入步骤使用依赖交付或 task_result_read。普通短问答省略 analysis。单步确需写入或执行时显式设置 allowed_tool_groups，工具仍受 workspace 授权约束。
 '''
 
 

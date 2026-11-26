@@ -19,6 +19,7 @@ class Scheduler:
         self.store.emit(run['session'],run['id'],'run.started',{})
         final=''
         approval=None
+        suspension=None
         try:
             async with aclosing(self.runtime.execute(run)) as events:
                 async for kind,payload in events:
@@ -26,11 +27,19 @@ class Scheduler:
                         from artorias_server.tasks.reviews import park_or_requeue
                         park_or_requeue(self.store,run)
                         return
+                    if kind == 'analysis.suspended':
+                        suspension = payload
+                        break
                     if kind=='approval.requested':
                         approval=payload
                         break
                     self.store.emit(run['session'],run['id'],kind,payload)
                     if kind=='assistant.final':final=payload['text']
+            if suspension is not None:
+                if not self.store.suspend_analysis(run, suspension['dependency_id']):
+                    raise ValueError('分析续跑次数已达上限，已提交的批次可在后续运行中使用')
+                self.store.emit(run['session'], run['id'], 'analysis.suspended', suspension)
+                return
             if approval is not None:
                 self.store.finish(run,'waiting',approval=approval);return
             self.store.finish(run,'completed',final)
@@ -43,7 +52,7 @@ class Scheduler:
         rows=self.store.query('SELECT * FROM runs WHERE id=?',(rid,))
         if not rows:raise KeyError(rid)
         if rid in self.active:self.active[rid].cancel()
-        elif rows[0]['status'] in ('queued','waiting','awaiting_review'):
+        elif rows[0]['status'] in ('queued','waiting','awaiting_review','analysis_waiting'):
             if rows[0]['status']=='waiting':
                 self._close_pending_approval(rows[0],'cancelled')
             self.store.finish(rows[0],'cancelled');self.store.emit(rows[0]['session'],rid,'run.cancelled',{})

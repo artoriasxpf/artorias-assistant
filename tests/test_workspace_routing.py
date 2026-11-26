@@ -219,7 +219,7 @@ def test_web_selection_grants_and_current_space(tmp_path,monkeypatch):
         assert client.get('/api/sessions/'+sid+'/files',headers=h).status_code==403
 
 
-@pytest.mark.parametrize('decision', ['approve', 'reject'])
+@pytest.mark.parametrize('decision', ['approve', 'remember', 'reject'])
 def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
     import json
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -241,11 +241,8 @@ def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
     def call(name,args,cid):return AIMessage(content='',tool_calls=[{'name':name,'args':args,'id':cid,'type':'tool_call'}])
     replies=[
         call('project_list',{'path':str(outside)},'list-before'),
-        call('project_authorize',{'path':str(outside),'access':'read'},'grant'),
+        finish_message('done'),
     ]
-    if decision=='approve':
-        replies.append(call('project_list',{'path':str(outside)},'list-after'))
-    replies.append(finish_message('done'))
     model=Model(disable_streaming=True,messages=iter(replies))
     monkeypatch.setattr(runtime,'create_model',lambda:model)
     db.submit(sid,'create external file','1');run=db.claim()
@@ -259,26 +256,25 @@ def test_real_agent_authorization_resume(tmp_path,monkeypatch,decision):
     assert db.query('SELECT status FROM task_steps WHERE run=?',(run['id'],))[0]['status']=='waiting'
     assert not db.query('SELECT id FROM workspace_grants WHERE scope_run=?',(run['id'],))
     cat.select(sid,cloud['id'])
-    db.decide(run['id'],decision,request['seq'])
+    request_item = json.loads(request['payload'])['requests'][0]
+    db.decide(run['id'],{request_item['request_id']: decision},request['seq'])
     asyncio.run(scheduler.execute(db.claim()))
     events=[(row['kind'],json.loads(row['payload'])) for row in db.events(sid,0)]
-    calls=[payload for kind,payload in events if kind=='tool.call' and payload['call_id']=='grant']
-    results=[payload for kind,payload in events if kind=='tool.result' and payload['call_id']=='grant']
-    assert len(calls)==len(results)==1
-    assert results[0]['status']=='success'
     assert sum(kind=='task.resumed' for kind,_ in events)==1
     assert events[-1][0]=='run.completed'
-    listing={payload['call_id']:payload for kind,payload in events if kind=='tool.result' and payload['name']=='project_list'}
-    assert listing['list-before']['status']=='error'
-    assert '未授权' in listing['list-before']['content']
-    if decision=='approve':
-        assert json.loads(listing['list-after']['content'])['entries']==[{'path':'nested','type':'directory'}]
-        ws=WorkspaceService(db,sid,run['id'])
-        with pytest.raises(PermissionError):
-            ws.write(str(outside/'a.txt'),'blocked',expected=None)
+    listing=next(payload for kind,payload in events if kind=='tool.result' and payload['name']=='project_list')
+    if decision=='reject':
+        assert json.loads(listing['content'])=={'rejected':True}
     else:
-        assert json.loads(results[0]['content'])=={'rejected':True}
-        assert not db.query('SELECT id FROM workspace_grants WHERE scope_run=?',(run['id'],))
+        assert json.loads(listing['content'])['entries']==[{'path':'nested','type':'directory'}]
+    next_ws = WorkspaceService(db, sid, 'another-run')
+    if decision == 'remember':
+        assert next_ws.read(str(outside/'nested/existing.txt')) == 'outside'
+        with pytest.raises(PermissionError):
+            WorkspaceService(db, db.session(), 'another-session').read(str(outside/'nested/existing.txt'))
+    else:
+        with pytest.raises(PermissionError):
+            next_ws.read(str(outside/'nested/existing.txt'))
     assert WorkspaceService(db,sid,run['id']).describe()['id']==local['id']
 
 
