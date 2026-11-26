@@ -10,12 +10,12 @@ class WorkspaceCatalog:
         with store.tx() as c:
             c.executescript('''
 CREATE TABLE IF NOT EXISTS workspace_locations(id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('device_fs','cloud_storage')), root TEXT NOT NULL, blob_root TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY, name TEXT NOT NULL, location_id TEXT NOT NULL, root TEXT NOT NULL, UNIQUE(location_id,root));
+CREATE TABLE IF NOT EXISTS workspaces(id TEXT PRIMARY KEY, location_id TEXT NOT NULL, name TEXT NOT NULL, root TEXT NOT NULL, UNIQUE(location_id,root));
 CREATE TABLE IF NOT EXISTS session_workspaces(session TEXT PRIMARY KEY, workspace_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS task_workspaces(task TEXT PRIMARY KEY, workspace_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS run_workspace_bindings(run TEXT NOT NULL, task TEXT NOT NULL DEFAULT '', workspace_id TEXT NOT NULL, PRIMARY KEY(run,task));
-CREATE TABLE IF NOT EXISTS workspace_grants(id TEXT PRIMARY KEY, location_id TEXT NOT NULL, root TEXT NOT NULL, access TEXT NOT NULL CHECK(access IN ('read','write')), scope_run TEXT NOT NULL DEFAULT '');
-CREATE TABLE IF NOT EXISTS resource_changes(change_id TEXT PRIMARY KEY, backend TEXT NOT NULL, location_id TEXT NOT NULL, root TEXT NOT NULL, blob_root TEXT NOT NULL, task_id TEXT, workspace_id TEXT);
+CREATE TABLE IF NOT EXISTS workspace_grants(id TEXT PRIMARY KEY, location_id TEXT NOT NULL, scope_run TEXT NOT NULL DEFAULT '', root TEXT NOT NULL, access TEXT NOT NULL CHECK(access IN ('read','write')));
+CREATE TABLE IF NOT EXISTS resource_changes(change_id TEXT PRIMARY KEY, task_id TEXT, workspace_id TEXT, location_id TEXT NOT NULL, backend TEXT NOT NULL, root TEXT NOT NULL, blob_root TEXT NOT NULL);
 ''')
             # Stable device identity survives process restarts; use explicit configuration for deployments.
             device=c.execute("SELECT id FROM workspace_locations WHERE kind='device_fs' LIMIT 1").fetchone()

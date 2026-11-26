@@ -144,6 +144,12 @@ class WorkspaceToolExecutor:
     def delete(self, path):
         return self.workspace.delete(path)
 
+    def move(self, source, destination, expected_source_version=None):
+        move = getattr(self.workspace, 'move', None)
+        if move is None:
+            raise ConnectorUnavailable('当前工作空间不支持文件移动')
+        return move(source, destination, expected_source_version=expected_source_version)
+
     def authorize(self, path, access, approve, call_id=None):
         if not hasattr(self.workspace, 'grant_access'):
             raise ConnectorUnavailable('当前工作空间不支持本机目录授权')
@@ -174,7 +180,7 @@ class WorkspaceToolExecutor:
         if service is None:
             if (request.args or request.inputs or request.output != OutputPolicy()
                     or request.mode != 'isolated' or request.working_directory or request.code_directory
-                    or request.allow_delete or request.execution_hint != 'auto'):
+                    or request.dependencies or request.allow_delete or request.execution_hint != 'auto'):
                 raise ValueError('此执行器不支持产物模式')
             approval = ApprovalRequest('code_execution', request.path, {'notice':'Legacy sandbox: logs only'})
             if approve(approval.to_payload()) != 'approve':

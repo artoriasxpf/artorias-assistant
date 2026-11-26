@@ -8,6 +8,7 @@ from .budget import RequestBudget
 from .model_activity import ModelActivity
 from .checkpoints import SQLiteCheckpointProvider
 from .tool_errors import ToolErrorBoundary
+from .step_repair import repair_submission
 from artorias_server.workspace.factory import WorkspaceFactory
 from artorias_server.tools.registry import build_tools
 
@@ -44,6 +45,7 @@ class DeepAgentRuntime:
                 +json.dumps(run['task_context'],ensure_ascii=False)})
         messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；缺少文件权限时工具会申请授权；拒绝后停止对该目标重复申请。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
         tools=list(self.tool_factory(ws,emit))
+        finished = []
         tool_names = {getattr(tool, 'name', None) for tool in tools}
         file_guidance = (
             '已知路径直接读，多个独立范围用一次 project_read_many。'
@@ -61,11 +63,32 @@ class DeepAgentRuntime:
         )
         if run.get('task_id'):
             from artorias_server.tasks.results import result_tool
-            tools.append(result_tool(self.store,run['session'],run['task_id']))
+            tools.append(result_tool(self.store,run['session'],run['task_id'],run['id'],run['task_step_id']))
+            from langchain_core.tools import tool
+            from artorias_server.tasks.models import FinishStep
+            from artorias_server.tasks.verification import resolve
+
+            def validate_submission(args):
+                submission=FinishStep.model_validate(args)
+                step=self.store.query('SELECT * FROM task_steps WHERE run=? AND key=?',
+                                      (run['id'],run['task_step_id']))[0]
+                resolve(self.store,run,step,submission)
+                return submission
+
+            @tool(args_schema=FinishStep, return_direct=True)
+            def finish_step(**kwargs):
+                """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional."""
+                submission = validate_submission(kwargs)
+                finished.append(submission)
+                return submission.final_text
+
+            tools.append(finish_step)
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对 criterion_refs 指定的标准和必选 local_reviews 填写 id、claim 和自然语言 reason。未指定 criterion_refs 时填写快照中全部必选标准。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
+
         thread_id=run.get('thread_id',run['id'])
         analysis = None
         middleware = [RequestBudget(), ModelActivity(), ToolErrorBoundary()]
-        analysis_plan = (run.get('task_context') or {}).get('execution_scope', {}).get('analysis')
+        analysis_plan = run.get('analysis_plan')
         analysis_enabled = os.environ.get('ARTORIAS_ANALYSIS_MEMORY', '1') != '0'
         if analysis_plan and not analysis_enabled:
             has_links = self.store.query("SELECT 1 FROM sqlite_master WHERE name='analysis_step_links'")
@@ -79,7 +102,7 @@ class DeepAgentRuntime:
             segment = self.store.begin_analysis(run['id'], run['step_key'])
             analysis.segment = segment
             thread_id += f':analysis:{segment}'
-            tools = analysis.tools()
+            tools = [*analysis.tools(), finish_step]
             middleware = [AnalysisPrompt(analysis), RequestBudget(), AnalysisContext(analysis),
                           ModelActivity(), ToolErrorBoundary()]
             file_guidance = (
@@ -107,13 +130,14 @@ class DeepAgentRuntime:
                     ('分析工具会校验来源范围和权限。' if analysis else
                      '用 project_write 或 project_edit 修改文件。相对路径走已绑定的本机或云端工作空间。'
                      '用户给出本机绝对路径时保留它。拒绝授权后不得重复申请。'
+                     '用 project_move 移动或改名本机文件，提供完整目标文件路径。'
                      '覆盖已有文件前先读取。执行 Python 用 run_python，等待用户审批。')
                     + '不要声称未实际执行的操作成功。不要自行拆分业务 Task。'
                 ),
             )
             result=None
             from langgraph.types import Command
-            config={'configurable':{'thread_id':thread_id},'recursion_limit':50}
+            config={'configurable':{'thread_id':thread_id},'recursion_limit':200}
             payload=Command(resume=run['decision']) if run.get('decision') else {'messages':messages}
             seen_calls=set()
             seen_results=set()
@@ -184,7 +208,20 @@ class DeepAgentRuntime:
                 }
                 return
             except ExhaustedAnalysis:
-                yield 'assistant.final', {'text': '分析已达到执行预算。已提交的批次笔记保留，可在后续运行中继续。'}
+                progress = analysis.snapshot()
+                yield 'analysis.result', {'analysis_id': analysis.id, 'revision': progress['committed_batches'],
+                                          'coverage': progress['coverage'], 'partial': True}
+                scope = run['task_context']['execution_scope']
+                criteria = run['task_context']['effective_requirements']['criteria']
+                required = set(scope['criterion_refs']) or {key for key, rule in criteria.items() if rule['required']}
+                required.update(key for key, rule in scope['local_reviews'].items() if rule['required'])
+                text = '分析已达到执行预算。已提交的批次笔记保留，可在后续运行中继续。'
+                yield 'step.submitted', FinishStep(
+                    step_outcome='partial', final_text=text,
+                    criterion_claims=[{'id': key, 'claim': 'partial', 'reason': '分析预算耗尽，仍需核实。'}
+                                      for key in sorted(required)],
+                ).model_dump()
+                yield 'assistant.final', {'text': text}
                 return
             finally:
                 emit('runtime.graph_metrics', dict(
@@ -204,6 +241,19 @@ class DeepAgentRuntime:
                 for m in reversed(result.get('messages',[])):
                     if getattr(m,'type',None)=='ai' and not getattr(m,'tool_calls',[]):
                         text=text_content(m.content);break
+            if run.get('task_id'):
+                if len(finished) == 1:
+                    submission = finished[0]
+                else:
+                    history = state.values.get('messages', [])
+                    problem = '需要单独提交一次有效的 finish_step'
+                    for message in reversed(history):
+                        if message.type == 'tool' and message.name == 'finish_step' and message.status == 'error':
+                            problem = str(message.content)[:1500]
+                            break
+                    submission = await repair_submission(
+                        model, finish_step, validate_submission, history, emit, problem,
+                    )
             if analysis:
                 progress = analysis.snapshot()
                 coverage = progress['coverage']
@@ -211,9 +261,13 @@ class DeepAgentRuntime:
                               or bool(coverage.get('failures') or coverage.get('unavailable_batches'))
                               or (analysis.plan.coverage_policy == 'full' and not coverage['full']))
                 if incomplete:
-                    text = '部分分析结果。已保存的批次可在后续运行中继续使用。\n\n' + text
+                    text = ('部分分析结果。已保存的批次可在后续运行中继续使用。\n\n' + text)[:100000]
+                    outcome = 'partial' if submission.step_outcome == 'completed' else submission.step_outcome
+                    submission = submission.model_copy(update={'final_text': text, 'step_outcome': outcome})
                 yield 'analysis.result', {'analysis_id': analysis.id, 'revision': progress['committed_batches'],
                                           'coverage': coverage, 'partial': incomplete}
+            if run.get('task_id'):
+                yield 'step.submitted',submission.model_dump()
             yield 'assistant.final',{'text':text}
 
 def text_content(content):

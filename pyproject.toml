@@ -6,13 +6,29 @@ name = "artorias-assistant"
 version = "0.8.0"
 description = "Local personal assistant with replaceable runtime and storage adapters"
 requires-python = ">=3.11"
-dependencies = ["langchain-deepseek==1.1.1", "langchain-anthropic==1.7.10", "deepagents==0.7.35", "langgraph-checkpoint-sqlite==3.1.3", "langchain-openai==1.7.4", "fastapi==0.141.1", "uvicorn==0.52.1", "python-dotenv==1.2.2", "regex"]
+dependencies = [
+    "langchain-deepseek==1.1.1",
+    "langchain-anthropic==1.7.10",
+    "deepagents==0.7.35",
+    "langgraph-checkpoint-sqlite==3.1.3",
+    "langchain-openai==1.7.4",
+    "fastapi==0.141.1",
+    "uvicorn==0.52.1",
+    "python-dotenv==1.2.2",
+    "regex",
+    "httpx>=0.27,<1",
+]
 [project.optional-dependencies]
-dev = ["pytest", "httpx"]
+dev = ["pytest", "httpx", "artorias-search-service"]
+search = ["artorias-search-service"]
 [project.scripts]
 artorias-assistant = "artorias_local_app.main:main"
 artorias-server = "artorias_server.main:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/artorias_shared", "src/artorias_device", "src/artorias_server", "src/artorias_web", "src/artorias_local_app"]
+[tool.uv.sources]
+artorias-search-service = { path = "services/search" }
+
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 pythonpath = ["src"]

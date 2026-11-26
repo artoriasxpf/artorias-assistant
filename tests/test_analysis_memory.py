@@ -8,7 +8,8 @@ from artorias_local_app.bootstrap import create_engine, create_workspace
 from artorias_server.scheduler.service import Scheduler
 from artorias_server.storage.sqlite import Store
 from artorias_server.tasks.executor import TaskRuntime
-from artorias_server.tasks.models import Item, Plan
+from artorias_server.tasks.models import Plan
+from task_fixtures import finish_message, plan_item
 
 
 class AnalysisModel(GenericFakeChatModel):
@@ -32,7 +33,7 @@ class AnalysisModel(GenericFakeChatModel):
                 ]},
             }])
         elif 'record_analysis_note' in names:
-            reply = AIMessage(content='已核对示例文件')
+            reply = finish_message('已核对示例文件')
         else:
             reply = AIMessage(content='', tool_calls=[{
                 'name': 'analysis_next_batch', 'id': 'read-batch',
@@ -57,7 +58,7 @@ def test_analysis_pipeline_commits_actual_presented_range(tmp_path, monkeypatch)
     workspace.write('example.txt', '示例文件\n')
 
     async def plan(_):
-        return Plan(kind='tasks', items=[Item(key='review', goal='分析示例', analysis={
+        return Plan(kind='tasks', items=[plan_item(key='review', goal='分析示例', analysis={
             'analysis_type': 'document_file', 'intent': 'summary', 'goal': '分析示例',
             'roots': ['example.txt'],
         })])
@@ -89,7 +90,7 @@ def test_recovered_step_reuses_committed_note_and_replays_pending_batch(tmp_path
     run = store.claim()
     workspace = create_workspace(store, session, run['id'])
     workspace.write('example.txt', '示例文件\n')
-    plan = Plan(kind='tasks', items=[Item(key='review', goal='分析示例', analysis={
+    plan = Plan(kind='tasks', items=[plan_item(key='review', goal='分析示例', analysis={
         'analysis_type': 'document_file', 'intent': 'summary', 'goal': '分析示例',
         'roots': ['example.txt'],
     })])
@@ -193,7 +194,7 @@ def test_endpoint_wait_releases_job_and_retains_operation_id(tmp_path, monkeypat
     monkeypatch.setattr(LocalWorkspace, 'analysis_range_async', True, raising=False)
 
     async def plan(_):
-        return Plan(kind='tasks', items=[Item(key='review', goal='分析示例', analysis={
+        return Plan(kind='tasks', items=[plan_item(key='review', goal='分析示例', analysis={
             'analysis_type': 'document_file', 'intent': 'summary', 'goal': '分析示例',
             'roots': ['example.txt'],
         })])

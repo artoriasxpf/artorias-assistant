@@ -1,0 +1,9 @@
+*
+!pyproject.toml
+!uv.lock
+!src/
+!src/**
+!services/
+!services/search/
+!services/search/pyproject.toml
+**/__pycache__/

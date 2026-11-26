@@ -1,3 +1,4 @@
+from task_fixtures import plan_item, finish_message, deliver
 from artorias_device.storage.journal import SQLiteWorkspaceJournal
 import asyncio
 import json
@@ -72,10 +73,10 @@ def test_followup_saves_previous_delivery_without_reopening_files(tmp_path, monk
     store.submit(sid,'扫描原目录','scan')
     scan=store.claim()
     repo=TaskRepository(store)
-    repo.install(scan,Plan(kind='tasks',items=[Item(key='scan',goal='扫描原目录')]),[])
+    repo.install(scan,Plan(kind='tasks',items=[plan_item(key='scan',goal='扫描原目录')]),[])
     source=store.query('SELECT * FROM task_steps')[0]
     summary='原始报告：只保留这份已经交付的摘要。'
-    repo.deliver(scan,source,summary)
+    deliver(repo,scan,source,summary)
     store.finish(scan,'completed',summary)
     store.submit(sid,'把上面的摘要保存到原目录','save')
     save=store.claim()
@@ -87,15 +88,15 @@ def test_followup_saves_previous_delivery_without_reopening_files(tmp_path, monk
 
     model=FollowupModel(disable_streaming=True,messages=iter([
         AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'summary.md','content':summary},'id':'write'}]),
-        AIMessage(content='已保存摘要'),
+        finish_message('已保存摘要'),
     ]))
     async def planner(_):
-        return Plan(kind='tasks',items=[Item(key='save',goal='保存已有摘要',relation='followup',task_id=source['task'])])
+        return Plan(kind='tasks',items=[plan_item(key='save',goal='保存已有摘要',relation='followup',task_id=source['task'])])
 
     runtime=TaskRuntime(tmp_path,store,engine=DeepAgentRuntime(tmp_path,store,model_factory=lambda:model),planner=planner)
     asyncio.run(Scheduler(store,runtime).execute(save))
     calls=[json.loads(event['payload'])['name'] for event in store.events(sid,0) if event['kind']=='tool.call']
-    assert calls==['project_write']
+    assert calls==['project_write','finish_step']
     assert create_workspace(store,sid,save['id']).read('summary.md')==summary
 
 
@@ -127,3 +128,92 @@ def test_approval_reject_resume(tmp_path,monkeypatch):
     resumed=db.claim();assert resumed['id']==run['id']
     second=asyncio.run(collect(resumed));assert second[-1][0]=='assistant.final'
     assert not any(kind=='tool.call' for kind,_ in second)
+
+
+def test_invalid_finish_step_repairs_without_reexecuting_tools(tmp_path):
+    from artorias_server.scheduler.service import Scheduler
+    from artorias_server.tasks.executor import TaskRuntime
+    from artorias_server.tasks.models import Criterion, Plan
+
+    initial = finish_message("草稿")
+    del initial.tool_calls[0]["args"]["final_text"]
+    missing_claim = finish_message("有正文，缺自评")
+    final = finish_message("最终正文")
+    final.tool_calls[0]["args"]["criterion_claims"] = [
+        {"id": "C1", "claim": "met", "reason": "正文已交付"}
+    ]
+
+    class RepairModel(FakeModel):
+        def _generate(self, messages, *args, **kwargs):
+            response = super()._generate(messages, *args, **kwargs)
+            reply = response.generations[0].message
+            if reply is missing_claim:
+                assert "final_text" in messages[-1].content
+            if reply is final:
+                assert "criterion_claims" in messages[-1].content
+                assert "C1" in messages[-1].content
+            return response
+
+    write = AIMessage(content="", tool_calls=[{
+        "name": "project_write", "args": {"path": "report.md", "content": "草稿"}, "id": "write-report",
+    }])
+    model = RepairModel(disable_streaming=True, messages=iter([write, initial, missing_claim, final]))
+
+    async def planner(_):
+        item = plan_item("a", "生成报告")
+        item.initial_requirements.criteria = [Criterion(text="提供正文")]
+        return Plan(kind="tasks", items=[item])
+
+    store = Store(tmp_path / "app.sqlite")
+    session = store.session()
+    store.submit(session, "生成报告", "run")
+    run = store.claim()
+    engine = DeepAgentRuntime(tmp_path, store, model_factory=lambda: model)
+    asyncio.run(Scheduler(store, TaskRuntime(tmp_path, store, engine, planner)).execute(run))
+    assert store.query("SELECT status FROM runs")[0]["status"] == "completed"
+    step = store.query("SELECT status,result FROM task_steps")[0]
+    assert step == {"status": "delivered", "result": "最终正文"}
+    task = store.query("SELECT status,progress,execution_count FROM business_tasks")[0]
+    assert task["execution_count"] == 1
+    assert task["status"] == "needs_review"
+    assert json.loads(task["progress"])["assessment_heads"]["C1"]["claim"] == "met"
+    calls = [json.loads(event["payload"]) for event in store.events(session, 0) if event["kind"] == "tool.call"]
+    assert sum(call["name"] == "project_write" for call in calls) == 1
+
+
+def test_exhausted_finish_repairs_preserve_pending_and_summary(tmp_path):
+    from artorias_server.scheduler.service import Scheduler
+    from artorias_server.tasks.executor import TaskRuntime
+    from artorias_server.tasks.models import Criterion, Plan
+
+    model = FakeModel(disable_streaming=True, messages=iter([
+        AIMessage(content="仅回复了正文，没有调用工具"),
+        finish_message("有正文，缺自评"),
+        finish_message("依然缺自评"),
+    ]))
+    store = Store(tmp_path / "app.sqlite")
+    session = store.session()
+    store.submit(session, "生成报告", "run")
+    run = store.claim()
+    engine = DeepAgentRuntime(tmp_path, store, model_factory=lambda: model)
+    runtime = TaskRuntime(tmp_path, store, engine)
+    item = plan_item("a", "生成报告")
+    item.initial_requirements.criteria = [Criterion(text="提供正文")]
+    runtime.repo.install(run, Plan(kind="tasks", items=[item]), [])
+    query = "SELECT status,progress,summary,execution_count FROM business_tasks"
+    baseline = store.query(query)
+    assert json.loads(baseline[0]["progress"])["assessment_heads"]["C1"]["verdict"] == "pending"
+
+    asyncio.run(Scheduler(store, runtime).execute(run))
+
+    assert store.query("SELECT status FROM runs")[0]["status"] == "failed"
+    step = store.query("SELECT status,result_json FROM task_steps")[0]
+    assert step["status"] == "failed"
+    assert not step["result_json"]
+    assert not store.query("SELECT id FROM task_criterion_assessments")
+    assert store.query(query) == baseline
+    repairs = [
+        json.loads(event["payload"]) for event in store.events(session, 0)
+        if event["kind"] == "model.started"
+    ]
+    assert sum(request["stage"] == "step_repair" for request in repairs) == 2

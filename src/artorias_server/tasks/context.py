@@ -10,13 +10,21 @@ class ContextBuilder:
         if old: return json.loads(old[0]['body'])
         task=store.query('SELECT * FROM business_tasks WHERE id=? AND session=?',(step['task'],run['session']))[0]
         scope=json.loads(step['scope'])
-        dependencies=store.query("SELECT key,result FROM task_steps WHERE run=? AND status='delivered'",(run['id'],))
-        dependencies=[d for d in dependencies if d['key'] in scope['depends_on']]
+        dependencies=[]
+        for key in dict.fromkeys([*scope['depends_on'], *(w['step_key'] for w in scope['step_spec']['wait_for'])]):
+            row=store.query("SELECT substr(result,1,500) AS preview FROM task_steps WHERE run=? AND key=? AND status='delivered'", (run['id'],key))
+            if row:
+                dependencies.append({'key':key,'preview':row[0]['preview'],'result_ref':{'run_id':run['id'],'step_key':key}})
         effective=json.loads(step['effective_requirements']) or requirements_for(task)
         task={k:task[k] for k in ('id','status','summary','progress','source_task')} | {'goal':effective['goal'], 'revision':step['applied_revision']}
-        task['progress']=json.loads(task['progress'])[-5:]
-        task['summary']=task['summary'][-3000:]
-        body={'effective_requirements':effective,'selection_policy':'task-results-recent-v4','task':task,'execution_scope':scope,'dependency_results':dependencies,'source_results':[],'history':[]}
+        task['progress']=json.loads(task['progress'])
+        task['progress']['milestones']=task['progress']['milestones'][-5:]
+        refs=set(scope['step_spec']['criterion_refs'])
+        if refs:
+            effective['criteria']={k:v for k,v in effective['criteria'].items() if k in refs}
+            task['progress']['assessment_heads']={k:v for k,v in task['progress']['assessment_heads'].items() if k in refs}
+        task['summary']=task['summary'][:1000]
+        body={'effective_requirements':effective,'selection_policy':'task-memory-v2','task':task,'execution_scope':scope['step_spec'],'dependency_results':dependencies,'source_results':[],'history':[], 'accepted_dependencies':store.query("SELECT criterion_id,criterion_version,evidence_version,assessment_id FROM task_step_waits WHERE run=? AND consumer=? AND state='satisfied'",(run['id'],step['key']))}
         # A character budget, intentionally not advertised as a token budget.
         essential=len(json.dumps(body,ensure_ascii=False))+len(run['input'])
         if essential>self.budget: raise ValueError('Required context exceeds budget; refine the request')

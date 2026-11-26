@@ -4,16 +4,53 @@
 
 ## 快速启动（macOS / Linux）
 
-安装 Python 3.11+ 和 uv，解压并进入项目：
+默认使用独立的 Search Service 做 Task 关键词检索。安装 Python 3.11+ 和 uv 后，在两个终端中先启动 Search Service，再启动 Assistant。两个服务都读取仓库根目录的 `.env`。
+
+### 1. 配置环境变量
+
+在仓库根目录执行：
 
 ```bash
-cp .env.example .env
-# 编辑 .env：填写 ARTORIAS_MODEL_PROVIDER、ARTORIAS_MODEL 和对应厂商的 API_KEY
-uv sync --extra dev
-uv run artorias-assistant
+test -f .env || cp .env.example .env
+openssl rand -hex 32
 ```
 
-打开 http://127.0.0.1:8765 。模型必须支持 tool calling；密钥只在后端读取。模型 API 兼容性仍须用你实际的供应商验证。
+编辑 `.env`。填写模型配置，并将上一步生成的随机值填入 `ARTORIAS_SEARCH_TOKEN`。下面以 DeepSeek 为例：
+
+```dotenv
+ARTORIAS_MODEL_PROVIDER=deepseek
+ARTORIAS_MODEL=deepseek-chat
+DEEPSEEK_API_KEY=your-model-api-key
+
+ARTORIAS_SEARCH_MODE=remote
+ARTORIAS_SEARCH_URL=http://127.0.0.1:8766
+ARTORIAS_SEARCH_TOKEN=your-random-search-token
+```
+
+选择账号可用且支持工具调用的模型。如果换用 OpenAI 或 Anthropic，请使用下方模型配置表中的对应密钥变量。模型 API 密钥与 Search 服务令牌用途不同。
+
+### 2. 启动 Search Service（终端一）
+
+从仓库根目录执行：
+
+```bash
+cd services/search
+uv run --locked --env-file ../../.env artorias-search --host 127.0.0.1 --port 8766
+```
+
+等待终端显示服务监听在 `127.0.0.1:8766`。可打开 [Search Admin 调试台](http://127.0.0.1:8766/admin)，输入 `ARTORIAS_SEARCH_TOKEN`，发送「就绪检查」确认服务可以读取索引。
+
+### 3. 启动 Assistant（终端二）
+
+在另一个终端进入仓库根目录，执行：
+
+```bash
+uv run --locked --env-file .env artorias-assistant
+```
+
+首次运行时，uv 会分别为两个项目安装依赖。保持两个终端运行，打开 [Assistant 网页](http://127.0.0.1:8765)。Assistant 会自动启动索引同步 worker。遇到连接错误时，确认 Search Service 已启动且 URL 端口匹配。遇到 HTTP 401 时，检查两个服务读取的 `ARTORIAS_SEARCH_TOKEN` 是否一致。
+
+Search 默认将索引保存在 `services/search/search-data/search.sqlite`，Assistant 默认将业务数据保存在 `data/app.sqlite`。容器部署、数据迁移和嵌入式兼容模式见 [Search 独立部署方案](docs/design/search_service_deployment.md)。独立配置和 Admin 调试示例见 [Search Service README](services/search/README.md)。
 
 在左侧选择会话，右侧查看消息和运行事件。输入时按 Enter 发送，按 Shift + Enter 换行，拼音组词期间的 Enter 由输入法处理。输入框下方可以切换本机或云端工作空间。在 macOS 上，点击「浏览…」可通过系统窗口选择或新建本机文件夹。云端工作空间使用逻辑路径，例如 `personal/reports`。
 
@@ -65,7 +102,7 @@ docker pull python:3.12-slim
 5. 磁盘工作目录是权威内容；Blob 保存修改前后备份。持久操作日志协调磁盘与数据库，中断后按哈希核对；不确定状态阻止同路径继续写入。详见 workspace_design.md。
 6. 等待审批的 Run 可在重启后再次审批恢复；正在执行时崩溃则标记 interrupted，不自动重放不确定的工具动作。后续发新消息继续。尚未提供任意节点自动恢复。
 7. Run、Turn 位于 runs 表；Task、执行计划与上下文快照已持久化。Artifact 仍以文件 hash 和 Change ID 表达。
-8. 文件访问检查持久目录授权和 Run 授权；外部目录通过 project_authorize 审批，Python 执行逐次审批。邮件、购物、社交、搜索、MCP、长期记忆未接入。
+8. 文件访问检查持久目录授权和 Run 授权；外部目录通过 project_authorize 审批，Python 执行逐次审批。邮件、购物、社交、网页搜索、MCP、长期记忆未接入。
 9. 默认不提供任意 shell、依赖安装、网络访问。编码环境只带镜像中的 Python；更换镜像由本机管理员配置。
 
 `project_tree` 用于有上限地浏览目录。默认深度 2、最多 200 条、隐藏项不显示；条目上限可设为 1–1000。只有达到条目上限并省略了条目时，才返回 `truncated: true`。 `project_list` 完整列出单层目录里的文件和文件夹，包含隐藏项。两者都跳过符号链接。可使用工作空间相对路径、本机绝对目录或 `workspace://ID/目录`。未授权的本机目录可通过 `project_authorize(path=..., access="read")` 申请本次运行的只读访问。模型使用 `project_*` 操作真实文件，保留的内置 `read_file` 只读取框架引用的虚拟文件。
@@ -104,7 +141,7 @@ uv run pytest -q
 
 ## v0.2 模块化服务与模型配置
 
-这里的服务是进程内的独立职责模块，不是独立部署的微服务。启动方式不变。
+以下为 v0.2 的进程内模块布局。当前启动方式见上方的快速启动。
 
 ```text
 src/artorias_assistant/  # v0.2 历史布局；当前布局见 v0.7 文档

@@ -1,0 +1,19 @@
+services:
+  search:
+    build:
+      context: .
+    ports:
+      - "127.0.0.1:8766:8766"
+    environment:
+      ARTORIAS_SEARCH_TOKEN: ${ARTORIAS_SEARCH_TOKEN:?Set ARTORIAS_SEARCH_TOKEN}
+      ARTORIAS_SEARCH_COLLECTIONS: ${ARTORIAS_SEARCH_COLLECTIONS:-tasks}
+    volumes:
+      - search-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, urllib.request; urllib.request.urlopen(urllib.request.Request('http://127.0.0.1:8766/readyz', headers={'Authorization':'Bearer '+os.environ['ARTORIAS_SEARCH_TOKEN']}), timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  search-data:

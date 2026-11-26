@@ -10,14 +10,14 @@ class Store:
         with self.tx() as c:
             c.executescript("""
             PRAGMA journal_mode=WAL;
-            CREATE TABLE IF NOT EXISTS decisions(run TEXT PRIMARY KEY, value TEXT);
-            CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session TEXT,run TEXT,role TEXT,content TEXT);
-            CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,session TEXT,turn TEXT,status TEXT,input TEXT,request_key TEXT, UNIQUE(session,request_key));
-            CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,run TEXT,status TEXT);
-            CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,session TEXT,run TEXT,kind TEXT,payload TEXT);
+            CREATE TABLE IF NOT EXISTS decisions(run TEXT PRIMARY KEY, value TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,session TEXT,run TEXT,role TEXT,content TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS runs(id TEXT PRIMARY KEY,session TEXT,turn TEXT,request_key TEXT,input TEXT,status TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '', UNIQUE(session,request_key));
+            CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,run TEXT,status TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
+            CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,session TEXT,run TEXT,kind TEXT,payload TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS event_session ON events(session,seq);
-            CREATE TABLE IF NOT EXISTS changes(id TEXT PRIMARY KEY,session TEXT,run TEXT,path TEXT,before_hash TEXT,after_hash TEXT,reverts TEXT);
+            CREATE TABLE IF NOT EXISTS changes(id TEXT PRIMARY KEY,session TEXT,run TEXT,path TEXT,before_hash TEXT,after_hash TEXT,reverts TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
             """)
     @contextmanager
     def tx(self):
@@ -118,6 +118,12 @@ class Store:
         with self.tx() as c:
             c.execute('UPDATE runs SET status=? WHERE id=?',(status,run['id']))
             c.execute("UPDATE jobs SET status='done' WHERE run=?",(run['id'],))
+            if status=='cancelled' and c.execute("SELECT 1 FROM sqlite_master WHERE name='task_review_requests'").fetchone():
+                for row in c.execute("SELECT id FROM task_review_requests WHERE run=? AND state='pending'",(run['id'],)).fetchall():
+                    c.execute("UPDATE task_review_requests SET state='cancelled' WHERE id=?",(row[0],))
+                    c.execute("INSERT INTO events(session,run,kind,payload) VALUES(?,?,'review.closed',?)",
+                              (run['session'],run['id'],json.dumps({'id':row[0],'state':'cancelled'})))
+                c.execute("UPDATE task_step_waits SET state='cancelled' WHERE run=? AND state='pending'",(run['id'],))
             if status != 'waiting' and c.execute(
                 "SELECT 1 FROM sqlite_master WHERE name='analysis_executions'"
             ).fetchone():

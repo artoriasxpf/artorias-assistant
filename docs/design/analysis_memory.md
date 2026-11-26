@@ -1,12 +1,12 @@
 # 大文件、目录与代码仓库的分析记忆
 
-**状态：第一、第二阶段已接入本地 Runtime。** 基线为 `feature/session-permissions` 的 `f5bfffd`。交付目标是在长分析中逐批保留可追溯结论，使下一次模型请求、故障重试和后续 Task 都能复用已经完成的工作。上线验收以“同一版本的哪些范围确实进入了模型输入，哪些已经形成笔记”为依据。
+**状态：第一、第二阶段已接入本地 Runtime 与 Task Memory V2。** 初始设计基于 `f5bfffd`。交付目标是在长分析中逐批保留可追溯结论，使下一次模型请求、故障重试和后续 Task 都能复用已经完成的工作。上线验收以“同一版本的哪些范围确实进入了模型输入，哪些已经形成笔记”为依据。
 
 ## 1. 与现有工程的衔接
 
 | 当前行为 | 实现入口 | 本方案的改动 |
 |---|---|---|
-| Task Step 由 `(run,key)` 标识；收到 `assistant.final` 后调用 `TaskRepository.deliver` | `src/artorias_server/tasks/executor.py`、`tasks/repository.py`（后续简写相对于 server 包） | 每个长分析 Step 创建一个 Analysis。保存中间 Note 独立提交，最后一次交付才更新 Task |
+| Task Step 由 `(run,key)` 标识；从 `finish_step` 结构化结果调用 `TaskRepository.deliver` | `src/artorias_server/tasks/executor.py`、`tasks/repository.py`（后续简写相对于 server 包） | 每个长分析 Step 创建一个 Analysis。保存中间 Note 独立提交，最后一次交付才更新 Task |
 | 初始 Task 上下文按 Step 缓存在 `context_snapshots`；模型请求前另有历史裁剪 | `tasks/context.py`、`runtime/budget.py` | 保留初始目标快照，每次模型调用单独装配最新分析状态，避免恢复时读到旧进度 |
 | 清点工具按页返回聚合和样本；搜索返回片段；批读最多 8 项，整批默认上限 24 KiB | `tools/project_analysis.py`、`tools/registry.py` | 复用只读工具与权限路由。新增真实读取回执、完整清单的分页接口、大文件范围读取 |
 | 本机批读取整个 UTF-8 文件后切片，单文件上限 1,000,000 字节 | `src/artorias_device/workspace/analysis.py` | 初版覆盖现有能力范围；大文件专项上线后按字节范围流式读取 |
@@ -100,7 +100,7 @@ flowchart TD
 2. 提交前验证当前执行有写入权、批次属于该 Analysis、实际展示的版本/范围和引用序号有效。一个事务内写入 Note、更新已分析区间、标记 committed、推进已确认游标、递增版本。相同 batch_id 和内容摘要返回已有结果；已提交批次收到不同内容返回 conflict，可显式追加修正。纯模型置信度不改变覆盖数。
 3. 将“提交上批 + 登记下批计划”放同一事务，通过调用幂等键关联下一批。审批或端点 I/O 在提交后执行。网络超时时重试同一 request_id，禁止仅因响应丢失创建新批。
 4. 全部失败的读取记录原因与待办；“读过但没有相关发现”可提交空 findings 和一条简短说明。模型漏交 Note 时一次定向补交，携带原批次与已展示片段；仍失败则保留未提交状态和部分交付。对分析模式下直接调用的旧读取入口，统一产生回执并关联当前批次，或只向该模式暴露受控读取入口，防止绕过覆盖统计。
-5. 最后一批已提交后，程序核对范围缺口并对关键结论按版本回读。全覆盖任务存在错误或未支持格式时返回部分结果，列明缺口。业务交付仍走 assistant.final → TaskRepository.deliver；分析 Note 的事务独立于最终交付，失败后可重新综合。最终交付绑定 analysis_id、revision、summary_version，复用原有 Step 幂等检查。将来合入 finish_step 分支时仅替换最终交付适配。
+5. 最后一批已提交后，程序核对范围缺口并对关键结论按版本回读。全覆盖任务存在错误或未支持格式时返回部分结果，列明缺口。业务交付走 finish_step → TaskRepository.deliver。分析 Note 的事务独立于最终交付，失败后可重新综合。最终交付绑定 analysis_id 和 revision，复用原有 Step 幂等检查。分析覆盖不足时将 Step 标记为部分交付。
 
 ## 5. 大文件、目录及代码端点
 

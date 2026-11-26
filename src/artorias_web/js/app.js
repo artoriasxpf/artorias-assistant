@@ -17,8 +17,9 @@ const runs = new Map();
 const turns = new Map();
 const streams = new Map();
 const approvals = new Map();
+const reviews = new Map();
 const TERMINAL = new Set(['run.completed', 'run.failed', 'run.cancelled', 'run.interrupted']);
-const EVENT_CARD_KINDS = /^(tool|approval|execution|file|task|workspace)\./;
+const EVENT_CARD_KINDS = /^(review|tool|approval|execution|file|task|workspace)\./;
 const EVENT_CARD_TERMINAL = new Set(['run.failed', 'run.cancelled', 'run.interrupted']);
 const TURN_STATES = {
   'message.accepted': '已排队',
@@ -368,6 +369,48 @@ function eventCard(event) {
     addJson(entry.article, payload);
   }
 
+  if (kind.startsWith('review.')) {
+    reviews.get(payload.id)?.remove();
+    reviews.delete(payload.id);
+    if (kind === 'review.requested') {
+      const actions = element('div', undefined, 'event-actions');
+      const sid = sessionId;
+      actions.append(element('p', payload.question), element('p', payload.preview));
+      const inspect = element('button','查看完整交付');
+      inspect.onclick = handle(async () => {
+        const response = await fetch(`/api/sessions/${sid}/reviews/${payload.id}/evidence`, {headers:headers()});
+        if (!response.ok) throw Error('读取交付失败');
+        if (payload.evidence?.artifact_id === 'response') {
+          addTextBlock(entry.article, '交付正文', await response.text());
+        } else {
+          const url = URL.createObjectURL(await response.blob());
+          const link = element('a');
+          link.href = url;
+          link.download = payload.evidence?.path?.split('/').pop() || 'artifact';
+          link.click();
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+      });
+      actions.append(inspect);
+      const feedback = document.createElement('input');
+      feedback.placeholder = '修改意见（可选）';
+      actions.append(feedback);
+      for (const [decision, label] of [['accept','通过'],['request_changes','需要修改']]) {
+        const button = element('button', label);
+        const key = crypto.randomUUID();
+        button.onclick = handle(async () => {
+          await api(`sessions/${sid}/reviews/${payload.id}/decision`, {
+            decision, decision_key:key, feedback:feedback.value,
+            criterion_version:payload.criterion_version, evidence_version:payload.evidence_version
+          });
+          actions.remove();
+        });
+        actions.append(button);
+      }
+      reviews.set(payload.id, actions);
+      entry.article.append(actions);
+    }
+  }
   if (kind.startsWith('approval.')) closeApproval(run);
   if (kind === 'approval.requested') {
     const actions = element('div', undefined, 'event-actions');
@@ -454,6 +497,7 @@ function renderEvent(event) {
       runs.set(run, 'running');
       closeApproval(run);
     }
+    if (kind === 'task.awaiting_review') runs.delete(run);
     if (kind === 'approval.requested' || kind === 'analysis.suspended') runs.set(run, 'waiting');
     if (kind === 'approval.decided') runs.set(run, 'queued');
     if (kind === 'run.completed') promoteStream(run, null);
@@ -491,6 +535,7 @@ async function selectSession(id) {
   turns.clear();
   runs.clear();
   approvals.clear();
+  reviews.clear();
   $('log').replaceChildren();
   $('empty').hidden = false;
   $('status').textContent = '';

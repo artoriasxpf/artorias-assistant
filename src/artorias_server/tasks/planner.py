@@ -10,15 +10,17 @@ PLANNER = '''你是业务任务路由器，只返回符合 schema 的 JSON，不
 先关联再拆分。同一目标的补充/细化使用 continue/refine，保留原目标和有效约束。
 已交付目标的新增范围用 followup（task_id 为来源）；没有来源用 new。
 同一个项目不代表同一个目标。已有 task_id 只能从候选选取。不能确定指代时 clarify。
+候选 recall_sources 标识 explicit（显式引用）、keyword（关键词）或 recent（近期）；命中和排序仅供参考，必须核对目标与本次意图。
 chat 不建任务；tasks 必须有任务。key 唯一，depends_on 仅引用本次其他 key，无环。
-复用任务时 goal 是本次执行范围；长期需求变化必须给 task_patch，未提及字段保持不变。
-task_patch.scope 区分 persistent 永久修改和 execution 本次例外，expected_revision 使用候选 revision。
-operations 仅使用 add/replace/remove，约束和验收点使用稳定 id。evidence 必须逐字引用本次用户输入。
-含糊的撤销或冲突必须 clarify。没有需求变更时省略 task_patch，或写成 "task_patch":{"operations":[]}；不能写成 "task_patch":null。source_message_id 由程序绑定，不能编造。
-input_locations/output_target 记录用户的位置意图，Downloads 这样的名称保留原文，不能猜测物理绝对路径。
+new/followup 填 initial_requirements，初始 criteria 顺序编号 C1、C2，约束 K1、K2。
+continue/refine 的 task_patch.expected_revision 由程序根据本轮候选绑定，模型省略该字段。永久变更给 operations 和本次用户原文 evidence。
+add 由系统分配 ID，可使用 client_ref。临时要求只写 step_spec。引用已有条目须核对版本。
+执行标准由执行模型根据相关历史交互、本步交付和实际工具结果自评，省略 verification。仅用户明确要求确认时使用 user。
+依赖交付用 depends_on；必须等验收通过再继续时用 step_spec.wait_for，只指向生产者 user 标准和产物角色。
+仅本步需要的用户确认放入 local_reviews。文字答复的产物角色为 response。
+位置意图保留用户原文，避免猜测绝对路径。
 大文件、目录或仓库分批分析时可填写 analysis，roots 必须使用用户给出的路径或工作空间相对路径。
 分析与修改分别规划，分析条目只读，修改条目依赖分析的结果。普通短问答省略 analysis。
-criteria 是本次执行可检查的验收点，不等于用户确认。严禁把所有历史目标都重新执行。
 '''
 
 
@@ -36,6 +38,16 @@ def _validation_feedback(error):
     return json.dumps(issues, ensure_ascii=False)
 
 
+def _bind_candidate_revisions(plan: Plan, candidates) -> Plan:
+    revisions = {candidate['id']: candidate['revision'] for candidate in candidates}
+    for item in plan.items:
+        if item.relation in ('continue', 'refine') and item.task_id in revisions:
+            # Bind the version actually seen by the planner. The repository
+            # still compares it with the live row inside the write transaction.
+            item.task_patch.expected_revision = revisions[item.task_id]
+    return plan
+
+
 class TaskPlanner:
     def __init__(self, store, planner=None):
         self.store, self.planner = store, planner
@@ -46,7 +58,7 @@ class TaskPlanner:
         schema=Plan.model_json_schema()
         if self.planner:
             check_budget({'system':PLANNER,'schema':schema,'payload':payload})
-            return await self.planner(payload)
+            return _bind_candidate_revisions(await self.planner(payload), candidates)
         from artorias_server.runtime.service import text_content
         schema_prompt=PLANNER+'\nJSON schema:\n'+json.dumps(schema,ensure_ascii=False)
         user_content=json.dumps(payload,ensure_ascii=False)
@@ -69,8 +81,10 @@ class TaskPlanner:
             if len(lines)>2 and lines[0].strip().lower() in ('```json','```') and lines[-1].strip()=='```':
                 raw='\n'.join(lines[1:-1])
             try:
-                return Plan.model_validate_json(raw,strict=True)
+                plan = Plan.model_validate_json(raw,strict=True)
             except ValidationError as error:
                 feedback=_validation_feedback(error)
                 if attempt==1:
                     raise ValueError(f'任务规划校验失败，已尝试纠正一次。{feedback}') from None
+            else:
+                return _bind_candidate_revisions(plan, candidates)

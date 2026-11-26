@@ -57,7 +57,12 @@ class ToolErrorBoundary(AgentMiddleware):
         count = self.failures.get(key, 0) + 1
         self.failures[key] = count
         call = request.tool_call if isinstance(request.tool_call, dict) else {}
-        detail = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
+        if call.get("name") == "finish_step":
+            from .step_repair import submission_error
+
+            detail = submission_error(exc)
+        else:
+            detail = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
         if count >= _REMIND_AFTER:
             content = (
                 f"工具调用失败：{detail}\n\n"

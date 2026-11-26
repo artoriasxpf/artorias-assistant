@@ -136,6 +136,16 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         return file_operation(path, 'write', False, lambda: executor.delete(path))
 
     @tool
+    def project_move(source: str, destination: str, expected_source_version: str | None = None) -> dict:
+        """Move or rename one regular file on the same client, including across
+        authorized local workspaces. Both paths require write access. Destination
+        is the full new file path, must not exist, and its parent must exist.
+        No file content is returned. Pass a known source version to check for edits.
+        The change_id identifies the move for undo.
+        """
+        return executor.move(source, destination, expected_source_version)
+
+    @tool
     def project_authorize(path: str, access: Literal['read', 'write'] = 'write') -> dict:
         """Ask for access to a local absolute directory and its descendants.
         Request read for listing or reading, and write for changes. Retry the file
@@ -151,23 +161,26 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         working_directory: str | None = None, code_directory: str | None = None,
         allow_delete: bool = False, execution_hint: str = 'auto',
         environment: str = 'python-default', timeout_seconds: int = 120,
+        dependencies: list[str] | None = None,
     ) -> dict:
         """Run an authorized Python script after approval. Auto uses the linked
         workspace's execution environment. Inputs are staged under /inputs,
         code under /app, and outputs under /outputs. workspace_copy requires
-        working_directory. Existing output overwrites require if_unchanged
+        working_directory. Prefer ARTORIAS_INPUT_DIR, ARTORIAS_OUTPUT_DIR and
+        ARTORIAS_WORK_DIR for portable scripts. Native macOS supports dependencies
+        declared as package names or package==version. Existing output overwrites require if_unchanged
         and expected_files. Returns execution and publication statuses.
         """
         request = PythonRequest(
             path=path, args=args or [], mode=mode, inputs=inputs or [],
             output=output or OutputPolicy(), working_directory=working_directory,
             code_directory=code_directory, allow_delete=allow_delete, execution_hint=execution_hint,
-            environment=environment, timeout_seconds=timeout_seconds,
+            environment=environment, timeout_seconds=timeout_seconds, dependencies=dependencies or [],
         )
         return await executor.run_python(tool_call_id, request, interrupt, emit)
 
     tools = [project_tree, project_list, project_read, project_write, project_edit,
-             project_delete, project_authorize, run_python]
+             project_delete, project_move, project_authorize, run_python]
     if os.getenv('ARTORIAS_PROJECT_ANALYSIS', '1') == '1':
         tools[:0] = [project_inventory, project_search, project_read_many]
     return tools

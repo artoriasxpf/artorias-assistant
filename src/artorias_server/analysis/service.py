@@ -21,7 +21,7 @@ class AnalysisSession:
     def __init__(self, store, run, workspace):
         self.workspace = workspace
         self.run = run
-        self.plan = AnalysisPlan.model_validate(run['task_context']['execution_scope']['analysis'])
+        self.plan = AnalysisPlan.model_validate(run['analysis_plan'])
         self.repo = AnalysisRepository(store)
         self.id = self.repo.attach(run, self.plan, workspace.describe()['id'], run['step_key'])['id']
         self.executor = WorkspaceToolExecutor(workspace)

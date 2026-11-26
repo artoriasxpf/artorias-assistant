@@ -328,3 +328,7 @@ artifact TTL 必须覆盖等待审批/冲突处理期间，正在被任务引用
 - stage_only 与冲突产物长期保留，提供下载；暂无自动另存/重试发布 UI。不会擅自覆盖或变更目标。
 
 见 [v0.8 发布说明](../releases/release_v0.8.md) 的使用示例、升级及 Docker 实测命令。
+
+## macOS 原生执行
+
+见 [macOS 本地 Python 执行](local_python_venv.md)。

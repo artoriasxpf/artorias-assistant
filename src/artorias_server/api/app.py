@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from artorias_server.storage.sqlite import Store
 from artorias_server.scheduler.service import Scheduler
+from artorias_server.tasks.reviews import Decision, decide as decide_review
 from artorias_server.workspace.routing import WorkspaceService
 from artorias_server.workspace.catalog import WorkspaceCatalog
 from artorias_server.workspace.connectors import ConnectorUnavailable
@@ -92,6 +93,47 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
     def decision(rid:str,body:dict):
         value=body.get('decisions', body.get('decision'))
         return service.decide(rid,value,body.get('request_seq'))
+    @app.get('/api/sessions/{sid}/reviews')
+    def reviews(sid:str):
+        store.require(sid)
+        with store.tx() as c:
+            rows=c.execute("""SELECT r.id,r.run,r.question,a.criterion_version,a.evidence_version,a.evidence_ref,
+                substr(s.result,1,2000) AS preview FROM task_review_requests r
+                JOIN task_criterion_assessments a ON a.id=r.assessment_id
+                JOIN task_steps s ON s.run=r.run AND s.key=r.step_key
+                WHERE r.session=? AND r.state='pending' ORDER BY r.rowid""",(sid,))
+            return {'items':[dict(row) for row in rows],
+                    'cursor':c.execute('SELECT coalesce(max(seq),0) FROM events WHERE session=?',(sid,)).fetchone()[0]}
+
+    @app.get('/api/sessions/{sid}/reviews/{rid}/evidence')
+    def review_evidence(sid:str,rid:str):
+        rows=store.query("""SELECT a.evidence_ref,a.evidence_version,s.result,s.result_json
+            FROM task_review_requests r JOIN task_criterion_assessments a ON a.id=r.assessment_id
+            JOIN task_steps s ON s.run=r.run AND s.key=r.step_key WHERE r.session=? AND r.id=?""",(sid,rid))
+        if not rows:
+            raise KeyError(rid)
+        row=rows[0]
+        aid=row['evidence_ref']
+        if aid=='response':
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(row['result'],headers={'X-Content-Type-Options':'nosniff'})
+        evidence=json.loads(row['result_json'])['verified_deliveries'][aid]
+        if evidence.get('execution_id'):
+            return artifact(sid,evidence['execution_id'],aid)
+        changes=store.query("""SELECT r.blob_root FROM resource_changes r JOIN changes c ON c.id=r.change_id
+            WHERE c.session=? AND c.id=? AND c.after_hash=?""",(sid,aid,row['evidence_version']))
+        if not changes:
+            raise KeyError(aid)
+        return FileResponse(Path(changes[0]['blob_root'])/row['evidence_version'],
+                            filename=Path(evidence['path']).name,headers={'X-Content-Type-Options':'nosniff'})
+
+    @app.post('/api/sessions/{sid}/reviews/{rid}/decision')
+    def review_decision(sid:str,rid:str,body:Decision):
+        runtime = getattr(scheduler, 'runtime', None)
+        if not hasattr(runtime, 'repo'):
+            raise ConnectorUnavailable('当前部署未配置 Task 验收服务')
+        return decide_review(store,runtime.repo.search,sid,rid,body)
+
     @app.get('/api/sessions/{sid}/workspace')
     def workspace(sid:str):
         store.require(sid)
