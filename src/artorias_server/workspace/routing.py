@@ -56,10 +56,11 @@ class WorkspaceService:
         if workspace['kind'] == 'device_fs' and (temporary or grant):
             if target.resolve() != target:
                 raise ValueError('请直接使用规范路径，不能授权符号链接')
-        if temporary and temporary.get('workspace_id') == resource['workspace_id'] and (
-            temporary['location_id'] == resource['location_id'] and covers(temporary, resource)
-        ):
-            return temporary
+        temporary_grants = temporary if isinstance(temporary, tuple) else (temporary,)
+        for candidate in temporary_grants:
+            if (candidate and candidate.get('workspace_id') == resource['workspace_id']
+                    and candidate['location_id'] == resource['location_id'] and covers(candidate, resource)):
+                return candidate
         if grant:
             return grant
         try:
@@ -106,6 +107,13 @@ class WorkspaceService:
 
     def check_access(self, path, action='read'):
         self._resolve(path, action)
+
+    def mkdir(self, path, *, parents=False):
+        ws, relative, space, _ = self._resolve(path, 'write', directory=True)
+        operation = getattr(ws, 'mkdir', None)
+        if space['kind'] != 'device_fs' or operation is None:
+            raise ConnectorUnavailable('当前连接器不支持创建目录')
+        return dict(operation(relative, parents=parents), path=path)
 
     def files_under(self, directory):
         ws,relative,_,_=self._resolve(directory,'read',directory=True)

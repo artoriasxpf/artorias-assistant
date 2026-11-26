@@ -66,7 +66,18 @@ class AnalysisSession:
                     return self._read(original.name, args, registered)
             return tracked
 
-        return [bind(item) if item.name in registered else item for item in tools]
+        def bind_preview(original):
+            @tool(original.name, args_schema=original.args_schema, description=original.description)
+            def scoped_preview(**kwargs) -> dict:
+                request = original.args_schema.model_validate(kwargs).request
+                if any(not self._in_scope(self._target(item.path)) for item in request.files):
+                    raise ValueError('变更预览目标超出分析范围')
+                return original.invoke(kwargs)
+            return scoped_preview
+
+        adapters = {name: bind for name in registered}
+        adapters['project_change_plan'] = bind_preview
+        return [adapters[item.name](item) if item.name in adapters else item for item in tools]
 
     def _read(self, name, args, registered):
         requested = {'tool': name, 'args': args}

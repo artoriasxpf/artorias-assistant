@@ -1,7 +1,7 @@
 """Resource contracts. No filesystem, database or agent-framework dependencies."""
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypedDict
+from typing import Literal, NotRequired, Protocol, TypedDict
 
 UNSET_VERSION = object()
 
@@ -40,6 +40,9 @@ class DirectoryEntry(TypedDict):
 class DirectoryTree(TypedDict):
     entries: list[DirectoryEntry]
     truncated: bool
+    filters: NotRequired[dict]
+    coverage: NotRequired[dict]
+    stop_reason: NotRequired[str]
 
 
 class FileOperations(Protocol):

@@ -255,7 +255,7 @@ def test_analysis_policy_and_project_receipts(tmp_path, monkeypatch):
         'analysis_type': 'document_directory', 'intent': 'summary', 'goal': '核对目录', 'roots': ['.'],
     }), ws)
     tools = build_tools(ws, lambda *_: None)
-    assert {t.name for t in step_tools(tools, None, True)} == READ_TOOLS
+    assert {t.name for t in step_tools(tools, None, True)} == READ_TOOLS | {'project_change_plan'}
     mixed = step_tools(tools, ['project_write'], True)
     assert 'project_write' in {t.name for t in mixed}
     assert 'run_python' not in {t.name for t in mixed}

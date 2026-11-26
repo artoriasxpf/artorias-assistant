@@ -128,6 +128,30 @@ class LocalWorkspace:
             raise NotADirectoryError(f'不是目录：{directory}')
         return directory
 
+    def mkdir(self, path, *, parents=False):
+        with self._locked():
+            target = self.root / self.path(path) if path != '.' else self.root
+            if target.resolve() != target:
+                raise ValueError('不允许通过符号链接创建目录')
+            if target.is_dir():
+                return {'status': 'already_exists', 'created': []}
+            missing = [target]
+            if parents:
+                while missing[-1] != self.root and not missing[-1].parent.exists():
+                    missing.append(missing[-1].parent)
+            created = []
+            for directory in reversed(missing):
+                try:
+                    directory.mkdir()
+                except FileExistsError:
+                    if directory.is_symlink() or not directory.is_dir():
+                        if directory == target:
+                            return {'status': 'conflict', 'created': created}
+                        raise
+                else:
+                    created.append(directory.relative_to(self.root).as_posix())
+            return {'status': 'created' if created else 'already_exists', 'created': created}
+
     def list_directory(self, directory):
         return self.tree(directory, max_depth=1, max_entries=None, include_hidden=True)['entries']
 
@@ -136,15 +160,19 @@ class LocalWorkspace:
         pending = deque([(root, 0)])
         found = []
         truncated = False
+        hidden = 0
+        depth_limited = 0
         while pending and not truncated:
             current, depth = pending.popleft()
             if depth >= max_depth:
+                depth_limited += 1
                 continue
             if current != root:
                 self.path(current.relative_to(self.root).as_posix())
             with os.scandir(current) as children:
                 for child in children:
                     if not include_hidden and child.name.startswith('.'):
+                        hidden += 1
                         continue
                     if child.is_dir(follow_symlinks=False):
                         kind = 'directory'
@@ -157,9 +185,12 @@ class LocalWorkspace:
                         break
                     path = Path(child.path)
                     found.append({'path': path.relative_to(root).as_posix(), 'type': kind})
-                    if kind == 'directory' and depth + 1 < max_depth:
+                    if kind == 'directory':
                         pending.append((path, depth + 1))
-        return {'entries': sorted(found, key=lambda item: item['path']), 'truncated': truncated}
+        return {'entries': sorted(found, key=lambda item: item['path']), 'truncated': truncated,
+                'filters': {'include_hidden': include_hidden, 'max_depth': max_depth},
+                'coverage': {'skipped': {'hidden': hidden, 'depth_limit': depth_limited}},
+                'stop_reason': 'entry_limit' if truncated else 'depth_limit' if depth_limited else 'complete'}
 
     def files_under(self, directory):
         directory = self._directory(directory)

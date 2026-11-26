@@ -122,6 +122,41 @@ class WorkspaceToolExecutor:
                     allowed[path] = (True, resource if choice != 'remember' else None)
         return allowed
 
+    def group_operation(self, call_id, paths, action, operation_key, operation, approve):
+        """Authorize each file, then run with any one-shot grants together."""
+        ws = self.workspace
+        if not call_id or not hasattr(ws, 'permissions'):
+            return operation()
+        pending = {}
+        denied = []
+        for path in paths:
+            space, target = ws._target(path)
+            try:
+                ws._authorize(space, target, action)
+            except MissingPermission as error:
+                request_id = ws.permissions.request(ws, call_id, error.resource, operation_key)
+                if request_id is None:
+                    denied.append(path)
+                else:
+                    pending[request_id] = error.resource
+        if denied:
+            return {'status': 'permission_denied', 'paths': denied}
+        if not pending:
+            return operation()
+        decision = approve({
+            'kind': 'file_access', 'access': action, 'resource_kind': 'file',
+            'path': '\n'.join(resource['root'] for resource in pending.values()),
+            'permission_request_ids': list(pending), 'allow_remember': True,
+        })
+        choices = {key: ws.permissions.claim(key) for key in pending}
+        if decision == 'reject' or not all(choices.values()):
+            return {'status': 'permission_denied'}
+        token = ws.once.set(tuple(pending[key] for key, choice in choices.items() if choice == 'approve'))
+        try:
+            return operation()
+        finally:
+            ws.once.reset(token)
+
     def list_directory(self, path):
         return {'path': path, 'entries': self.workspace.list_directory(path)}
 
@@ -138,8 +173,8 @@ class WorkspaceToolExecutor:
     def write(self, path, content):
         return self.files.write(path, content)
 
-    def edit(self, path, old, new):
-        return self.files.edit(path, old, new)
+    def edit(self, path, old, new, expected_version=None):
+        return self.files.edit(path, old, new, expected_version)
 
     def delete(self, path):
         return self.workspace.delete(path)

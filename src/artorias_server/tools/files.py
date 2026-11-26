@@ -63,10 +63,14 @@ class FileToolService:
         self.observed_versions[key] = result['version']
         return result
 
-    def edit(self, path, old, new):
+    def edit(self, path, old, new, expected_version=None):
         text, version = self.workspace.read_version(path)
-        if not old or text.count(old) != 1:
-            raise ValueError('old 必须唯一匹配')
+        if expected_version is not None and version != expected_version:
+            return {'status': 'conflict', 'reason': 'version_mismatch', 'path': path}
+        count = text.count(old) if old else 0
+        if count != 1:
+            reason = 'ambiguous_match' if count > 1 else 'no_match' if old else 'empty_match'
+            return {'status': 'conflict', 'reason': reason, 'matches': count, 'path': path}
         result = self.workspace.write(path, text.replace(old, new, 1), expected=version)
         self.observed_versions[self.workspace.path(path)] = result['version']
         return result
