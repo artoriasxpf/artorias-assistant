@@ -1,7 +1,7 @@
 """Resolve and authorize each operation; never reinterpret a rollback via current Session."""
 from pathlib import Path
 from contextvars import ContextVar
-from artorias_server.permissions import MissingPermission, Permissions
+from artorias_server.permissions import MissingPermission, Permissions, covers
 from .catalog import WorkspaceCatalog
 from .connectors import ConnectorRegistry
 from artorias_shared.workspace import ConnectorUnavailable, WorkspaceContext, UNSET_VERSION
@@ -55,10 +55,10 @@ class WorkspaceService:
         if workspace['kind'] == 'device_fs' and (temporary or grant):
             if target.resolve() != target:
                 raise ValueError('请直接使用规范路径，不能授权符号链接')
-        if temporary and all(temporary[key] == resource[key] for key in
-                             ('location_id', 'workspace_id', 'root', 'resource_kind')):
-            if action == 'read' or temporary['action'] == 'write':
-                return temporary
+        if temporary and temporary.get('workspace_id') == resource['workspace_id'] and (
+            temporary['location_id'] == resource['location_id'] and covers(temporary, resource)
+        ):
+            return temporary
         if grant:
             return grant
         try:
@@ -128,6 +128,25 @@ class WorkspaceService:
         if tree is None:
             raise ConnectorUnavailable('目标连接器不支持目录树')
         return tree(relative, max_depth=max_depth, max_entries=max_entries, include_hidden=include_hidden)
+
+    def analysis_root(self, path):
+        endpoint, relative, workspace, target = self._resolve(path, 'read', directory=True, create_default=path=='.')
+        return endpoint, relative, (workspace['kind'], workspace['location_id'], workspace['id'], str(target))
+
+    def analysis_text(self, path, *, max_bytes, versioned):
+        endpoint, relative, workspace, target = self._resolve(path, 'read')
+        operation = getattr(endpoint, 'analysis_text', None)
+        if operation is None:
+            raise ConnectorUnavailable('目标连接器不支持有界文本读取')
+        result = operation(relative, max_bytes=max_bytes, versioned=versioned)
+        return result, f"{workspace['kind']}:{workspace['location_id']}:{target}"
+
+    def analysis_search(self, path, **options):
+        endpoint, relative, _, _ = self._resolve(path, 'read')
+        operation = getattr(endpoint, 'analysis_search', None)
+        if operation is None:
+            raise ConnectorUnavailable('目标连接器不支持有界正文搜索')
+        return operation(relative, **options)
 
     def write_bytes(self, path, content, *, expected, operation_id=None):
         ws,p,w,target=self._resolve(path,'write')

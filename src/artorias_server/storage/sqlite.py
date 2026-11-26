@@ -134,8 +134,11 @@ class Store:
                 choice = choices[item['request_id']]
                 if choice not in allowed or (choice == 'remember' and not item.get('allow_remember')):
                     raise ValueError('无效的权限决定')
+                permission_ids = item.get('permission_request_ids', [])
                 if item.get('permission_request_id'):
-                    record_decision(c, item['permission_request_id'], row['session'], rid, choice)
+                    permission_ids = [item['permission_request_id']]
+                for permission_id in permission_ids:
+                    record_decision(c, permission_id, row['session'], rid, choice)
             resume_value = json.dumps({
                 key: 'approve' if choice == 'remember' else choice for key, choice in choices.items()
             }) if individual else ('approve' if value == 'remember' else value)

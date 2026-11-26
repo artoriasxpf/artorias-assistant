@@ -85,6 +85,43 @@ class WorkspaceToolExecutor:
         finally:
             ws.once.reset(token)
 
+    def read_permissions(self, call_id, paths, approve):
+        """Collect all missing file grants before one interrupt, then claim them."""
+        ws = self.workspace
+        allowed = {}
+        pending = {}
+        for path in paths:
+            if not hasattr(ws, 'permissions'):
+                allowed[path] = (True, None)
+                continue
+            try:
+                target_ws, target = ws._target(path)
+                ws._authorize(target_ws, target, 'read')
+            except MissingPermission as error:
+                resource = error.resource
+                request_id = ws.permissions.request(ws, call_id, resource, 'file_operation') if call_id else None
+                if request_id:
+                    pending[path] = (request_id, resource)
+                allowed[path] = (False, None)
+            except (ValueError, KeyError, OSError):
+                # The individual read reports its own invalid or unavailable path.
+                allowed[path] = (True, None)
+            else:
+                allowed[path] = (True, None)
+        if pending:
+            requests = dict(pending.values())
+            decision = approve({
+                'kind': 'file_access', 'access': 'read', 'resource_kind': 'file',
+                'path': '\n'.join(item['root'] for item in requests.values()),
+                'permission_request_ids': list(requests), 'allow_remember': True,
+            })
+            claims = {request_id: ws.permissions.claim(request_id) for request_id in requests}
+            for path, (request_id, resource) in pending.items():
+                choice = claims[request_id]
+                if decision != 'reject' and choice:
+                    allowed[path] = (True, resource if choice != 'remember' else None)
+        return allowed
+
     def list_directory(self, path):
         return {'path': path, 'entries': self.workspace.list_directory(path)}
 

@@ -176,6 +176,18 @@ class LocalWorkspace:
                     result.append(p.relative_to(directory).as_posix())
         return sorted(result)
 
+    def analysis_entries(self, directory, *, max_depth, include_hidden):
+        from .analysis import entries
+        return entries(self, directory, max_depth=max_depth, include_hidden=include_hidden)
+
+    def analysis_text(self, path, *, max_bytes, versioned):
+        from .analysis import read_text
+        return read_text(self, path, max_bytes=max_bytes, versioned=versioned)
+
+    def analysis_search(self, path, **options):
+        from .analysis import search_text
+        return search_text(self, path, **options)
+
     def _backup(self, data):
         if data is None:
             return None

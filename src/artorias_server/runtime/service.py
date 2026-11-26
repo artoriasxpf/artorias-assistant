@@ -1,4 +1,5 @@
 import json
+from artorias_shared.ids import uid
 from deepagents import create_deep_agent
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from artorias_server.model_provider.factory import create_model
@@ -42,6 +43,21 @@ class DeepAgentRuntime:
                 +json.dumps(run['task_context'],ensure_ascii=False)})
         messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；缺少文件权限时工具会申请授权；拒绝后停止对该目标重复申请。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
         tools=list(self.tool_factory(ws,emit))
+        tool_names = {getattr(tool, 'name', None) for tool in tools}
+        file_guidance = (
+            '已知路径直接读，多个独立范围用一次 project_read_many。'
+            '已知文件名、关键词或符号线索时，直接用 project_search 定位，再按命中行核实。'
+            '目录分布未知时用 project_inventory 清点，再按未解决的问题选样阅读。'
+            '需要精确目录树或完整单层列表时，分别用 project_tree 或 project_list。'
+            '批读下一页使用 next_start 和 expected_version，保留原范围单位。'
+            if {'project_read_many', 'project_search', 'project_inventory'} <= tool_names else
+            '已知路径用 project_read。目录结构未知时用 project_tree，精确单层列表用 project_list。'
+            '续页使用 next_offset 和 expected_version。'
+        )
+        file_guidance += (
+            '仍有未解决问题或用户要求更高覆盖时才继续分页。报告枚举、实际读取、跳过、截断及失败范围。'
+            '名称、元数据或预览只能支持相应范围的判断。引用原文结论时记录路径和范围。'
+        )
         if run.get('task_id'):
             from artorias_server.tasks.results import result_tool
             tools.append(result_tool(self.store,run['session'],run['task_id']))
@@ -60,12 +76,9 @@ class DeepAgentRuntime:
                 model=model,tools=tools,checkpointer=saver,
                 middleware=[internal_files,RequestBudget(),ModelActivity(),ToolErrorBoundary()],
                 system_prompt=(
-                    '你是 Artorias 个人助理。先用 project_tree 小范围浏览；truncated 为真时缩小目录或分层查看。'
-                    '只有需要完整的单层列表时才用 project_list。用 project_read 分页读取，用 project_write 或 project_edit 修改。'
-                    '分析多个文件或长文件时，每批最多调用 3 次 project_read，每次 limit 不超过 2000。'
-                    '每批返回后先分析本批，在简短的中间回复里记下要点和来源路径、页范围，再发起下一批读取。'
-                    '需要续读时使用该文件上一页的 next_offset 和 version 作为 offset 和 expected_version。'
-                    '完成各批分析后再汇总；明确标注未读完、读取失败或版本变化的文件。工具结果只有预览时，不把省略的正文算作已分析。'
+                    '你是 Artorias 个人助理。'
+                    + file_guidance +
+                    '用 project_write 或 project_edit 修改文件。'
                     '相对路径走已绑定的本机或云端工作空间，用户给出本机绝对路径时保留它。'
                     '文件工具会申请最小权限。Python 准备需要额外本机目录权限时可用 project_authorize；拒绝后不得重复申请。'
                     '覆盖已有文件前先读取。执行 Python 用 run_python，默认由绑定空间决定执行位置，等待用户审批。'
@@ -85,30 +98,59 @@ class DeepAgentRuntime:
                         seen_calls.update(call['id'] for call in msg.tool_calls if call.get('id') and call.get('name'))
                     elif msg.type=='tool':
                         seen_results.add(msg.tool_call_id)
-            async for mode,chunk in agent.astream(payload,config=config,stream_mode=['messages','values','custom']):
-                if mode=='custom':
-                    if isinstance(chunk,dict) and chunk.get('kind') in ('model.started','model.finished'):
-                        yield chunk['kind'],chunk['payload']
-                    continue
-                if mode=='messages':
-                    msg,_=chunk
-                    text=text_content(msg.content) if msg.type in ('ai','AIMessageChunk') else ''
-                    if text:yield 'assistant.delta',{'text':text}
-                    continue
-                result=chunk
-                for msg in chunk.get('messages',[]):
-                    # The message stream exposes partial arguments and often omits
-                    # the tool name. Graph state contains the assembled messages.
-                    if msg.type=='ai':
-                        for call in msg.tool_calls:
-                            call_id,name=call.get('id'),call.get('name')
-                            if not call_id or not name or call_id in seen_calls:continue
-                            seen_calls.add(call_id)
-                            yield 'tool.call',{'call_id':call_id,'name':name,'args':call['args']}
-                    elif msg.type=='tool' and msg.tool_call_id not in seen_results:
-                        seen_results.add(msg.tool_call_id)
-                        if msg.tool_call_id not in detailed_results:
-                            yield 'tool.result',{'call_id':msg.tool_call_id,'name':msg.name,'status':msg.status,'content':msg.content}
+            steps = set()
+            request_bytes = 0
+            invocation_id = uid()
+            metrics = dict(model_requests=0, request_bytes=0, input_tokens=0, output_tokens=0,
+                           estimated_requests=0, measured_requests=0, tool_calls=0)
+            try:
+                async for mode,chunk in agent.astream(payload,config=config,stream_mode=['messages','values','custom','debug']):
+                    if mode == 'debug':
+                        if chunk.get('type') == 'task' and isinstance(chunk.get('step'), int):
+                            steps.add(chunk['step'])
+                        continue
+                    if mode == 'custom':
+                        if not isinstance(chunk, dict):
+                            continue
+                        kind = chunk.get('kind')
+                        if kind in ('model.started', 'model.finished'):
+                            metrics['model_requests'] += int(kind == 'model.started')
+                            yield kind, chunk['payload']
+                        elif kind == 'runtime.request_metrics':
+                            request_bytes = chunk['payload']['request_bytes']
+                            metrics['request_bytes'] += request_bytes
+                        elif kind == 'runtime.usage_metrics':
+                            usage = chunk['payload']
+                            estimated = usage['input_tokens'] is None or usage['output_tokens'] is None
+                            metrics['estimated_requests'] += int(estimated)
+                            metrics['measured_requests'] += int(not estimated)
+                            metrics['input_tokens'] += (request_bytes + 3) // 4 if estimated else usage['input_tokens']
+                            metrics['output_tokens'] += (usage['output_bytes'] + 3) // 4 if estimated else usage['output_tokens']
+                        continue
+                    if mode=='messages':
+                        msg,_=chunk
+                        text=text_content(msg.content) if msg.type in ('ai','AIMessageChunk') else ''
+                        if text:yield 'assistant.delta',{'text':text}
+                        continue
+                    result=chunk
+                    for msg in chunk.get('messages',[]):
+                        # The message stream exposes partial arguments and often omits
+                        # the tool name. Graph state contains the assembled messages.
+                        if msg.type=='ai':
+                            for call in msg.tool_calls:
+                                call_id,name=call.get('id'),call.get('name')
+                                if not call_id or not name or call_id in seen_calls:continue
+                                seen_calls.add(call_id)
+                                metrics['tool_calls'] += 1
+                                yield 'tool.call',{'call_id':call_id,'name':name,'args':call['args']}
+                        elif msg.type=='tool' and msg.tool_call_id not in seen_results:
+                            seen_results.add(msg.tool_call_id)
+                            if msg.tool_call_id not in detailed_results:
+                                yield 'tool.result',{'call_id':msg.tool_call_id,'name':msg.name,'status':msg.status,'content':msg.content}
+            finally:
+                emit('runtime.graph_metrics', dict(
+                    metrics, thread_id=thread_id, invocation_id=invocation_id, graph_steps=len(steps),
+                ))
             state=await agent.aget_state(config)
             pending=[i for task in state.tasks for i in task.interrupts]
             if pending:

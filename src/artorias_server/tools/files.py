@@ -6,8 +6,8 @@ from artorias_shared.ports.execution import WorkspacePort
 PAGE_BYTES = 8192
 
 
-def _json_bytes(value):
-    return json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+def json_bytes(value):
+    return json.dumps(value, ensure_ascii=False).encode('utf-8')
 
 
 def _page_bounds(offset, limit, maximum, total, version, expected_version):
@@ -26,7 +26,7 @@ def _byte_capped_page(values, offset, limit):
     start, stop = offset, min(len(values), offset + limit)
     while start < stop:
         end = (start + stop + 1) // 2
-        if len(_json_bytes(values[offset:end])) <= PAGE_BYTES:
+        if len(json_bytes(values[offset:end])) <= PAGE_BYTES:
             start = end
         else:
             stop = end - 1
