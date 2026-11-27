@@ -48,6 +48,7 @@ class SearchArguments(Arguments):
     inventory_id: str | None = Field(default=None, max_length=80)
     query: str = Field(min_length=1, max_length=256)
     mode: Literal['name', 'literal', 'regex'] = 'literal'
+    include_hidden: bool | None = None
     include: list[Glob] = Field(default_factory=list, max_length=20)
     context_lines: int = Field(default=2, ge=0, le=2)
     max_hits: int = Field(default=50, ge=1, le=100)
@@ -163,9 +164,9 @@ class ProjectAnalysis:
 
     def snapshot_page(self, args):
         options = args.model_dump(exclude_defaults=True)
-        allowed = {'root', 'cursor', 'query', 'snapshot_page'}
+        allowed = {'root', 'cursor', 'query', 'snapshot_page', 'include_hidden'}
         if options.keys() - allowed:
-            raise ValueError('快照分页支持 root、cursor 和搜索 query；其他选项请使用普通模式')
+            raise ValueError('快照分页支持 root、cursor、include_hidden 和搜索 query；其他选项请使用普通模式')
         endpoint, path, _ = self.workspace.analysis_root(args.root or '.')
         request_id = page_request.get() or uid()
         if isinstance(args, SearchArguments):
@@ -176,7 +177,10 @@ class ProjectAnalysis:
             options = {'limit': 8}
         if read is None:
             return {'status': 'unsupported'}
-        return read(path, request_id=request_id, cursor=args.cursor, **options)
+        if args.include_hidden:
+            options['include_hidden'] = True
+        result = read(path, request_id=request_id, cursor=args.cursor, **options)
+        return dict(result, filters={'include_hidden': bool(args.include_hidden)})
 
     def byte_page(self, path, offset, limit, expected_version):
         if offset < 0 or not 4 <= limit <= 4096 or (offset and not expected_version):
@@ -264,6 +268,8 @@ class ProjectAnalysis:
                     largest = sorted([*largest, item], key=lambda row: (-row['size_bytes'], row['path']))[:8]
         result = self._result(
             'inventory', scan, stats, reason, inventory_id=inventory_id, root=args.root,
+            filters={'include_hidden': args.include_hidden, 'include': args.include,
+                     'exclude': args.exclude, 'max_depth': args.max_depth},
             counts=dict(types), extensions=dict(extensions.most_common(20)),
             top_directories=dict((key[:100], count) for key, count in directories.most_common(12)),
             size_buckets=dict(sizes), samples=samples, largest=largest, counts_scope='page',
@@ -275,7 +281,9 @@ class ProjectAnalysis:
     def search(self, args, inventory):
         root = args.root or (inventory['root'] if inventory else '.')
         depth = inventory['max_depth'] if inventory else 12
-        hidden = inventory['include_hidden'] if inventory else False
+        hidden = args.include_hidden if args.include_hidden is not None else bool(inventory and inventory['include_hidden'])
+        filters = {'include_hidden': hidden, 'include': args.include, 'max_depth': depth,
+                   'inventory_id': args.inventory_id}
         options = (args.model_dump(exclude={'cursor'}), inventory)
         stats = coverage()
         scan, error = self._open('search', root, depth, hidden, args.cursor, options)
@@ -343,7 +351,7 @@ class ProjectAnalysis:
                         skip(stats, 'output_limit')
                         continue
                     scan.pending = (item, hit['line'] - 1 if hit['line'] else 0, hit.get('observation'))
-                    return self._result('search', scan, stats, 'output_limit', hits=hits, root=root)
+                    return self._result('search', scan, stats, 'output_limit', hits=hits, root=root, filters=filters)
                 hits.append(hit)
                 size += cost
             if args.mode != 'name':
@@ -357,7 +365,7 @@ class ProjectAnalysis:
             if monotonic() >= deadline:
                 reason = 'time_limit'
                 break
-        return self._result('search', scan, stats, reason, hits=hits, root=root)
+        return self._result('search', scan, stats, reason, hits=hits, root=root, filters=filters)
 
     @staticmethod
     def _metadata_limit(result):

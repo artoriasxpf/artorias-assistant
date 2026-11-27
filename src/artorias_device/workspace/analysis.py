@@ -193,14 +193,15 @@ def read_range(workspace, relative, *, offset, limit, expected_version=None):
             'next_start': end if end < info.st_size else None, 'content': content}
 
 
-def inventory_page(workspace, relative, *, request_id, cursor, limit):
+def inventory_page(workspace, relative, *, request_id, cursor, limit, include_hidden=False):
     """Store metadata pages in the endpoint's journal area for retry by request ID."""
     import json
     import sqlite3
     from contextlib import closing
     from uuid import uuid4
+    from collections import Counter
 
-    scope = json.dumps([workspace.session, str(workspace.root), relative])
+    scope = json.dumps([workspace.session, str(workspace.root), relative] + ([True] if include_hidden else []))
     db_path = workspace.blobs / 'analysis-pages.sqlite'
     with closing(sqlite3.connect(db_path, timeout=10)) as db, db:
         db.execute("""CREATE TABLE IF NOT EXISTS inventory_pages(
@@ -237,7 +238,7 @@ def inventory_page(workspace, relative, *, request_id, cursor, limit):
                 return {'status': 'inventory_quota'}
             db.executemany('INSERT INTO inventory_entries VALUES(?,?,?)', (
                 (snapshot_id, n, json.dumps(item, ensure_ascii=False))
-                for n, item in enumerate(entries(workspace, relative, max_depth=32, include_hidden=False))
+                for n, item in enumerate(entries(workspace, relative, max_depth=32, include_hidden=include_hidden))
             ))
         page = [json.loads(row[0]) for row in db.execute(
             """SELECT entry FROM inventory_entries WHERE snapshot_id=? AND ordinal>=?
@@ -245,7 +246,11 @@ def inventory_page(workspace, relative, *, request_id, cursor, limit):
         )]
         next_cursor = uuid4().hex if len(page) > limit else None
         page = page[:limit]
+        skipped = Counter(entry['skip'] for entry in page if entry.get('skip'))
         result = {'status': 'ok', 'entries': page, 'next_cursor': next_cursor,
+                  'coverage': {'skipped': dict(skipped)},
+                  'stop_reason': next((entry['stop_reason'] for entry in page if 'stop_reason' in entry),
+                                      'page_limit' if next_cursor else 'complete'),
                   'snapshot_id': snapshot_id,
                   'incomplete': any('stop_reason' in entry or entry.get('error') or
                                     entry.get('depth_limited') or entry.get('skip')
@@ -258,14 +263,14 @@ def inventory_page(workspace, relative, *, request_id, cursor, limit):
         return result
 
 
-def search_page(workspace, relative, *, request_id, cursor, query):
+def search_page(workspace, relative, *, request_id, cursor, query, include_hidden=False):
     """Search one persisted inventory page, resuming within a file when needed."""
     import json
     import sqlite3
     from contextlib import closing
     from uuid import uuid4
 
-    scope = json.dumps([workspace.session, str(workspace.root), relative, query])
+    scope = json.dumps([workspace.session, str(workspace.root), relative, query] + ([True] if include_hidden else []))
     with closing(sqlite3.connect(workspace.blobs / 'analysis-search.sqlite', timeout=10)) as db, db:
         db.execute("""CREATE TABLE IF NOT EXISTS search_pages(
             request_id TEXT PRIMARY KEY, cursor TEXT UNIQUE, scope TEXT NOT NULL,
@@ -287,7 +292,7 @@ def search_page(workspace, relative, *, request_id, cursor, query):
             state = {'page_id': request_id, 'page_cursor': None, 'position': 0,
                      'line': 0, 'observation': None}
         page = inventory_page(workspace, relative, request_id='search:' + state['page_id'],
-                              cursor=state['page_cursor'], limit=8)
+                              cursor=state['page_cursor'], limit=8, include_hidden=include_hidden)
         if page['status'] != 'ok':
             return page
         hits, gaps = [], []
@@ -316,7 +321,8 @@ def search_page(workspace, relative, *, request_id, cursor, query):
             state.update(page_id=request_id, page_cursor=page['next_cursor'], position=0)
         next_cursor = uuid4().hex if more else None
         payload = {'status': 'ok', 'hits': hits, 'gaps': gaps, 'next_cursor': next_cursor,
-                   'incomplete': page['incomplete'] or bool(gaps)}
+                   'incomplete': page['incomplete'] or bool(gaps), 'coverage': page.get('coverage', {}),
+                   'stop_reason': 'page_limit' if more else page.get('stop_reason', 'complete')}
         db.execute('INSERT INTO search_pages(request_id,cursor,scope,parent,payload,continuation) VALUES(?,?,?,?,?,?)',
                    (request_id, next_cursor, scope, cursor, json.dumps(payload, ensure_ascii=False),
                     json.dumps(state)))

@@ -39,7 +39,7 @@ def receipts(name, args, value, target):
                     row['end'] = row['start'] + item['count']
             continue
         row.update(input_cursor=args.get('cursor'), next_cursor=item.get('next_cursor'),
-                   incomplete=bool(item.get('incomplete') or item.get('coverage', {}).get('skipped')))
+                   incomplete=bool(item.get('incomplete') or item.get('truncated') or any(item.get('coverage', {}).get('skipped', {}).values())))
         if item.get('snapshot_id'):
             row['snapshot_id'] = item['snapshot_id']
         entries = item.get('entries', item.get('hits', item.get('samples', [])))

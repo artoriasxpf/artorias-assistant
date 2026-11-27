@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from artorias_shared.execution.models import InputResource, OutputPolicy, PythonRequest
 from .executor import WorkspaceToolExecutor
+from .change_plans import ChangePlans, PlanArguments
 from .project_analysis import (
     InventoryArguments, ProjectAnalysis, ReadArguments, SearchArguments, stopped,
 )
@@ -35,6 +36,7 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         return executor.file_operation(call_id, path, action, directory, operation, interrupt)
 
     analysis = ProjectAnalysis(ws, executor.files)
+    changes = ChangePlans(ws)
 
     def measure(name, operation):
         started = monotonic()
@@ -54,7 +56,7 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
     def project_inventory(**kwargs) -> dict:
         """Summarize directory contents using metadata only. Paths in samples are
         relative to root. For the next page, repeat the options with next_cursor.
-        Report coverage and exclusions when using inventory to make recommendations.
+        Set include_hidden=true for dotfiles. Report coverage and exclusions.
         """
         args = InventoryArguments(**kwargs)
         if args.snapshot_page:
@@ -66,7 +68,8 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
     @tool(args_schema=SearchArguments)
     def project_search(**kwargs) -> dict:
         """Search authorized paths by name, literal text, or line-oriented regex.
-        Return matching locations and short excerpts. Read source ranges to verify.
+        Return matching locations and short excerpts. Set include_hidden=true for dotfiles.
+        Read source ranges to verify.
         If next_cursor is present, repeat the original options to continue.
         """
         args = SearchArguments(**kwargs)
@@ -132,9 +135,9 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         return file_operation(path, 'write', False, lambda: executor.write(path, content))
 
     @tool
-    def project_edit(path: str, old: str, new: str) -> dict:
+    def project_edit(path: str, old: str, new: str, expected_version: str | None = None) -> dict:
         """Replace one uniquely matching string in an authorized UTF-8 file."""
-        return file_operation(path, 'write', False, lambda: executor.edit(path, old, new))
+        return file_operation(path, 'write', False, lambda: executor.edit(path, old, new, expected_version))
 
     @tool
     def project_delete(path: str) -> str | dict:
@@ -149,7 +152,41 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         No file content is returned. Pass a known source version to check for edits.
         The change_id identifies the move for undo.
         """
-        return executor.move(source, destination, expected_source_version)
+        return executor.group_operation(
+            tool_call.get(), [source, destination], 'write',
+            ['move', source, destination, expected_source_version],
+            lambda: executor.move(source, destination, expected_source_version), interrupt,
+        )
+
+    @tool
+    def project_mkdir(path: str, parents: bool = False) -> dict:
+        """Create an authorized local directory. Set parents=true to create missing
+        ancestors inside the authorized directory scope. Existing directories are safe to retry.
+        """
+        return file_operation(path, 'write', True, lambda: ws.mkdir(path, parents=parents))
+
+    @tool(args_schema=PlanArguments)
+    def project_change_plan(**kwargs) -> dict:
+        """Preview a versioned edit of existing UTF-8 files. Replace uses explicit
+        paths and match counts. Patch uses zero-based half-open Unicode character
+        offsets from the specified versions. Returns diffs and a plan_id without writing workspace files.
+        """
+        request = PlanArguments.model_validate(kwargs).request
+        return executor.group_operation(
+            tool_call.get(), [item.path for item in request.files], 'read',
+            'change_preview', lambda: changes.preview(request), interrupt,
+        )
+
+    @tool
+    def project_change_apply(plan_id: str) -> dict:
+        """Apply a previously previewed plan in this Session and workspace.
+        Reports conflicts, partial writes and per-file change IDs for undo.
+        """
+        items = changes.load(plan_id)
+        return executor.group_operation(
+            tool_call.get(), [item['path'] for item in items], 'write',
+            ['change_apply', plan_id], lambda: changes.apply(plan_id, items), interrupt,
+        )
 
     @tool
     def project_authorize(path: str, access: Literal['read', 'write'] = 'write') -> dict:
@@ -186,7 +223,8 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         return await executor.run_python(tool_call_id, request, interrupt, emit)
 
     tools = [project_tree, project_list, project_read, project_write, project_edit,
-             project_delete, project_move, project_authorize, run_python]
+             project_delete, project_move, project_mkdir, project_change_plan,
+             project_change_apply, project_authorize, run_python]
     if os.getenv('ARTORIAS_PROJECT_ANALYSIS', '1') == '1':
         tools[:0] = [project_inventory, project_search, project_read_many]
     return tools

@@ -203,3 +203,24 @@ def test_first_phase_tools_can_be_disabled(project, monkeypatch):
     names = {tool.name for tool in build_tools(workspace, lambda *_: None)}
     assert 'project_read' in names
     assert names.isdisjoint({'project_inventory', 'project_search', 'project_read_many'})
+
+
+def test_hidden_inventory_and_search_across_scan_modes(tmp_path, monkeypatch):
+    from artorias_local_app.bootstrap import create_workspace
+    from artorias_server.storage.sqlite import Store
+    from artorias_server.tools.registry import build_tools
+
+    root = tmp_path / 'project'
+    monkeypatch.setenv('ARTORIAS_WORKSPACE', str(root))
+    (tmp_path / 'data').mkdir()
+    store = Store(tmp_path / 'data' / 'app.sqlite')
+    ws = create_workspace(store, store.session())
+    ws.write('nested/.hidden.txt', 'needle')
+    tools = {item.name: item.invoke for item in build_tools(ws, lambda *_: None)}
+    for snapshot in (False, True):
+        args = {'snapshot_page': snapshot, 'query': 'needle'}
+        assert tools['project_search'](args)['hits'] == []
+        assert tools['project_search']({**args, 'include_hidden': True})['hits']
+        page = tools['project_inventory']({'snapshot_page': snapshot, 'include_hidden': True})
+        assert page['filters']['include_hidden'] is True
+        assert 'hidden' not in page['coverage']['skipped']

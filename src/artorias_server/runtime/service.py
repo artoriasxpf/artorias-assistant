@@ -116,14 +116,15 @@ class DeepAgentRuntime:
                 '可重放的字面搜索用 project_search(snapshot_page=true)。清点与搜索不代表已读正文。'
                 '恢复时按 pending.plan_json 原工具与参数重放。如为旧版 reads 计划，调用其中任一 project 读取以恢复。'
                 '查阅历史用 read_analysis_notes。记录最后一批再交付，报告覆盖、来源及未核验部分。'
+                '若本步负责预览明确的文件改动，用 project_change_plan 生成 diff，并在交付中记录 plan_id。'
             )
         async with self.checkpoint_provider.open() as saver:
             internal_files=FilesystemMiddleware(
                 tools=['read_file'],
                 custom_tool_descriptions={'read_file': (
-                    'Read a virtual file explicitly referenced by a prior tool result or context notice. '
+                    'Open the exact virtual reference supplied in a prior tool result or context notice. '
                     'This tool cannot access the Mac, host filesystem, or any user workspace. '
-                    'Use project_read for real files.'
+                    'For workspace paths, including absolute paths and workspace:// references, use project_read.'
                 )},
                 system_prompt='内置 read_file 仅用于读取工具结果或上下文提示明确引用的内部虚拟文件。',
             )
@@ -137,7 +138,8 @@ class DeepAgentRuntime:
                      '用 project_write 或 project_edit 修改文件。相对路径走已绑定的本机或云端工作空间。'
                      '用户给出本机绝对路径时保留它。拒绝授权后不得重复申请。'
                      '用 project_move 移动或改名本机文件，提供完整目标文件路径。'
-                     '覆盖已有文件前先读取。执行 Python 用 run_python，等待用户审批。')
+                     '覆盖已有文件前先读取。批量替换或补丁先用 project_change_plan 预览，再用 project_change_apply 应用。'
+                     '执行 Python 用 run_python，等待用户审批。')
                     + '不要声称未实际执行的操作成功。不要自行拆分业务 Task。'
                 ),
             )

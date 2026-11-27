@@ -343,9 +343,13 @@ def test_project_tree_and_unbounded_directory_list(tmp_path, monkeypatch):
     ws=WorkspaceService(db,sid)
     tools={tool.name:tool for tool in build_tools(ws,lambda *_:None)}
     tree=tools['project_tree'].invoke
-    assert tree({})=={'path':'.','entries':[
+    default = tree({})
+    assert default['entries']==[
         {'path':'nested','type':'directory'}, {'path':'nested/deeper','type':'directory'},
-    ],'truncated':False}
+    ]
+    assert default['truncated'] is False
+    assert default['coverage']['skipped']['hidden'] == 1
+    assert default['stop_reason'] == 'depth_limit'
     assert tree({'max_entries':2})['truncated'] is False
     assert tree({'max_entries':1})['truncated'] is True
     assert tree({'max_depth':1,'include_hidden':True})['entries']==[
@@ -372,3 +376,122 @@ def test_project_tree_and_unbounded_directory_list(tmp_path, monkeypatch):
     assert 'truncated' not in listing
     tree_result=tools['project_tree'].invoke({'max_entries':1000})
     assert len(tree_result['entries'])==1000 and tree_result['truncated'] is True
+
+
+@pytest.mark.parametrize(('decision', 'local_source'), [('approve', False), ('reject', False), ('approve', True)])
+def test_move_tool_requests_only_missing_permissions(tmp_path, monkeypatch, decision, local_source):
+    from artorias_server.permissions import record_decision, tool_call
+    from artorias_server.tools import registry
+
+    db, sid, _, local, _ = setup(tmp_path, monkeypatch)
+    db.submit(sid, 'move', 'move-approval')
+    run = db.claim()
+    ws = WorkspaceService(db, sid, run['id'])
+    outside = tmp_path / 'external'
+    outside.mkdir()
+    source = (Path(local['root']) if local_source else outside) / 'source'
+    source.parent.mkdir(exist_ok=True)
+    source.write_text('body')
+    destination = outside / 'destination'
+
+    def approve(request):
+        paths = [destination] if local_source else [source, destination]
+        assert request['path'].splitlines() == list(map(str, paths))
+        assert len(request['permission_request_ids']) == len(paths)
+        with db.tx() as sql:
+            for key in request['permission_request_ids']:
+                record_decision(sql, key, sid, run['id'], decision)
+        return decision
+
+    monkeypatch.setattr(registry, 'interrupt', approve)
+    move = next(tool for tool in registry.build_tools(ws, lambda *_: None) if tool.name == 'project_move')
+    token = tool_call.set('move-test')
+    try:
+        result = move.invoke({'source': str(source), 'destination': str(destination)})
+    finally:
+        tool_call.reset(token)
+    if decision == 'reject':
+        assert result['status'] == 'permission_denied'
+        assert source.read_text() == 'body' and not destination.exists()
+    else:
+        assert destination.read_text() == 'body' and not source.exists()
+        record = ws.registry.find_change(result['change_id'], sid)
+        assert record['status'] == 'committed' and record['kind'] == 'file.moved'
+
+
+def test_change_plans_and_mkdir(tmp_path, monkeypatch):
+    from artorias_server.tools.registry import build_tools
+
+    db, sid, catalog, local, _ = setup(tmp_path, monkeypatch)
+    ws = WorkspaceService(db, sid)
+    tools = {tool.name: tool.invoke for tool in build_tools(ws, lambda *_: None)}
+    root = Path(local['root'])
+    assert tools['project_mkdir']({'path': 'src/new', 'parents': True})['status'] == 'created'
+    assert tools['project_mkdir']({'path': 'src/new'})['status'] == 'already_exists'
+    first, second = 'src/new/a.py', 'src/new/b.py'
+    (root / first).write_text('use(old)\n')
+    (root / second).write_text('old\nold\n')
+    assert tools['project_edit']({'path': second, 'old': 'old', 'new': 'new'})['matches'] == 2
+    request = {'request': {'kind': 'replace', 'files': [
+        {'path': first, 'expected_matches': 1}, {'path': second, 'expected_matches': 2},
+    ], 'pattern': 'old', 'replacement': 'updated'}}
+    preview = tools['project_change_plan'](request)
+    plan = {'plan_id': preview['plan_id']}
+    assert (root / first).read_text() == 'use(old)\n'
+    (root / second).write_text('external change')
+    assert tools['project_change_apply'](plan)['status'] == 'blocked'
+    assert (root / first).read_text() == 'use(old)\n'
+
+    (root / second).write_text('old\nold\n')
+    applied = tools['project_change_apply'](plan)
+    assert applied['status'] == 'applied'
+    assert tools['project_change_apply'](plan) == applied
+    assert (root / first).read_text() == 'use(updated)\n'
+    another = db.session()
+    catalog.select(another, local['id'])
+    other_tools = build_tools(WorkspaceService(db, another), lambda *_: None)
+    with pytest.raises(ValueError, match='变更计划不存在'):
+        next(t for t in other_tools if t.name == 'project_change_apply').invoke(plan)
+    ws.revert(applied['files'][0]['change_id'])
+    assert (root / first).read_text() == 'use(old)\n'
+    patch = tools['project_change_plan']({'request': {'kind': 'patch', 'files': [{
+        'path': first, 'expected_version': ws.head(first),
+        'edits': [{'start': 4, 'end': 7, 'text': 'new'}],
+    }]}})
+    assert '+use(new)' in patch['files'][0]['diff']
+    assert tools['project_change_apply']({'plan_id': patch['plan_id']})['status'] == 'applied'
+    assert (root / first).read_text() == 'use(new)\n'
+
+
+def test_partial_apply_retry_keeps_committed_change_id(tmp_path, monkeypatch):
+    from artorias_server.tools.registry import build_tools
+
+    db, sid, _, local, _ = setup(tmp_path, monkeypatch)
+    ws = WorkspaceService(db, sid)
+    root = Path(local['root'])
+    paths = ['a.py', 'b.py']
+    for path in paths:
+        ws.write(path, 'old')
+    tools = {tool.name: tool.invoke for tool in build_tools(ws, lambda *_: None)}
+    preview = tools['project_change_plan']({'request': {
+        'kind': 'replace', 'pattern': 'old', 'replacement': 'new',
+        'files': [{'path': path, 'expected_matches': 1} for path in paths],
+    }})
+    original_write = ws.write_bytes
+
+    def fail_second(path, *args, **kwargs):
+        if path == paths[1]:
+            raise OSError('simulated disk error')
+        return original_write(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ws, 'write_bytes', fail_second)
+        partial = tools['project_change_apply']({'plan_id': preview['plan_id']})
+    assert partial['status'] == 'partial'
+    assert [entry['status'] for entry in partial['files']] == ['applied', 'failed']
+    reopened = WorkspaceService(db, sid)
+    apply = next(tool for tool in build_tools(reopened, lambda *_: None) if tool.name == 'project_change_apply')
+    resumed = apply.invoke({'plan_id': preview['plan_id']})
+    assert resumed['status'] == 'applied'
+    assert resumed['files'][0] == partial['files'][0]
+    assert (root / paths[1]).read_text() == 'new'
