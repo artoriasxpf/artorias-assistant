@@ -1,6 +1,8 @@
 import json
 import os
 from artorias_shared.ids import uid
+from artorias_server.permissions import MissingPermission
+from artorias_shared.workspace import ConnectorUnavailable
 from deepagents import create_deep_agent
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from artorias_server.model_provider.factory import create_model
@@ -12,6 +14,7 @@ from .tool_errors import ToolErrorBoundary
 from .step_repair import repair_submission
 from artorias_server.workspace.factory import WorkspaceFactory
 from artorias_server.tools.registry import build_tools
+from artorias_server.tools.analysis.location import LocationReady
 
 class DeepAgentRuntime:
     def __init__(self, data, store, *, workspace_factory=None, model_factory=None,
@@ -49,7 +52,7 @@ class DeepAgentRuntime:
                 'followup 优先复用 source_results 中的来源交付。要求保存、转交或加工已有结果时直接使用该结果；'
                 '如果只有部分预览，先用 task_result_read 按引用取回正文。只有用户要求重扫或确有信息缺失时才重读原文件。'
                 '其他目标由调度器执行。依赖结果可引用，不要重复执行。'
-                '如与原始用户消息冲突，遵循用户要求并报告冲突。不要虚报完成。\n'
+                '本步骤职责之外的部分可能由后续步骤执行；本步骤的只读范围不代表整轮未能保存。只有仍影响交付的问题需要说明。不要虚报完成。\n'
                 +json.dumps(run['task_context'],ensure_ascii=False)})
         messages.insert(0,{'role':'system','content':'文件默认位置由程序固定。相对路径使用本次 Task 空间；明确的本机绝对路径或 workspace://ID/path 可指定其他位置；缺少文件权限时工具会申请授权；拒绝后停止对该目标重复申请。工作空间数据：'+json.dumps(ws.describe(),ensure_ascii=False)})
         tools=list(self.tool_factory(ws,emit))
@@ -95,7 +98,7 @@ class DeepAgentRuntime:
                 return submission.final_text
 
             tools.append(finish_step)
-            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对 criterion_refs 指定的标准和必选 local_reviews 填写 id、claim 和自然语言 reason。未指定 criterion_refs 时填写快照中全部必选标准。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。milestones 和 blocker_changes 的 evidence_refs 默认使用 response，也可引用本步工具返回的 execution_id。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。final_text 写本步实际成果、结论及仍未解决的限制，使用面向用户的自然语言。内部标准编号、约束编号和步骤 key 留在结构化字段中。根据本步目标、相关历史交互和实际工具结果，对 criterion_refs 指定的标准和必选 local_reviews 填写 id、claim 和自然语言 reason。未指定 criterion_refs 时填写快照中全部必选标准。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。milestones 和 blocker_changes 的 evidence_refs 默认使用 response，也可引用本步工具返回的 execution_id。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
 
         thread_id=run.get('thread_id',run['id'])
         analysis = None
@@ -111,59 +114,151 @@ class DeepAgentRuntime:
         plan = unit = attempt = None
         unit_summaries = []
         work_budget = None
+        location = None
         if analysis_plan and analysis_enabled:
             from artorias_server.tools.analysis.service import AnalysisContext, AnalysisPrompt, AnalysisSession
             from artorias_server.tools.analysis import workplan as strategy
+            from artorias_server.tools.analysis.location import (
+                FileLocation, MissingSourcePath, candidate_scopes, explicit_reference,
+                preflight, probe, save_location, suggested_scopes,
+            )
             from artorias_server.tools.analysis.models import DeferredAnalysis
             from artorias_server.work import repository as work
             read_only = not set(run.get('allowed_tool_groups') or ()) & {'execution','project_write'}
             if existing_plan or (read_only and not legacy_link and os.getenv('ARTORIAS_WORK_PLANS','1') != '0'):
-                plan, unit, attempt = work.claim(self.store,run,ws.describe()['id'],strategy.initial_units(analysis_plan))
+                full_document = (
+                    analysis_plan['analysis_type'] == 'document_file'
+                    and analysis_plan.get('coverage_policy') == 'full'
+                    and hasattr(ws, '_resolve')
+                )
+                if full_document:
+                    recent = self.store.query(
+                        """SELECT content FROM messages WHERE session=? AND role='user' AND run!=?
+                           ORDER BY rowid DESC LIMIT 6""", (run['session'], run['id']),
+                    )
+                    location_context = [run['input'], *(row['content'] for row in recent)]
+                initial = []
+                if not existing_plan:
+                    initial = strategy.initial_units(analysis_plan)
+                    if full_document:
+                        initial = []
+                        for requested in analysis_plan['roots']:
+                            reference = explicit_reference(requested, run['input'])
+                            explicit = reference.startswith(('/', 'workspace://'))
+                            user_relative = not explicit and '/' in reference and reference in run['input']
+                            scopes = [] if user_relative else candidate_scopes(reference, location_context)
+                            if explicit or not scopes:
+                                try:
+                                    probe(ws, reference)
+                                except (MissingPermission, ValueError, KeyError, OSError, ConnectorUnavailable):
+                                    pass
+                                else:
+                                    initial.append(('read_group', {'paths': [reference]}))
+                                    continue
+                            initial.append(('locate_file', {'reference': reference, 'scopes': scopes}))
+                        initial = list({json.dumps(item): item for item in initial}.values())
+                plan, unit, attempt = work.claim(self.store, run, ws.describe()['id'], initial)
                 inputs = json.loads(unit['inputs'])
+                if full_document and inputs.get('relocate'):
+                    path = inputs['relocate']
+                    strategy.schedule_file_location(self.store, plan, path, candidate_scopes(path, location_context))
+                    yield 'work.requeue', {'plan_id': plan['id']}
+                    return
                 run = dict(run,work_kind=unit['kind'],work_inputs=inputs,work_plan_id=plan['id'],work_unit_id=unit['id'],work_attempt=attempt)
+                if unit['kind'] == 'locate_file':
+                    location = FileLocation(self.store, ws, unit, attempt)
+                    if 'preflight' not in inputs:
+                        found, pending, used_decision = await preflight(
+                            ws, self.checkpoint_provider, f'{thread_id}:locate:{unit["id"]}',
+                            inputs['reference'], inputs['scopes'], run.get('decision'),
+                        )
+                        if pending:
+                            yield 'approval.requested', {'requests': pending}
+                            return
+                        if used_decision:
+                            run = {key: value for key, value in run.items() if key != 'decision'}
+                        inputs['preflight'] = found.get('searches', [])
+                        inputs['suggested_roots'] = suggested_scopes(ws, inputs['reference'], inputs['scopes'])
+                        if found.get('path'):
+                            inputs['selection'] = {'path': found['path']}
+                        with self.store.tx() as db:
+                            save_location(db, unit['id'], inputs)
+                    inputs = location.start_attempt()
+                    if inputs.get('selection', {}).get('path'):
+                        strategy.finish_location(self.store, plan, unit, attempt, inputs['selection']['path'])
+                        yield 'work.requeue', {'plan_id': plan['id']}
+                        return
                 if unit['kind'] != 'direct':
                     run['analysis_key'] = 'work:' + unit['id']
                 if inputs.get('paths') and unit['kind'] != 'direct':
                     run['analysis_plan'] = dict(analysis_plan,roots=inputs['paths'])
+                elif full_document and unit['kind'] in ('reduce', 'synthesis'):
+                    run['analysis_plan'] = dict(analysis_plan, roots=strategy.document_roots(self.store, plan))
                 thread_id += ':work:' + attempt
-            analysis = AnalysisSession(self.store, run, ws)
-            segment = self.store.begin_analysis(run['id'], run['step_key'])
-            analysis.segment = segment
-            thread_id += f':analysis:{segment}'
-            tools = [*analysis.bind_project_tools(tools), *analysis.tools()]
-            middleware = [AnalysisPrompt(analysis), RequestBudget(), AnalysisContext(analysis),
-                          ModelActivity(), ToolErrorBoundary()]
-            file_guidance += (
-                '每次 project 读取自动创建持久化批次。一次只发一个读取调用，多个范围用 project_read_many。'
-                '收到 batch_id 后先用 record_analysis_note 提交摘要。refs 按返回条目从零编号。'
-                '大型文件用 project_read(unit="byte")；完整目录清点用 project_inventory(snapshot_page=true)。'
-                '可重放的字面搜索用 project_search(snapshot_page=true)。清点与搜索不代表已读正文。'
-                '恢复时按 pending.plan_json 原工具与参数重放。如为旧版 reads 计划，调用其中任一 project 读取以恢复。'
-                '查阅历史用 read_analysis_notes。记录最后一批再交付，报告覆盖、来源及未核验部分。'
-                '若本步负责预览明确的文件改动，用 project_change_plan 生成 diff，并在交付中记录 plan_id。'
-            )
-            if unit and unit['kind'] != 'direct':
-                if unit['kind'] != 'synthesis':
-                    messages[0]['content'] = '本次只执行指定工作单元。'
-                try:
-                    tools,file_guidance = strategy.bind_unit(analysis,plan,unit,tools,unit_summaries)
-                except strategy.DependenciesScheduled:
-                    yield 'work.requeue', {'plan_id':plan['id']}
-                    return
-                except DeferredAnalysis as error:
-                    yield 'analysis.suspended', {'dependency_id':str(error),'step_key':run['step_key']}
-                    return
-                except strategy.ChangedSource as change:
-                    strategy.invalidate(self.store,plan,change.path)
-                    yield 'work.requeue', {'plan_id':plan['id']}
-                    return
-                except (ValueError, OSError) as error:
-                    yield 'work.pause', {'plan_id':plan['id'],'reason':str(error)}
-                    return
-            if plan:
-                work_budget = WorkBudget(self.store,plan['id'],attempt,tools)
-                middleware.insert(-2,work_budget)
-                start_revision = self.store.query('SELECT revision FROM analyses WHERE id=?',(analysis.id,))[0]['revision']
+            if location:
+                tools = location.bind_tools()
+                file_guidance = (
+                    '本工作单元只定位目标文件。优先使用搜索记录。需要继续时，每轮只调用一次 search_for_file，'
+                    '可检查已授权目录；若相关历史目录已变动，可从 suggested_roots 选择目录或其下更具体的目录申请只读权限。'
+                    '如果目录因包含应用数据而无法授权，只在有线索时缩小到具体的项目目录。'
+                    '不要重复搜索或重复申请。只有一个已核实的文件时调用 finish_file_location 并传入路径。'
+                    '有多个候选、权限拒绝后无法继续或仍找不到时，不传路径调用 finish_file_location。'
+                )
+                observations = {
+                    'reference': inputs['reference'],
+                    'workspace': ws.describe(),
+                    'searches': [
+                        {key: value for key, value in item.items() if key not in ('key', 'call_id', 'attempt_id')}
+                        for item in [*inputs['preflight'], *inputs.get('searches', [])]
+                    ],
+                    'suggested_roots': inputs['suggested_roots'],
+                }
+                messages = [
+                    {'role': 'system', 'content': '定位数据见以下 JSON。' + json.dumps(observations, ensure_ascii=False)},
+                    {'role': 'user', 'content': run['input']},
+                ]
+                work_budget = WorkBudget(self.store, plan['id'], attempt, tools, internal_read=False)
+                middleware.insert(-1, work_budget)
+                middleware.insert(0, location)
+            else:
+                analysis = AnalysisSession(self.store, run, ws)
+                segment = self.store.begin_analysis(run['id'], run['step_key'])
+                analysis.segment = segment
+                thread_id += f':analysis:{segment}'
+                tools = [*analysis.bind_project_tools(tools), *analysis.tools()]
+                middleware = [AnalysisPrompt(analysis), RequestBudget(), AnalysisContext(analysis),
+                              ModelActivity(), ToolErrorBoundary()]
+                file_guidance += (
+                    '每次 project 读取自动创建持久化批次。一次只发一个读取调用，多个范围用 project_read_many。'
+                    '收到 batch_id 后先用 record_analysis_note 提交摘要。refs 按返回条目从零编号。'
+                    '大型文件用 project_read(unit="byte")；完整目录清点用 project_inventory(snapshot_page=true)。'
+                    '可重放的字面搜索用 project_search(snapshot_page=true)。清点与搜索不代表已读正文。'
+                    '恢复时按 pending.plan_json 原工具与参数重放。如为旧版 reads 计划，调用其中任一 project 读取以恢复。'
+                    '查阅历史用 read_analysis_notes。记录最后一批再交付，报告覆盖、来源及未核验部分。'
+                    '若本步负责预览明确的文件改动，用 project_change_plan 生成 diff，并在交付中记录 plan_id。'
+                )
+                if unit and unit['kind'] != 'direct':
+                    if unit['kind'] != 'synthesis':
+                        messages[0]['content'] = '本次只执行指定工作单元。'
+                    try:
+                        tools,file_guidance = strategy.bind_unit(analysis,plan,unit,tools,unit_summaries)
+                    except strategy.DependenciesScheduled:
+                        yield 'work.requeue', {'plan_id':plan['id']}
+                        return
+                    except DeferredAnalysis as error:
+                        yield 'analysis.suspended', {'dependency_id':str(error),'step_key':run['step_key']}
+                        return
+                    except strategy.ChangedSource as change:
+                        strategy.invalidate(self.store,plan,change.path)
+                        yield 'work.requeue', {'plan_id':plan['id']}
+                        return
+                    except (ValueError, OSError) as error:
+                        yield 'work.pause', {'plan_id':plan['id'],'reason':str(error)}
+                        return
+                if plan:
+                    work_budget = WorkBudget(self.store,plan['id'],attempt,tools)
+                    middleware.insert(-2,work_budget)
+                    start_revision = self.store.query('SELECT revision FROM analyses WHERE id=?',(analysis.id,))[0]['revision']
         async with self.checkpoint_provider.open() as saver:
             internal_files=FilesystemMiddleware(
                 tools=['read_file'],
@@ -176,11 +271,11 @@ class DeepAgentRuntime:
             )
             agent=create_deep_agent(
                 model=model,tools=tools,checkpointer=saver,
-                middleware=[internal_files, *middleware],
+                middleware=middleware if location else [internal_files, *middleware],
                 system_prompt=(
                     '你是 Artorias 个人助理。'
                     + file_guidance +
-                    ('分析工具会校验来源范围和权限。' if analysis else
+                    ('搜索工具会校验读取权限。' if location else '分析工具会校验来源范围和权限。' if analysis else
                      '用 project_write 或 project_edit 修改文件。相对路径走已绑定的本机或云端工作空间。'
                      '用户给出本机绝对路径时保留它。拒绝授权后不得重复申请。'
                      '用 project_move 移动或改名本机文件，提供完整目标文件路径。'
@@ -197,6 +292,8 @@ class DeepAgentRuntime:
             seen_results=set()
             if run.get('decision'):
                 previous=await agent.aget_state(config)
+                if location and not previous.interrupts:
+                    payload = {'messages': messages}
                 for msg in previous.values.get('messages',[]):
                     if msg.type=='ai':
                         seen_calls.update(call['id'] for call in msg.tool_calls if call.get('id') and call.get('name'))
@@ -237,7 +334,7 @@ class DeepAgentRuntime:
                     if mode=='messages':
                         msg,_=chunk
                         text=text_content(msg.content) if msg.type in ('ai','AIMessageChunk') else ''
-                        if text:yield 'assistant.delta',{'text':text}
+                        if text and not location:yield 'assistant.delta',{'text':text}
                         continue
                     result=chunk
                     for msg in chunk.get('messages',[]):
@@ -254,6 +351,8 @@ class DeepAgentRuntime:
                             seen_results.add(msg.tool_call_id)
                             if msg.tool_call_id not in detailed_results:
                                 yield 'tool.result',{'call_id':msg.tool_call_id,'name':msg.name,'status':msg.status,'content':msg.content}
+            except LocationReady:
+                pass
             except WorkUnitReady:
                 strategy.finish_group(self.store,plan,unit,attempt,analysis,'')
                 yield 'work.requeue', {'plan_id':plan['id']}
@@ -261,6 +360,9 @@ class DeepAgentRuntime:
             except (EndOfAttempt, RequestTooLarge, TimeoutError) as error:
                 if not plan:
                     raise
+                if location:
+                    yield 'work.pause', {'plan_id': plan['id'], 'reason': f'文件定位已暂停（{type(error).__name__}）'}
+                    return
                 current = self.store.query('SELECT revision FROM analyses WHERE id=?',(analysis.id,))[0]['revision']
                 if current > start_revision:
                     yield 'work.requeue', {'plan_id':plan['id']}
@@ -274,7 +376,15 @@ class DeepAgentRuntime:
                 strategy.invalidate(self.store,plan,change.path)
                 yield 'work.requeue', {'plan_id':plan['id']}
                 return
+            except MissingSourcePath as missing:
+                path = str(missing)
+                strategy.schedule_file_location(self.store, plan, path, candidate_scopes(path, location_context))
+                yield 'work.requeue', {'plan_id': plan['id']}
+                return
             except (DeferredAnalysis, GraphRecursionError) as error:
+                if location and isinstance(error, GraphRecursionError):
+                    yield 'work.pause', {'plan_id': plan['id'], 'reason': '文件定位已达到执行轮次上限'}
+                    return
                 if analysis is None:
                     raise
                 if self.store.query("SELECT 1 FROM analysis_executions WHERE run_id=? AND state='side_effect'", (run['id'],)):
@@ -312,6 +422,30 @@ class DeepAgentRuntime:
                     if isinstance(i.value,dict) else {'request_id':i.id,'value':i.value}
                     for i in pending
                 ]}
+                return
+            if location:
+                location_state = location.state()
+                selection = location_state.get('selection')
+                if selection and selection.get('path'):
+                    strategy.finish_location(self.store, plan, unit, attempt, selection['path'])
+                    yield 'work.requeue', {'plan_id': plan['id']}
+                    return
+                if selection is None:
+                    selection = location.clarification(location_state)
+                    location_state['selection'] = selection
+                    with self.store.tx() as db:
+                        location.save(db, location_state)
+                reason = selection['error']
+                scope = run['task_context']['execution_scope']
+                criteria = run['task_context']['effective_requirements']['criteria']
+                required = set(scope['criterion_refs']) or {key for key, rule in criteria.items() if rule['required']}
+                required.update(key for key, rule in scope['local_reviews'].items() if rule['required'])
+                yield 'step.submitted', FinishStep(
+                    step_outcome='blocked', final_text=reason,
+                    criterion_claims=[{'id': key, 'claim': 'unmet', 'reason': '尚未定位文档。'}
+                                      for key in sorted(required)],
+                ).model_dump()
+                yield 'assistant.final', {'text': reason}
                 return
             text=''
             if result:

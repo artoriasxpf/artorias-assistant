@@ -165,7 +165,12 @@ def observation(info):
 
 def file_observation(workspace, relative):
     with _open_relative(workspace.root, workspace.path(relative), directory=False) as fd:
-        return observation(os.fstat(fd))
+        info = os.fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            raise IsADirectoryError(relative)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("需要普通文件")
+        return observation(info)
 
 
 def read_range(workspace, relative, *, offset, limit, expected_version=None):

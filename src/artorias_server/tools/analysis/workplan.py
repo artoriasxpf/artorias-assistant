@@ -46,7 +46,7 @@ def schedule_next(db, plan):
     )
     if any(unit["status"] != "completed" for unit in units):
         return
-    layer = [u["id"] for u in units if u["kind"] != "inventory"]
+    layer = [u["id"] for u in units if u["kind"] not in ("inventory", "locate_file")]
     if not layer:
         layer = [u["id"] for u in units]
     while len(layer) > 6:
@@ -169,6 +169,8 @@ def finish_group(store, plan, unit, attempt, session, summary):
             inputs["skipped"] = skipped
             db.execute("UPDATE work_units SET inputs=? WHERE id=?", (json.dumps(inputs), unit["id"]))
         if more:
+            if inputs.get("relocated"):
+                more["relocated"] = True
             add_unit(db, plan["id"], "read_group", more, [unit["id"]])
         if unit["kind"] == "reduce":
             db.execute(
@@ -368,6 +370,14 @@ def coverage(store, plan):
     )
 
 
+def document_roots(store, plan):
+    rows = store.query(
+        """SELECT inputs FROM work_units WHERE plan=? AND kind='read_group' AND status!='obsolete'
+           ORDER BY ordinal""", (plan["id"],),
+    )
+    return list(dict.fromkeys(path for row in rows for path in json.loads(row["inputs"])["paths"]))
+
+
 def invalidate(store, plan, path):
     """Keep unrelated files' committed notes; discard summaries derived from the old version."""
     with store.tx() as db:
@@ -408,6 +418,35 @@ def invalidate(store, plan, path):
         event(db, plan, "work.source.changed", path=path)
 
 
+def schedule_file_location(store, plan, path, scopes):
+    """Locate a moved document while retaining the previous read receipts for audit."""
+    from artorias_server.work.repository import event
+
+    with store.tx() as db:
+        units = db.execute(
+            """SELECT id FROM work_units WHERE plan=? AND status!='obsolete' AND
+               (kind IN ('reduce','synthesis') OR (kind='read_group' AND EXISTS
+                (SELECT 1 FROM json_each(inputs,'$.paths') WHERE value=?)))""",
+            (plan["id"], path),
+        ).fetchall()
+        for (unit_id,) in units:
+            db.execute("UPDATE work_units SET status='obsolete' WHERE id=?", (unit_id,))
+            db.execute(
+                "UPDATE work_attempts SET status='invalidated' WHERE unit=? AND status='running'", (unit_id,),
+            )
+        add_unit(db, plan["id"], "locate_file", {"reference": path, "scopes": scopes, "relocated": True})
+        event(db, plan, "work.source.changed", path=path)
+
+
+def finish_location(store, plan, unit, attempt, path):
+    with store.tx() as db:
+        complete_unit(db, plan, unit, attempt, path, None)
+        inputs = {"paths": [path]}
+        if json.loads(unit["inputs"]).get("relocated"):
+            inputs["relocated"] = True
+        add_unit(db, plan["id"], "read_group", inputs, [unit["id"]])
+
+
 def next_ranges(session):
     """One contiguous authorized byte range per file; never count metadata as content."""
     spec = session.run["work_inputs"]
@@ -427,6 +466,7 @@ def next_ranges(session):
                 "binary",
                 "encoding",
                 "unsupported",
+                "not_found",
                 "unreadable",
                 "special_file",
                 "invalid_utf8_range",

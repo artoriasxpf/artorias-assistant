@@ -17,8 +17,10 @@ class EndOfAttempt(Exception):
 
 
 class WorkBudget(AgentMiddleware):
-    def __init__(self, store, plan, attempt, tools):
-        self.allowed = {t.name for t in tools} | {"read_file"}
+    def __init__(self, store, plan, attempt, tools, *, internal_read=True):
+        self.allowed = {t.name for t in tools}
+        if internal_read:
+            self.allowed.add("read_file")
         self.store = store
         self.plan = plan
         self.attempt = attempt

@@ -3,6 +3,7 @@ from .verification import assess
 from .repository import TaskRepository
 from .context import ContextBuilder
 from .planner import TaskPlanner
+from .reply import compose_reply, fallback_reply, needs_composition
 import asyncio
 import json
 from contextlib import aclosing
@@ -38,6 +39,13 @@ class TaskRuntime:
             return
         steps=self.store.query('SELECT * FROM task_steps WHERE run=? ORDER BY rowid',(run['id'],))
         results=[]
+        def record(step, text, outcome):
+            scope = json.loads(step['scope'])
+            results.append({
+                'key': step['key'], 'text': text, 'outcome': outcome,
+                'dependencies': [*scope['depends_on'], *(item['step_key'] for item in scope['step_spec']['wait_for'])],
+            })
+
         delivered=set()
         pending=False
         waiting_keys = {row['step_key'] for row in self.store.query(
@@ -48,15 +56,16 @@ class TaskRuntime:
             if step['status']=='needs_replan':
                 continue
             if step['status']=='delivered':
-                results.append(step['result'])
-                if json.loads(step['result_json'])['submitted']['step_outcome']=='completed':
+                outcome = json.loads(step['result_json'])['submitted']['step_outcome']
+                record(step, step['result'], outcome)
+                if outcome=='completed':
                     delivered.add(step['key'])
                 continue
             gates=self.store.query('SELECT state FROM task_step_waits WHERE run=? AND consumer=?',(run['id'],step['key']))
             if any(g['state']=='needs_replan' for g in gates):
                 with self.store.tx() as c:
                     c.execute("UPDATE task_steps SET status='needs_replan' WHERE run=? AND key=?",(run['id'],step['key']))
-                results.append('验收未通过或已失效，请按反馈修改后继续。')
+                record(step, '验收未通过或已失效，请按反馈修改后继续。', 'blocked')
                 yield 'task.needs_replan',{'key':step['key'],'task_id':step['task']}
                 continue
             if any(g['state']=='pending' for g in gates) or set(json.loads(step['scope'])['depends_on'])-delivered:
@@ -113,7 +122,7 @@ class TaskRuntime:
                     c.execute("UPDATE task_steps SET status='waiting' WHERE run=? AND key=?",(run['id'],step['key']))
                 yield 'approval.requested',approval
                 return
-            results.append(submission.final_text)
+            record(step, submission.final_text, submission.step_outcome)
             if submission.step_outcome=='completed':
                 delivered.add(step['key'])
             yield 'task.delivered',{'task_id':step['task'],'key':step['key'],'text':submission.final_text,
@@ -124,4 +133,11 @@ class TaskRuntime:
         if pending:
             yield 'task.awaiting_review',{}
             return
-        yield 'assistant.final',{'text':'\n\n'.join(results)}
+        model_factory = getattr(self.engine, 'model_factory', None)
+        if model_factory and needs_composition(run['input'], results):
+            def emit(kind, payload):
+                self.store.emit(run['session'], run['id'], kind, payload)
+            text = await compose_reply(model_factory, run, results, emit)
+        else:
+            text = fallback_reply(results)
+        yield 'assistant.final', {'text': text}
