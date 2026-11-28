@@ -1,3 +1,5 @@
+from urllib.parse import urlsplit
+
 from .settings import ModelSettings
 
 def create_model(settings: ModelSettings | None = None):
@@ -14,3 +16,14 @@ def create_model(settings: ModelSettings | None = None):
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(**kwargs,max_tokens=settings.max_tokens)
     raise ValueError("Unsupported model provider: "+settings.provider)
+
+
+def prefer_json_object(model):
+    """Request native JSON output on endpoints with known support."""
+    from .deepseek import DeepSeekChatModel
+
+    if isinstance(model, DeepSeekChatModel):
+        hostname = urlsplit(str(model.openai_api_base)).hostname
+        if hostname == 'api.deepseek.com':
+            return model.bind(response_format={'type': 'json_object'})
+    return model

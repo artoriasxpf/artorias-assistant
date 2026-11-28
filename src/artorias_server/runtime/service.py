@@ -20,6 +20,11 @@ class DeepAgentRuntime:
         self.workspace_factory = workspace_factory if workspace_factory is not None else WorkspaceFactory(store)
         self.model_factory = model_factory if model_factory is not None else create_model
         self.checkpoint_provider = checkpoint_provider if checkpoint_provider is not None else SQLiteCheckpointProvider(data/'checkpoints.sqlite')
+        if tool_factory is None and os.getenv('ARTORIAS_RUNNER_ROUTES'):
+            from functools import partial
+            from artorias_server.tools.execution_service import ExecutionService
+            self.execution_service = ExecutionService(data,store)
+            tool_factory = partial(build_tools, execution_service=self.execution_service)
         self.tool_factory = tool_factory if tool_factory is not None else build_tools
     async def execute(self,run):
         ws=self.workspace_factory(run)
@@ -82,7 +87,7 @@ class DeepAgentRuntime:
 
             @tool(args_schema=FinishStep, return_direct=True)
             def finish_step(**kwargs):
-                """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional."""
+                """Deliver final_text. For applicable criteria give id, claim and a plain-language reason. File deliveries are optional. Milestones and blocker changes may cite response, a declared delivery, or a saved execution ID from this step."""
                 if analysis and analysis.repo.pending(analysis.id):
                     raise ValueError("请先调用 record_analysis_note 提交当前批次，再交付")
                 submission = validate_submission(kwargs)
@@ -90,7 +95,7 @@ class DeepAgentRuntime:
                 return submission.final_text
 
             tools.append(finish_step)
-            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对 criterion_refs 指定的标准和必选 local_reviews 填写 id、claim 和自然语言 reason。未指定 criterion_refs 时填写快照中全部必选标准。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
+            messages[0]['content'] += ' 当前任务结束时必须单独调用 finish_step，提交 final_text、step_outcome。根据本步目标、相关历史交互和实际工具结果，对 criterion_refs 指定的标准和必选 local_reviews 填写 id、claim 和自然语言 reason。未指定 criterion_refs 时填写快照中全部必选标准。没有足够依据时填 partial 或 unmet。普通文字无需证据编号或 deliveries。milestones 和 blocker_changes 的 evidence_refs 默认使用 response，也可引用本步工具返回的 execution_id。显式要求用户审阅文件时，使用发布工具返回的 artifact_id 并声明 deliveries。'
 
         thread_id=run.get('thread_id',run['id'])
         analysis = None
@@ -180,7 +185,7 @@ class DeepAgentRuntime:
                      '用户给出本机绝对路径时保留它。拒绝授权后不得重复申请。'
                      '用 project_move 移动或改名本机文件，提供完整目标文件路径。'
                      '覆盖已有文件前先读取。批量替换或补丁先用 project_change_plan 预览，再用 project_change_apply 应用。'
-                     '执行 Python 用 run_python，等待用户审批。')
+                     '执行 Python 用 run_python。就地读取用 workspace_ro，直接修改用 workspace_rw；可用时用 run_command 执行受限命令，等待审批。')
                     + '不要声称未实际执行的操作成功。不要自行拆分业务 Task。'
                 ),
             )

@@ -234,10 +234,13 @@ def deliver_result(c, search, run, step, result, evidence, verdicts):
         applied_revision=step["applied_revision"],
         submitted=submitted,
         final_hash=digest(result.final_text),
-        verified_deliveries=evidence,
+        verified_deliveries={key: value for key, value in evidence.items() if "artifact_id" in value},
         initial_assessment_ids=assessment_ids,
         merge_status="applied" if applicable else "historical_only",
     )
+    execution_refs = {key: value for key, value in evidence.items() if "artifact_id" not in value}
+    if execution_refs:
+        envelope["verified_executions"] = execution_refs
     c.execute(
         "UPDATE task_steps SET status='delivered',result=?,result_json=? WHERE run=? AND key=?",
         (result.final_text, dump(envelope), run["id"], step["key"]),

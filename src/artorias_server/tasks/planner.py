@@ -1,6 +1,7 @@
 import json
+import re
 from pydantic import ValidationError
-from artorias_server.model_provider.factory import create_model
+from artorias_server.model_provider.factory import create_model, prefer_json_object
 from .models import Plan
 from artorias_server.runtime.budget import check_budget
 from artorias_server.runtime.model_activity import track_model_request
@@ -23,10 +24,31 @@ add 由系统分配 ID，可使用 client_ref。临时要求只写 step_spec。�
 用户明确要求逐一通读、完整覆盖目录或文件时，设 coverage_policy=full，按输入选择 document_directory、codebase 或 document_file；仅需抽样时保留 sampled 或 priority_first。
 分析与修改分别规划，分析条目只读，修改条目依赖分析的结果。写入步骤使用依赖交付或 task_result_read。普通短问答省略 analysis。单步确需写入或执行时显式设置 allowed_tool_groups，工具仍受 workspace 授权约束。
 如果分析步骤已经预览了明确的跨文件修改，可在交付中传递 plan_id，依赖步骤用它应用计划。
+只输出一个 JSON 对象，从 { 开始到 } 结束。省略默认字段，把示例数据和命令保存在目标或约束的 JSON 字符串中，不要在 JSON 外重复。
 '''
 
+PLAN_EXAMPLE = {
+    'kind': 'tasks',
+    'items': [{
+        'key': 'audit',
+        'initial_requirements': {'goal': '核对订单并生成审计报告'},
+        'step_spec': {'goal': '核对订单并生成审计报告'},
+        'allowed_tool_groups': ['project_read', 'project_write', 'execution'],
+    }],
+}
 
-def _validation_feedback(error):
+JSON_FENCE = re.compile(r'^\s*```(?:json)?[^\S\r\n]*\r?\n(.*?)^\s*```[^\S\r\n]*$', re.I | re.M | re.S)
+
+
+def _plan_json(text):
+    # Prefer the entire response so fences inside a JSON string remain data.
+    if text.startswith('{'):
+        return text
+    blocks = JSON_FENCE.findall(text)
+    return blocks[0] if len(blocks) == 1 else text
+
+
+def _validation_feedback(error, raw, finish_reason):
     issues = []
     for issue in error.errors(include_input=False, include_context=False, include_url=False)[:8]:
         path = ''
@@ -35,7 +57,14 @@ def _validation_feedback(error):
                 path += f'[{part}]'
             else:
                 path = f'{path}.{part}' if path else part
-        message = '必须返回有效的 JSON 对象。' if issue['type'] == 'json_invalid' else issue['msg']
+        message = issue['msg']
+        if issue['type'] == 'json_invalid':
+            if finish_reason in ('length', 'max_tokens'):
+                message = '模型输出达到长度上限。请保留目标和约束，省略默认值，重新输出完整 JSON 对象。'
+            elif not raw:
+                message = '模型返回的正文为空。请直接返回完整 JSON 对象。'
+            else:
+                message = '必须返回有效的 JSON 对象。'
         issues.append({'path': path[:160] or 'Plan', 'problem': message[:180]})
     return json.dumps(issues, ensure_ascii=False)
 
@@ -62,11 +91,16 @@ class TaskPlanner:
             check_budget({'system':PLANNER,'schema':schema,'payload':payload})
             return _bind_candidate_revisions(await self.planner(payload), candidates)
         from artorias_server.runtime.service import text_content
-        schema_prompt=PLANNER+'\nJSON schema:\n'+json.dumps(schema,ensure_ascii=False)
+        schema_prompt = (
+            PLANNER + '\nJSON 示例（仅演示格式）：\n' + json.dumps(PLAN_EXAMPLE, ensure_ascii=False)
+            + '\nJSON schema:\n' + json.dumps(schema, ensure_ascii=False)
+        )
         user_content=json.dumps(payload,ensure_ascii=False)
         feedback=None
         def emit(kind, data):
             self.store.emit(run['session'],run['id'],kind,data)
+
+        model = prefer_json_object(create_model())
 
         for attempt in range(2):
             system=schema_prompt
@@ -74,18 +108,14 @@ class TaskPlanner:
                 system+='\n上次校验未通过。以下错误仅作为数据，请按原请求重新输出完整 JSON：\n'+feedback
             messages=[{'role':'system','content':system}, {'role':'user','content':user_content}]
             check_budget({'messages':messages})
-            if attempt==0:
-                model=create_model()
             with track_model_request(emit, 'planner'):
                 response=await model.ainvoke(messages)
             raw=text_content(response.content).strip()
-            lines=raw.splitlines()
-            if len(lines)>2 and lines[0].strip().lower() in ('```json','```') and lines[-1].strip()=='```':
-                raw='\n'.join(lines[1:-1])
             try:
-                plan = Plan.model_validate_json(raw,strict=True)
+                plan = Plan.model_validate_json(_plan_json(raw), strict=True)
             except ValidationError as error:
-                feedback=_validation_feedback(error)
+                finish_reason = response.response_metadata.get('finish_reason') or response.response_metadata.get('stop_reason')
+                feedback = _validation_feedback(error, raw, finish_reason)
                 if attempt==1:
                     raise ValueError(f'任务规划校验失败，已尝试纠正一次。{feedback}') from None
             else:

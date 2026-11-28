@@ -239,7 +239,8 @@ def test_artifact_api_ownership(tmp_path):
         assert client.get(path.replace(ws.session,other),headers=headers).status_code==404
 
 
-def test_real_graph_approval_resume_publishes_once(tmp_path):
+@pytest.mark.parametrize('entry', [{'path':'script.py'}, {'code':'print("内联")'}], ids=['path','code'])
+def test_real_graph_approval_resume_publishes_once(tmp_path, entry):
     from functools import partial
     from langchain_core.messages import AIMessage
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
@@ -247,21 +248,52 @@ def test_real_graph_approval_resume_publishes_once(tmp_path):
     from artorias_server.tools.registry import build_tools
     class Model(GenericFakeChatModel):
         def bind_tools(self,*args,**kwargs):return self
-    backend=Backend(lambda p,r:(r/'outputs/a.bin').write_bytes(b'\x00\xff'))
+    def write_output(plan, root):
+        assert (root/'app/__entry__.py').read_text() == entry.get('code', 'print(42)')
+        (root/'outputs/a.bin').write_bytes(b'\x00\xff')
+
+    backend=Backend(write_output)
     ws,service,db=setup(tmp_path,backend)
     run=db.query('SELECT * FROM runs')[0]
     model=Model(disable_streaming=True,messages=iter([
-        AIMessage(content='',tool_calls=[{'name':'run_python','args':{'path':'script.py','args':['hello world'],'output':{'target':'out'}},'id':'actual-call','type':'tool_call'}]),
+        AIMessage(content='',tool_calls=[{'name':'run_python','args':{**entry,'args':['hello world'],'output':{'target':'out'}},'id':'actual-call','type':'tool_call'}]),
         AIMessage(content='saved')]))
     engine=DeepAgentRuntime(tmp_path/'data',db,workspace_factory=lambda r:ws,model_factory=lambda:model,tool_factory=partial(build_tools,execution_service=service))
     async def collect(r):return [x async for x in engine.execute(r)]
     first=asyncio.run(collect(run))
     assert first[-1][0]=='approval.requested' and backend.calls==0
-    assert first[-1][1]['requests'][0]['output']['target']=='out'
+    approval = first[-1][1]['requests'][0]
+    assert approval['output']['target']=='out'
+    if 'code' in entry:
+        import hashlib
+        assert approval['path'] == '内联 Python 代码'
+        assert approval['script_sha256'] == hashlib.sha256(entry['code'].encode()).hexdigest()
+        assert approval['inputs'] == []
     db.finish(run,'waiting',approval=first[-1][1]);db.decide(run['id'],'approve')
     second=asyncio.run(collect(db.claim()))
     assert second[-1][0]=='assistant.final' and backend.calls==1
     assert ws.read_bytes('out/a.bin')==b'\x00\xff'
+
+
+def test_inline_code_revalidates_staging_and_rejects_changed_request(tmp_path):
+    backend = Backend()
+    ws, service, _ = setup(tmp_path, backend)
+    request = {'code': 'print(42)', 'output': {'publish': 'stage_only'}}
+    plan = service.prepare(ws, 'call', request)
+    assert service.prepare(ws, 'call', request) == plan
+    with pytest.raises(ValueError, match='同一工具调用参数发生变化'):
+        service.prepare(ws, 'call', {**request, 'code': 'print(43)'})
+    entry = service.root / plan['id'] / 'app/__entry__.py'
+    entry.write_text('print(43)')
+    assert execute(service, ws, plan)['execution_status'] == 'stale_plan'
+    assert backend.calls == 0
+
+
+@pytest.mark.parametrize('entry', [{}, {'path': 'script.py', 'code': 'print(42)'}, {'code': ' '},
+                                  {'code': '字' * 21846}])
+def test_inline_code_requires_one_valid_entrypoint(entry):
+    with pytest.raises(ValueError):
+        PythonRequest.model_validate(entry)
 
 
 def test_cancel_records_state_and_no_publication(tmp_path):

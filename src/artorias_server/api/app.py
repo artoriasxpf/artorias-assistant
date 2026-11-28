@@ -3,7 +3,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -178,12 +178,34 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
     def revert(sid:str,cid:str):
         store.require(sid);return {'id':WorkspaceService(store,sid,registry=registry).revert(cid)}
     @app.get('/api/sessions/{sid}/executions/{eid}')
-    def execution(sid:str,eid:str):
+    async def execution(sid:str,eid:str):
         from artorias_server.storage.executions import ExecutionRepository
         store.require(sid)
         row=ExecutionRepository(store).get(eid)
         if not row or row['session_id']!=sid:raise KeyError(eid)
+        if row['status']=='running' and 'runner' in row['plan']:
+            from artorias_server.tools.workspace_execution import configured_runners
+            import httpx
+            plan = row['plan']
+            client = configured_runners().get((plan['kind'],plan['location_id']))
+            if client:
+                try:
+                    result = await client.status(eid)
+                except (httpx.HTTPError,ValueError):
+                    return {'id':eid,'status':'unknown','result':{'error':'暂时无法联系执行器'}}
+                if result['execution_status'] not in ('running','prepared','unknown'):
+                    ExecutionRepository(store).save(eid,'completed',result)
+                    return {'id':eid,'status':'completed','result':result}
+                return {'id':eid,'status':result['execution_status'],'result':result}
         return {'id':eid,'status':row['status'],'result':row['result']}
+
+    def runner_file(row, resource):
+        from artorias_server.tools.workspace_execution import configured_runners
+        plan = row['plan']
+        runner = configured_runners().get((plan['kind'],plan['location_id']))
+        if not runner:
+            raise ConnectorUnavailable('执行器未连接')
+        return runner.fetch(row['id'],resource)
 
     @app.get('/api/sessions/{sid}/executions/{eid}/logs')
     def execution_logs(sid:str,eid:str):
@@ -191,6 +213,9 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
         store.require(sid)
         row=ExecutionRepository(store).get(eid)
         if not row or row['session_id']!=sid:raise KeyError(eid)
+        if 'runner' in row['plan']:
+            result = row['result'] or {}
+            return PlainTextResponse('STDOUT\n'+result.get('stdout_tail','')+'\nSTDERR\n'+result.get('stderr_tail',''))
         path=Path(data)/'executions'/row['id']/'logs.txt'
         if not path.is_file():raise FileNotFoundError(eid)
         return FileResponse(path,filename='python-logs.txt',media_type='text/plain',headers={'X-Content-Type-Options':'nosniff'})
@@ -204,6 +229,12 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
         items=(row['result'] or {}).get('artifacts',[])
         item=next((x for x in items if x['id']==aid and x['action']=='write'),None)
         if item is None:raise KeyError(aid)
+        if 'runner' in row['plan']:
+            content = runner_file(row, 'artifacts/'+item['id'])
+            if hashlib.sha256(content).hexdigest() != item['sha256']:
+                raise ValueError('远程产物校验失败')
+            return Response(content,media_type='application/octet-stream',
+                            headers={'X-Content-Type-Options':'nosniff','Content-Disposition':'attachment'})
         path=Path(data)/'executions'/row['id']/'artifacts'/item['id']
         return FileResponse(path,filename=Path(item['path']).name,media_type='application/octet-stream',headers={'X-Content-Type-Options':'nosniff'})
 

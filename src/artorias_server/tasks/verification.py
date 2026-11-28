@@ -88,15 +88,44 @@ def resolve(store, run, step, result):
         or len(evidence) != 1 + len(roles)
     ):
         raise ValueError("Invalid, duplicate or unpublished delivery")
+    delivery_refs = set(evidence)
     spec = json.loads(step["scope"])["step_spec"]
     rules = json.loads(step["effective_requirements"])["criteria"]
     local = spec["local_reviews"]
-    for entry in [
-        *result.milestones,
-        *result.blocker_changes,
-    ]:
-        if set(entry.evidence_refs) - evidence.keys():
-            raise ValueError("Unknown evidence reference")
+    references = {
+        ref
+        for entry in [*result.milestones, *result.blocker_changes]
+        for ref in entry.evidence_refs
+    }
+    missing_refs = references - evidence.keys()
+    if missing_refs and store.query(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='python_executions'"
+    ):
+        # An execution receipt can support a milestone or blocker update even
+        # when the script produced no file to declare as a delivery.
+        placeholders = ",".join("?" for _ in missing_refs)
+        receipts = store.query(
+            f"""SELECT id,result FROM python_executions WHERE session_id=? AND run_id=?
+                AND task_id=? AND task_step_id=? AND id IN ({placeholders})""",
+            (run["session"], run["id"], step["task"], step["key"], *sorted(missing_refs)),
+        )
+        for row in receipts:
+            receipt = json.loads(row["result"]) if row["result"] else {}
+            status = receipt.get("execution_status")
+            if status in ("succeeded", "failed", "timed_out"):
+                evidence[row["id"]] = {
+                    "role": "execution",
+                    "execution_id": row["id"],
+                    "execution_status": status,
+                    "exit_code": receipt.get("exit_code"),
+                    "version": digest(row["result"]),
+                }
+    unknown = references - evidence.keys()
+    if unknown:
+        raise ValueError(
+            "无法验证本步骤的 evidence_refs：" + ", ".join(sorted(unknown)[:5])
+            + "。可使用 response、本次已声明的交付 ID 或本步骤已结束的执行 ID。"
+        )
     claim_ids = {claim.id for claim in result.criterion_claims}
     if len(claim_ids) != len(result.criterion_claims):
         raise ValueError("Duplicate claim")
@@ -111,7 +140,7 @@ def resolve(store, run, step, result):
         rule = local.get(claim.id) or rules.get(claim.id)
         if not rule or (claim.id not in local and spec["criterion_refs"] and claim.id not in spec["criterion_refs"]):
             raise ValueError("Criterion outside this step")
-        if rule["verification"]["method"] == "user" and claim.artifact_id and claim.artifact_id not in evidence:
+        if rule["verification"]["method"] == "user" and claim.artifact_id and claim.artifact_id not in delivery_refs:
             raise ValueError("Criterion refers to an undeclared delivery")
     return evidence, rules, local
 

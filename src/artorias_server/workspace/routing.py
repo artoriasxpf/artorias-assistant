@@ -79,7 +79,7 @@ class WorkspaceService:
         boundary = Path(grant['root'])
         if grant.get('resource_kind') == 'file':
             boundary = boundary.parent
-        routed=dict(w,root=str(boundary))
+        routed=dict(w,root=str(boundary),execution_root=w['root'])
         if directory:routed['create_root']=create_default
         connector=self.registry.get(w['kind'],w['location_id'])
         ws=connector.open(routed,WorkspaceContext(self.session,self.run,self.task))

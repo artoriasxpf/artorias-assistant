@@ -173,3 +173,36 @@ def test_planner_rejects_program_verification():
 
     with pytest.raises(ValidationError):
         Criterion(text="发布文件", verification={"method": "program", "rule": "published"})
+
+
+def test_finish_step_can_reference_only_its_own_execution_receipt(tmp_path):
+    import json
+    import pytest
+    from artorias_server.storage.executions import ExecutionRepository
+    from artorias_server.storage.sqlite import Store
+    from artorias_server.tasks.models import FinishStep
+    from artorias_server.tasks.verification import resolve
+
+    store = Store(tmp_path / "app.sqlite")
+    executions = ExecutionRepository(store)
+    run = {"id": "run", "session": "session"}
+    step = {
+        "key": "step", "task": "task",
+        "scope": json.dumps({"step_spec": {"local_reviews": {}, "criterion_refs": []}}),
+        "effective_requirements": json.dumps({"criteria": {}}),
+    }
+    for eid, step_key in [("exec_current", "step"), ("exec_other", "other_step")]:
+        executions.install({"id": eid, "context": {
+            "session": "session", "run": "run", "task": "task", "step": step_key, "call": eid,
+        }, "request_hash": eid})
+        executions.save(eid, "completed", {"execution_status": "succeeded", "exit_code": 0})
+    submission = FinishStep.model_validate({
+        "step_outcome": "completed", "final_text": "脚本成功执行",
+        "blocker_changes": [{"op": "resolve", "id": "setup", "text": "已恢复",
+                             "evidence_refs": ["exec_current"]}],
+    })
+    evidence, _, _ = resolve(store, run, step, submission)
+    assert evidence["exec_current"]["execution_status"] == "succeeded"
+    submission.blocker_changes[0].evidence_refs = ["exec_other"]
+    with pytest.raises(ValueError, match="exec_other"):
+        resolve(store, run, step, submission)

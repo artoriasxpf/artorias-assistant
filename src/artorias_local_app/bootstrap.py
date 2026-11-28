@@ -23,7 +23,7 @@ def build_registry(store):
     catalog = WorkspaceCatalog(store)
     journal = SQLiteWorkspaceJournal(store.path)
     registry = ConnectorRegistry(changes=journal)
-    local = LocalFilesystemConnector(journal)
+    local = LocalFilesystemConnector(journal,runner_data=catalog.data/'workspace-runner')
     registry.register('device_fs', catalog.device_id, local)
     registry.register('cloud_storage', 'cloud-default', ManagedCloudConnector(local))
     return registry
@@ -48,8 +48,32 @@ def create_engine(data, store, *, cloud_python_backend=None, **kwargs):
         docker = DockerPythonBackend()
         native = selection == 'macos-venv' or (selection == 'auto' and sys.platform == 'darwin')
         backend = MacOSVenvPythonBackend(Path(data) / 'python-envs') if native else docker
+        if cloud_python_backend is None:
+            # The desktop development cloud connector stores its volume on this host.
+            cloud_python_backend = (MacOSVenvPythonBackend(Path(data)/'python-envs',location='cloud')
+                                    if native else DockerPythonBackend(location='cloud'))
         service = ExecutionService(data, store, backend, cloud_backend=cloud_python_backend,
                                    docker_backend=docker)
+        from artorias_device.tools.workspace_runner import WorkspaceRunner
+        catalog = WorkspaceCatalog(store)
+        def resolve_workspace(job):
+            record = catalog.get(job.workspace_id)
+            if (record['kind'],record['location_id']) != (job.kind,job.location_id):
+                raise ValueError('工作空间绑定位置发生变化')
+            if job.kind == 'cloud_storage':
+                base = Path(record['location_root']).resolve()
+                root = base / record['root']
+                if root.resolve() != root or not root.is_relative_to(base):
+                    raise ValueError('非法云工作目录')
+                root.mkdir(parents=True, exist_ok=True)
+                return root
+            root = Path(record['root'])
+            if root == Path(data).resolve()/'workspaces'/'default':
+                root.mkdir(parents=True,exist_ok=True)
+            return root
+        runner = WorkspaceRunner(Path(data)/'workspace-runner',resolve_workspace)
+        service.runners.setdefault(('device_fs',catalog.device_id),runner)
+        service.runners.setdefault(('cloud_storage','cloud-default'),runner)
         kwargs['tool_factory']=partial(build_tools,execution_service=service)
     engine=DeepAgentRuntime(Path(data), store, **kwargs)
     engine.execution_service=locals().get('service')

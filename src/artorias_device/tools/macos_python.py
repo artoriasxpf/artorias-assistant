@@ -13,6 +13,13 @@ import tempfile
 
 
 SEATBELT = '/usr/bin/sandbox-exec'
+SYSTEM_READ_PATHS = (
+    '/System/Library', '/usr/lib', '/usr/share/locale',
+    # The loader can map the shared cache from the OS Cryptex on newer macOS.
+    '/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld',
+    '/private/preboot/Cryptexes/OS/System/Library/dyld',
+    '/System/Cryptexes/OS/System/Library/dyld',
+)
 PACKAGE = re.compile(r'[a-zA-Z0-9][a-zA-Z0-9._-]*(?:==[a-zA-Z0-9][a-zA-Z0-9.!+_-]*)?')
 BOOTSTRAP = """
 import errno, os, resource, runpy, socket, sys
@@ -58,18 +65,27 @@ class StageFailure(Exception):
         self.result = result
 
 
-def sandbox_profile(readable, writable, executable, *, install=False, fork=False):
+def sandbox_profile(readable, writable, executable, *, install=False, fork=False, bound_paths=()):
+    def policy_path(root):
+        # Workspace names were canonicalized and bound before approval. A replacement
+        # symlink must not expand the policy to the link target during launch.
+        path = Path(root)
+        return path if path in bound_paths else path.resolve()
+
     def paths(rule, roots, match='subpath'):
         return [
-            f'(allow {rule} ({match} {json.dumps(str(Path(root).resolve()), ensure_ascii=False)}))'
+            f'(allow {rule} ({match} {json.dumps(str(policy_path(root)), ensure_ascii=False)}))'
             for root in roots
         ]
 
-    ancestors = {str(parent) for root in [*readable, *writable, *executable]
-                 for parent in Path(root).resolve().parents}
+    read_paths = [*SYSTEM_READ_PATHS, *readable]
+    ancestors = {str(parent) for root in [*read_paths, *writable, *executable]
+                 for parent in policy_path(root).parents}
     return '\n'.join([
         '(version 1)', '(deny default)', '(allow sysctl-read)',
-        *paths('file-read*', ['/System/Library', '/usr/lib', '/usr/share/locale', *readable]),
+        *paths('file-read*', read_paths),
+        # dyld opens the root directory while locating the shared cache.
+        *paths('file-read-data', ['/'], 'literal'),
         *paths('file-read*', ['/dev/null', '/dev/urandom', '/dev/random', '/private/etc/localtime'], 'literal'),
         *paths('file-write-data', ['/dev/null'], 'literal'),
         *paths('file-read-metadata', sorted(ancestors), 'literal'),
@@ -87,7 +103,10 @@ class MacOSVenvPythonBackend:
     location = 'device'
     native = True
 
-    def __init__(self, cache):
+    def __init__(self, cache, *, location='device'):
+        if location not in ('device','cloud'):
+            raise ValueError('未知的 Python 执行位置')
+        self.location = location
         self.cache = Path(cache).resolve()
         self.active = {}
         self.environment_lock = asyncio.Lock()
@@ -157,6 +176,8 @@ class MacOSVenvPythonBackend:
                 exit_code=None, stderr_tail=str(exc),
             ) from exc
         if code:
+            if code < 0 and not stderr:
+                stderr = f'进程收到 {signal.strsignal(-code) or -code} 信号后终止，未输出错误日志。'
             raise StageFailure(
                 phase=phase, step=step, execution_status='failed', error_code='nonzero_exit',
                 exit_code=code, stdout_tail=stdout, stderr_tail=stderr, logs_truncated=truncated,
