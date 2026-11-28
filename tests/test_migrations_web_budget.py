@@ -37,9 +37,36 @@ def test_task_columns_grouped_on_fresh_database(tmp_path):
     from artorias_server.tasks.repository import TaskRepository
     db=Store(tmp_path/'app.sqlite')
     TaskRepository(db)
-    columns=[r['name'] for r in db.query('PRAGMA table_info(business_tasks)')]
+    columns=[r['name'] for r in db.query('PRAGMA table_info(tasks)')]
     assert columns[:6]==['id','session','source_task','goal','constraints','criteria']
     assert columns[-2:]==['created_at','updated_at']
+
+
+def test_rename_legacy_task_table_preserves_records_and_schema_objects(tmp_path):
+    path = tmp_path / 'app.sqlite'
+    original = Store(path)
+    TaskRepository(original)
+    with original.tx() as c:
+        c.execute("""INSERT INTO tasks(id,session,goal,constraints,criteria,status,revision)
+                     VALUES('task-1','session-1','goal','{}','{}','open',7)""")
+        expected = dict(c.execute("SELECT * FROM tasks").fetchone())
+        c.execute('DROP TRIGGER tasks_timestamps_insert')
+        c.execute('DROP TRIGGER tasks_timestamps_update')
+        c.execute('ALTER TABLE tasks RENAME TO business_tasks')
+        c.execute('CREATE TABLE task_reference(task TEXT REFERENCES business_tasks(id))')
+        c.execute("INSERT INTO task_reference VALUES('task-1')")
+
+    for _ in range(2):
+        store = Store(path)
+        TaskRepository(store)
+        task_tables = store.query("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('tasks','business_tasks')")
+        assert task_tables == [{'name': 'tasks'}]
+        assert store.query('SELECT * FROM tasks') == [expected]
+        assert store.query("SELECT name FROM pragma_index_list('tasks') WHERE name='task_session'")
+        assert {r['name'] for r in store.query("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='tasks'")} == {
+            'tasks_timestamps_insert', 'tasks_timestamps_update',
+        }
+        assert store.query('PRAGMA foreign_key_check') == []
 
 
 def test_checkpointer_timestamps(tmp_path):

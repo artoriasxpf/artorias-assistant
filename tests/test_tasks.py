@@ -34,13 +34,13 @@ def test_resume_dependencies_and_original_input(tmp_path):
     second=asyncio.run(collect(db.claim()))
     assert second[-1][1]['text']=='框架\n\n说明'
     assert len(calls)==3
-    assert all(x['status']=='needs_review' for x in db.query('SELECT * FROM business_tasks'))
+    assert all(x['status']=='needs_review' for x in db.query('SELECT * FROM tasks'))
     assert len(db.query('SELECT * FROM context_snapshots'))==2
 
 def test_refine_reuses_goal_and_context_budget(tmp_path):
     db,r=setup(tmp_path);repo=TaskRepository(db)
     repo.install(r,Plan(kind='tasks',items=[plan_item(key='a',goal='设计整个项目')]),[])
-    task=db.query('SELECT * FROM business_tasks')[0]
+    task=db.query('SELECT * FROM tasks')[0]
     db.finish(r,'completed','框架已设计')
     db.submit(r['session'],'细化各模块','two');r2=db.claim()
     repo.install(r2,Plan(kind='tasks',items=[plan_item(key='b',goal='细化模块',relation='refine',task_id=task['id'])]),repo.candidates(r['session'],'细化各模块'))
@@ -49,7 +49,7 @@ def test_refine_reuses_goal_and_context_budget(tmp_path):
     assert body['task']['goal']=='设计整个项目'
     assert body['execution_scope']['goal']=='细化模块'
     assert body['history']
-    assert len(db.query('SELECT * FROM business_tasks'))==1
+    assert len(db.query('SELECT * FROM tasks'))==1
     assert repo.candidates(db.session(),'项目')==[]
 
 def test_two_tasks_with_actual_deepagents(tmp_path, monkeypatch):

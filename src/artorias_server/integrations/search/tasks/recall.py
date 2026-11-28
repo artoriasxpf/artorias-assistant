@@ -17,13 +17,13 @@ def recall_candidates(store, index, session, text):
     with store.tx() as conn:
         explicit = []
         for task_id in dict.fromkeys(match.group().lower() for match in _TASK_ID.finditer(text)):
-            if conn.execute('SELECT 1 FROM business_tasks WHERE session=? AND id=?',
+            if conn.execute('SELECT 1 FROM tasks WHERE session=? AND id=?',
                             (session, task_id)).fetchone():
                 explicit.append(task_id)
                 if len(explicit) == 20:
                     break
         hits = remote_hits if remote else _keyword_hits(index, conn, session, text)
-        recent = conn.execute('''SELECT id FROM business_tasks WHERE session=?
+        recent = conn.execute('''SELECT id FROM tasks WHERE session=?
             ORDER BY updated_at DESC,rowid DESC LIMIT 8''', (session,)).fetchall()
         sources = {}
         for source, ids in (('explicit', explicit), ('keyword', [hit.id for hit in hits]),
@@ -34,7 +34,7 @@ def recall_candidates(store, index, session, text):
                     labels.append(source)
         candidates = []
         for task_id, labels in sources.items():
-            row = conn.execute('SELECT * FROM business_tasks WHERE session=? AND id=?',
+            row = conn.execute('SELECT * FROM tasks WHERE session=? AND id=?',
                                (session, task_id)).fetchone()
             if row is None:
                 continue

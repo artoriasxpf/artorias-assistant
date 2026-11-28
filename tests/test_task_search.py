@@ -39,7 +39,7 @@ def test_recall_beyond_200_order_sources_dedup_and_session(tasks):
     foreign = store.session()
     with store.tx() as conn:
         for i in range(215):
-            conn.execute('''INSERT INTO business_tasks(id,session,goal,constraints,criteria,status,updated_at)
+            conn.execute('''INSERT INTO tasks(id,session,goal,constraints,criteria,status,updated_at)
                 VALUES(?,?,?,'{}','{}','open',?)''',
                 (f'{i:032x}', foreign if i == 214 else session,
                  'quartz' if i in (0, 214) else 'unrelated', f'2026-01-01T00:00:00.{i:03}Z'))
@@ -90,7 +90,7 @@ def test_requirement_projection_and_delivery_updates(tasks, scope):
     row = store.query('SELECT * FROM text_search_documents WHERE document_id=?', (tid,))[0]
     assert len(row['body']) <= 1000
     assert 'beginword' in row['body']
-    assert store.query('SELECT summary FROM business_tasks WHERE id=?', (tid,))[0]['summary'] == row['body']
+    assert store.query('SELECT summary FROM tasks WHERE id=?', (tid,))[0]['summary'] == row['body']
     with pytest.raises(ValueError):
         deliver(repo,changed, step, 'duplicateignored')
     assert search(tasks, 'duplicateignored') == []
@@ -99,7 +99,7 @@ def test_requirement_projection_and_delivery_updates(tasks, scope):
 def test_write_failure_rolls_back_plan_and_delivery(tasks, monkeypatch):
     store, repo, session = tasks
     run, step = create(tasks)
-    before = store.query('SELECT summary,execution_count FROM business_tasks')[0]
+    before = store.query('SELECT summary,execution_count FROM tasks')[0]
     original = repo.search.index.upsert
 
     def fail(*args, **kwargs):
@@ -109,7 +109,7 @@ def test_write_failure_rolls_back_plan_and_delivery(tasks, monkeypatch):
     monkeypatch.setattr(repo.search.index, 'upsert', fail)
     with pytest.raises(RuntimeError, match='index failure'):
         deliver(repo,run, step, 'newsummary')
-    assert store.query('SELECT summary,execution_count FROM business_tasks')[0] == before
+    assert store.query('SELECT summary,execution_count FROM tasks')[0] == before
     assert store.query('SELECT status FROM task_steps')[0]['status'] == 'pending'
     assert search(tasks, 'newsummary') == []
     store.finish(run, 'completed')
@@ -117,7 +117,7 @@ def test_write_failure_rolls_back_plan_and_delivery(tasks, monkeypatch):
     failed_run = store.claim()
     with pytest.raises(RuntimeError, match='index failure'):
         repo.install(failed_run, Plan(kind='tasks', items=[plan_item(key='new', goal='newtask')]), [])
-    assert len(store.query('SELECT * FROM business_tasks')) == 1
+    assert len(store.query('SELECT * FROM tasks')) == 1
     assert not store.query('SELECT * FROM task_plans WHERE run=?', (failed_run['id'],))
     assert not store.query('SELECT * FROM task_steps WHERE run=?', (failed_run['id'],))
     assert search(tasks, 'newtask') == []
@@ -129,7 +129,7 @@ def test_first_build_restart_version_upgrade_and_manual_rebuild(tasks, tmp_path)
     # Simulate authoritative tasks predating deployment, and stale projection metadata.
     with store.tx() as conn:
         conn.execute('DELETE FROM text_search_collections')
-        conn.execute("UPDATE business_tasks SET goal='reindexedword'")
+        conn.execute("UPDATE tasks SET goal='reindexedword'")
     repo = TaskRepository(Store(store.path))
     tasks = store, repo, session
     assert search(tasks, 'reindexedword') == [step['task']]
@@ -137,12 +137,12 @@ def test_first_build_restart_version_upgrade_and_manual_rebuild(tasks, tmp_path)
     TaskRepository(Store(store.path))
     assert store.query('SELECT * FROM text_search_collections') == metadata
     with store.tx() as conn:
-        conn.execute("UPDATE business_tasks SET goal='versionchange'")
+        conn.execute("UPDATE tasks SET goal='versionchange'")
         conn.execute("UPDATE text_search_collections SET tokenizer_version='old'")
     repo = TaskRepository(store)
     assert search((store, repo, session), 'versionchange') == [step['task']]
     with store.tx() as conn:
-        conn.execute("UPDATE business_tasks SET goal='manualrepair'")
+        conn.execute("UPDATE tasks SET goal='manualrepair'")
     result = subprocess.run([sys.executable, 'scripts/rebuild_task_search.py', '--data', str(tmp_path)],
                             capture_output=True, text=True, check=True)
     assert 'Rebuilt 1 Task documents' in result.stdout
@@ -172,8 +172,8 @@ def test_hydration_rechecks_session_and_current_revision(tasks, monkeypatch):
     store, repo, session = tasks
     run, step = create(tasks)
     with store.tx() as conn:
-        conn.execute("UPDATE business_tasks SET revision=7,goal='newauthoritative'")
-        conn.execute('''INSERT INTO business_tasks(id,session,goal,constraints,criteria,status)
+        conn.execute("UPDATE tasks SET revision=7,goal='newauthoritative'")
+        conn.execute('''INSERT INTO tasks(id,session,goal,constraints,criteria,status)
             VALUES('foreign','other','foreign','{}','{}','open')''')
     monkeypatch.setattr(repo.search.index, 'search', lambda *args, **kwargs: [
         SearchHit('foreign', -5), SearchHit('deleted', -4), SearchHit(step['task'], -3)])

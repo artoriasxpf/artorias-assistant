@@ -1,7 +1,10 @@
 import json, sqlite3
 from contextlib import contextmanager
+from pathlib import Path
 
 from artorias_shared.ids import uid
+
+from .migrations import ensure_timestamps, rename_business_tasks
 
 class Store:
     def __init__(self, path):
@@ -19,6 +22,11 @@ class Store:
             CREATE INDEX IF NOT EXISTS event_session ON events(session,seq);
             CREATE TABLE IF NOT EXISTS changes(id TEXT PRIMARY KEY,session TEXT,run TEXT,path TEXT,before_hash TEXT,after_hash TEXT,reverts TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
             """)
+        with self.tx() as c:
+            c.executescript((Path(__file__).parents[1]/"work"/"schema.sql").read_text())
+        with self.tx() as c:
+            rename_business_tasks(c)
+
     @contextmanager
     def tx(self):
         c=sqlite3.connect(self.path,timeout=5);c.row_factory=sqlite3.Row
@@ -27,7 +35,6 @@ class Store:
             yield c
             version = c.execute('PRAGMA schema_version').fetchone()[0]
             if version != self._schema_version:
-                from .migrations import ensure_timestamps
                 ensure_timestamps(c)
             c.commit()
             self._schema_version = c.execute('PRAGMA schema_version').fetchone()[0]
@@ -51,6 +58,10 @@ class Store:
             if old:
                 if old['input']!=text:raise ValueError('幂等键对应不同输入')
                 return dict(old)
+            from artorias_server.work.repository import resume
+            resumed = resume(c,s,text,key,workspace['id'])
+            if resumed:
+                return resumed
             run,turn=uid(),uid()
             c.execute('INSERT INTO runs(id,session,turn,status,input,request_key) VALUES(?,?,?,?,?,?)',(run,s,turn,'queued',text,key))
             c.execute('INSERT INTO messages(id,session,run,role,content) VALUES(?,?,?,?,?)',(uid(),s,run,'user',text))
@@ -88,6 +99,18 @@ class Store:
             (run_id, run_id))
         return True
 
+    @staticmethod
+    def requeue_step(db, run_id, step_key):
+        # Release the transient graph segment. Durable unit attempts and receipts
+        # remain available for recovery; a new queue position allows other runs in.
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='analysis_executions'").fetchone():
+            db.execute('DELETE FROM analysis_executions WHERE run_id=? AND step_key=?',(run_id,step_key))
+        db.execute('DELETE FROM decisions WHERE run=?',(run_id,))
+        db.execute("UPDATE runs SET status='queued' WHERE id=?",(run_id,))
+        db.execute('DELETE FROM jobs WHERE run=?',(run_id,))
+        db.execute("INSERT INTO jobs(id,run,status) VALUES(?,?,'queued')",(uid(),run_id))
+        db.execute("UPDATE task_steps SET status='interrupted' WHERE run=? AND key=?",(run_id,step_key))
+
     def suspend_analysis(self, run, dependency_id):
         with self.tx() as c:
             return self._suspend_analysis(c, run['id'], dependency_id)
@@ -118,6 +141,12 @@ class Store:
         with self.tx() as c:
             c.execute('UPDATE runs SET status=? WHERE id=?',(status,run['id']))
             c.execute("UPDATE jobs SET status='done' WHERE run=?",(run['id'],))
+            if status in ('cancelled','failed','interrupted'):
+                c.execute("""UPDATE work_attempts SET status=? WHERE status='running' AND unit IN
+                    (SELECT u.id FROM work_units u JOIN work_plans p ON u.plan=p.id WHERE p.run=?)""",(status,run['id']))
+                c.execute("""UPDATE work_units SET status=? WHERE status!='completed' AND plan IN
+                    (SELECT id FROM work_plans WHERE run=?)""",(status,run['id']))
+                c.execute("UPDATE work_plans SET status=? WHERE run=? AND status!='completed'",(status,run['id']))
             if status=='cancelled' and c.execute("SELECT 1 FROM sqlite_master WHERE name='task_review_requests'").fetchone():
                 for row in c.execute("SELECT id FROM task_review_requests WHERE run=? AND state='pending'",(run['id'],)).fetchall():
                     c.execute("UPDATE task_review_requests SET state='cancelled' WHERE id=?",(row[0],))
@@ -150,6 +179,15 @@ class Store:
                     # The fresh read-only segment can ask again for interrupted approvals.
                     if c.execute("SELECT 1 FROM sqlite_master WHERE name='permission_requests'").fetchone():
                         c.execute("DELETE FROM permission_requests WHERE run_id=? AND state='pending'", (run['id'],))
+                    continue
+                has_work = c.execute("SELECT 1 FROM work_plans WHERE run=?", (run['id'],)).fetchone()
+                owned = has_work and c.execute("""SELECT 1 FROM work_plans p WHERE p.run=? AND (
+                    (p.status='running' AND EXISTS (SELECT 1 FROM work_units u WHERE u.plan=p.id AND u.status='running')) OR NOT EXISTS (
+                      SELECT 1 FROM task_steps s WHERE s.run=p.run AND s.status NOT IN ('delivered','needs_replan')))""",
+                                  (run['id'],)).fetchone()
+                if owned and not c.execute("""SELECT 1 FROM task_steps WHERE run=? AND status='failed'""",(run['id'],)).fetchone():
+                    c.execute("UPDATE runs SET status='queued' WHERE id=?", (run['id'],))
+                    c.execute("UPDATE jobs SET status='queued' WHERE run=?", (run['id'],))
                     continue
             self.finish(run,'interrupted')
             self.emit(run['session'],run['id'],'run.interrupted',{'reason':'进程中断；请核对已产生的文件，再发送新消息继续。'})

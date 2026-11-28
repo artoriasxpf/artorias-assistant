@@ -216,6 +216,10 @@ class LocalWorkspace:
         from .analysis import read_text
         return read_text(self, path, max_bytes=max_bytes, versioned=versioned)
 
+    def analysis_observation(self, path):
+        from .analysis import file_observation
+        return file_observation(self, path)
+
     def analysis_range(self, path, **options):
         from .analysis import read_range
         return read_range(self, path, **options)

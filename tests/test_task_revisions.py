@@ -41,7 +41,7 @@ def test_patches_snapshots_and_idempotency(tmp_path, scope):
     store, repo, sid, first = setup(tmp_path)
     run, plan, candidates = change(store, repo, sid, first['task'], scope)
     repo.install(run, plan, candidates)
-    task = store.query('SELECT * FROM business_tasks')[0]
+    task = store.query('SELECT * FROM tasks')[0]
     assert task['execution_count'] == 1
     assert task['revision'] == (1 if scope == 'persistent' else 0)
     assert json.loads(task['constraints'])['K1']['text'] == ('中文' if scope == 'persistent' else '英语')
@@ -53,7 +53,7 @@ def test_patches_snapshots_and_idempotency(tmp_path, scope):
     assert any(m['role'] == 'task_result' for m in body['history'])
     # Execution failure does not roll back an already accepted permanent change.
     store.finish(run, 'failed')
-    assert store.query('SELECT revision FROM business_tasks')[0]['revision'] == task['revision']
+    assert store.query('SELECT revision FROM tasks')[0]['revision'] == task['revision']
     assert result_tool(store,sid,first['task']).invoke({'run_id':first['run'],'step_key':'a'})['content'] == '任务一成果'
     with pytest.raises(ValueError):
         result_tool(store,store.session(),first['task']).invoke({'run_id':first['run'],'step_key':'a'})
@@ -145,7 +145,7 @@ def test_summary_is_bounded_and_progress_links_to_latest_milestone(tmp_path):
     result='最新交付正文' * 1000 + '结尾仍保留'
     deliver(repo,run,step,result)
     deliver(repo,run,step,result)
-    task=store.query('SELECT * FROM business_tasks')[0]
+    task=store.query('SELECT * FROM tasks')[0]
     assert len(task['summary'])<=1000 and task['summary']!=result
     assert task['execution_count']==2
     assert json.loads(task['progress'])['milestones'][-1]['step_ref']=={'run':run['id'],'key':step['key']}

@@ -40,7 +40,11 @@ class TaskRuntime:
         results=[]
         delivered=set()
         pending=False
+        waiting_keys = {row['step_key'] for row in self.store.query(
+            "SELECT step_key FROM work_plans WHERE run=? AND status='waiting'", (run['id'],))}
         for step in steps:
+            if step['key'] in waiting_keys:
+                continue
             if step['status']=='needs_replan':
                 continue
             if step['status']=='delivered':
@@ -58,7 +62,7 @@ class TaskRuntime:
             if any(g['state']=='pending' for g in gates) or set(json.loads(step['scope'])['depends_on'])-delivered:
                 pending=True
                 continue
-            task_revision=self.store.query('SELECT revision FROM business_tasks WHERE id=?',(step['task'],))[0]['revision']
+            task_revision=self.store.query('SELECT revision FROM tasks WHERE id=?',(step['task'],))[0]['revision']
             if task_revision != step['applied_revision']:
                 raise ValueError('任务要求已修改，当前步骤需要重新规划')
             scoped=dict(run,allowed_tool_groups=json.loads(step['scope']).get('allowed_tool_groups'),step_key=step['key'],analysis_plan=json.loads(step['scope']).get('analysis'),task_step_id=step.get('id',step['key']),task_id=step['task'],thread_id=run['id']+':'+step['key'],task_context=self.context.build(run,step))
@@ -83,7 +87,7 @@ class TaskRuntime:
                         if kind=='assistant.final':continue
                         if kind == 'analysis.result':
                             analysis_result = payload
-                        if kind == 'analysis.suspended':
+                        if kind in ('analysis.suspended','work.pause','work.requeue'):
                             yield kind, payload
                             return
                         if kind=='approval.requested':
@@ -114,6 +118,9 @@ class TaskRuntime:
                 delivered.add(step['key'])
             yield 'task.delivered',{'task_id':step['task'],'key':step['key'],'text':submission.final_text,
                                     'step_outcome':submission.step_outcome,'status':status}
+        if waiting_keys:
+            yield 'work.idle', {}
+            return
         if pending:
             yield 'task.awaiting_review',{}
             return

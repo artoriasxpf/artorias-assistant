@@ -134,7 +134,7 @@ LocalWorkspace 名称保留是为兼容 v0.4 测试与调用。新 Runtime/API �
 保留旧表：
 
 - sessions(id)：对话容器。
-- business_tasks(id, session, source_task, goal, constraints, status, summary, updated)：目标及状态；workspace 通过 task_workspaces 一对一关联。
+- tasks(id, session, source_task, goal, constraints, status, summary, updated)：目标及状态；workspace 通过 task_workspaces 一对一关联。
 - workspace_bindings(session PK, root)：v0.4 兼容数据，不再作为新执行路径的当前空间来源。
 - workspace_operations(id PK, root, session, run, path, before_hash, after_hash, before_mode, after_mode, reverts, kind, status)：文件变更持久日志。
 - changes(id PK, session, run, path, before_hash, after_hash, reverts)：供历史接口使用的变更投影。
@@ -161,7 +161,7 @@ Store.submit 获取当前 Workspace，在同一数据库事务内创建消息、
 
 #### 3.3 计划安装
 
-TaskRepository.install 先校验模型计划及依赖。new/followup 创建 business_tasks，并在同一事务插入 task_workspaces，使用提交快照中的 Workspace。continue/refine 复用已有 Task 绑定。旧任务缺少绑定时根据旧 Session 位置进行兼容补齐；切换 Session 前也先补齐其旧任务。
+TaskRepository.install 先校验模型计划及依赖。new/followup 创建 tasks，并在同一事务插入 task_workspaces，使用提交快照中的 Workspace。continue/refine 复用已有 Task 绑定。旧任务缺少绑定时根据旧 Session 位置进行兼容补齐；切换 Session 前也先补齐其旧任务。
 
 #### 3.4 执行任务
 

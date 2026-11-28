@@ -18,6 +18,12 @@ class Input(BaseModel):
     text:str=Field(min_length=1,max_length=30000)
     request_key:str=Field(min_length=1,max_length=100)
 
+class WorkResume(BaseModel):
+    request_key: str = Field(min_length=1, max_length=100)
+    generation: int = Field(ge=1)
+    additional_calls: int = Field(default=0, ge=0, le=1000)
+
+
 def web_revision(web_root):
     """Deterministic signature over the served frontend files, for live reload."""
     root = Path(web_root)
@@ -82,6 +88,22 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
         result=service.submit_message(sid,body.text,body.request_key)
         catalog.snapshot_run(result['id'],sid)
         return result
+    @app.get('/api/sessions/{sid}/work-plans')
+    def waiting_work(sid:str):
+        store.require(sid)
+        return store.query('''SELECT p.id,p.run,p.step_key,p.task_id,p.reason,p.generation,p.calls,p.call_limit,
+            b.calls AS task_calls,b.call_limit AS task_limit FROM work_plans p
+            JOIN work_task_budgets b ON p.task_id=b.task_id WHERE p.session=? AND p.status='waiting'
+            ORDER BY p.rowid''',(sid,))
+
+    @app.post('/api/sessions/{sid}/work-plans/{pid}/resume')
+    def resume_work(sid:str,pid:str,body:WorkResume):
+        from artorias_server.work.repository import resume
+        workspace = catalog.current(sid)
+        text = f'追加 {body.additional_calls} 次模型调用并继续' if body.additional_calls else '继续'
+        with store.tx() as db:
+            return resume(db,sid,text,body.request_key,workspace['id'],pid,body.generation,body.additional_calls)
+
     @app.get('/api/sessions/{sid}/events')
     async def events(sid:str,request:Request,after:int=0):
         store.require(sid)

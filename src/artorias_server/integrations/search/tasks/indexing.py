@@ -25,7 +25,7 @@ class TaskSearch:
             self.index.initialize(conn)
             if force or not self.index.is_current(conn, COLLECTION, PROJECTION_VERSION):
                 def documents():
-                    cursor = conn.execute('SELECT * FROM business_tasks ORDER BY rowid')
+                    cursor = conn.execute('SELECT * FROM tasks ORDER BY rowid')
                     while rows := cursor.fetchmany(200):
                         for row in rows:
                             yield row['session'], project(row)
@@ -33,7 +33,7 @@ class TaskSearch:
         return None
 
     def update(self, conn, task_id):
-        row = conn.execute('SELECT * FROM business_tasks WHERE id=?', (task_id,)).fetchone()
+        row = conn.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
         return self.index.upsert(conn, Scope(COLLECTION, row['session']), [project(row)],
                                  projection_version=PROJECTION_VERSION)
 

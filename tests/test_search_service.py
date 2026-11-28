@@ -87,7 +87,7 @@ def test_outage_commit_retry_and_crash_after_remote_commit(remote, monkeypatch):
         worker.sync_once()
     assert store.query('SELECT * FROM search_outbox')
     deliver(repo,run, step, 'committedwhileoffline')
-    assert 'committedwhileoffline' in store.query('SELECT summary FROM business_tasks')[0]['summary']
+    assert 'committedwhileoffline' in store.query('SELECT summary FROM tasks')[0]['summary']
     monkeypatch.setattr(client, 'send', original)
     drain(worker)
     assert hits(client, session, 'committedwhileoffline')
@@ -109,7 +109,7 @@ def test_business_rollback_removes_event(remote, monkeypatch):
     with pytest.raises(RuntimeError):
         deliver(repo,run, step, 'rollbackword')
     assert not store.query('SELECT * FROM search_outbox')
-    assert 'rollbackword' not in store.query('SELECT summary FROM business_tasks')[0]['summary']
+    assert 'rollbackword' not in store.query('SELECT summary FROM tasks')[0]['summary']
     assert not hits(client, session, 'rollbackword')
 
 

@@ -26,7 +26,7 @@ def test_task_inherits_submission_snapshot_and_refine_stays(tmp_path,monkeypatch
     cat.select(sid,cloud['id'])
     repo=TaskRepository(db)
     repo.install(run,Plan(kind='tasks',items=[plan_item(key='a',goal='project')]),[])
-    task=db.query('SELECT * FROM business_tasks')[0]
+    task=db.query('SELECT * FROM tasks')[0]
     assert cat.task_binding(task['id'],sid)['id']==local['id']
     ws=WorkspaceService(db,sid,run['id'],task['id'])
     ws.write('a.txt','local',expected=None)
@@ -34,7 +34,7 @@ def test_task_inherits_submission_snapshot_and_refine_stays(tmp_path,monkeypatch
     db.finish(run,'completed')
     db.submit(sid,'refine and another task','2');r2=db.claim()
     repo.install(r2,Plan(kind='tasks',items=[plan_item(key='a',goal='refine',relation='refine',task_id=task['id']),plan_item(key='b',goal='new')]),repo.candidates(sid,'project'))
-    tasks=db.query('SELECT * FROM business_tasks ORDER BY rowid')
+    tasks=db.query('SELECT * FROM tasks ORDER BY rowid')
     assert cat.task_binding(tasks[0]['id'],sid)['id']==local['id']
     assert cat.task_binding(tasks[1]['id'],sid)['id']==cloud['id']
     assert WorkspaceService(db,sid,run['id'],task['id']).describe()['id']==local['id']

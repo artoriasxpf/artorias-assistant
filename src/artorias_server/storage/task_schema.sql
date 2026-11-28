@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS business_tasks (
+CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     session TEXT NOT NULL,
     source_task TEXT,
@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS business_tasks (
     created_at TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS task_session ON business_tasks(session);
+CREATE INDEX IF NOT EXISTS task_session ON tasks(session);
 CREATE TABLE IF NOT EXISTS task_plans (
     run TEXT PRIMARY KEY,
     plan TEXT NOT NULL,

@@ -19,10 +19,11 @@ const streams = new Map();
 const approvals = new Map();
 const reviews = new Map();
 const TERMINAL = new Set(['run.completed', 'run.failed', 'run.cancelled', 'run.interrupted']);
-const EVENT_CARD_KINDS = /^(review|tool|approval|execution|file|task|workspace)\./;
+const EVENT_CARD_KINDS = /^(work|review|tool|approval|execution|file|task|workspace)\./;
 const EVENT_CARD_TERMINAL = new Set(['run.failed', 'run.cancelled', 'run.interrupted']);
 const TURN_STATES = {
   'message.accepted': '已排队',
+  'work.idle': '等待继续', 'work.plan.waiting': '等待继续', 'work.plan.resumed': '已排队',
   'run.started': '处理中',
   'tool.call': '执行工具',
   'execution.started': '执行工具',
@@ -41,6 +42,9 @@ const EVENT_LABELS = {
   'run.cancelled': '运行取消', 'run.interrupted': '运行中断',
   'task.plan': '任务计划', 'task.started': '任务开始', 'task.resumed': '任务恢复',
   'task.delivered': '任务交付', 'task.failed': '任务失败', 'task.interrupted': '任务中断',
+  'work.plan.created': '工作计划已创建', 'work.unit.started': '分组开始',
+  'work.unit.completed': '分组完成', 'work.unit.suspended': '分组暂停', 'work.source.changed': '来源已变更', 'work.plan.waiting': '工作计划已暂停',
+  'work.plan.resumed': '继续工作计划',
   'task.revised': '任务修订',
   'workspace.selected': '切换工作空间',
   'execution.started': '执行开始', 'execution.finished': '执行完成',
@@ -89,7 +93,7 @@ function turnFor(run) {
   loading.append(dots, loadingLabel);
   section.append(header, request, activity, reply, loading);
   $('log').append(section);
-  const turn = { request, activity, steps, reply, state, loading, loadingLabel, modelRequest: null };
+  const turn = { section, request, activity, steps, reply, state, loading, loadingLabel, modelRequest: null };
   turns.set(run, turn);
   return turn;
 }
@@ -369,6 +373,22 @@ function eventCard(event) {
     addJson(entry.article, payload);
   }
 
+  if (kind === 'work.plan.waiting') {
+    const extra = payload.calls >= payload.call_limit || payload.task_calls >= payload.task_limit ? 80 : 0;
+    addTextBlock(entry.article, '暂停原因', payload.reason);
+    addTextBlock(entry.article, '执行进度', [payload.units_completed + '/' + payload.units_total + ' 个单元已完成',
+      '本步模型调用 ' + payload.calls + '/' + payload.call_limit].join('，'));
+    const button = element('button', extra ? '追加 80 次模型调用并继续' : '继续');
+    button.dataset.workPlan = payload.plan_id;
+    const key = crypto.randomUUID();
+    button.onclick = handle(async () => {
+      await api('sessions/' + event.session + '/work-plans/' + payload.plan_id + '/resume', {
+        generation: payload.generation, request_key: key, additional_calls: extra,
+      });
+      button.disabled = true;
+    });
+    entry.article.append(button);
+  }
   if (kind.startsWith('review.')) {
     reviews.get(payload.id)?.remove();
     reviews.delete(payload.id);
@@ -497,6 +517,16 @@ function renderEvent(event) {
       runs.set(run, 'running');
       closeApproval(run);
     }
+    if (kind === 'work.plan.waiting' || kind === 'work.idle') runs.set(run, 'waiting');
+    if (kind === 'work.plan.resumed' || TERMINAL.has(kind)) {
+      turnFor(run).section.querySelectorAll('button[data-work-plan]').forEach(button => {
+        if (TERMINAL.has(kind) || button.dataset.workPlan === payload.plan_id) button.disabled = true;
+      });
+      if (kind === 'work.plan.resumed') {
+        userBubble(run, payload.text);
+        runs.set(run, 'queued');
+      }
+    }
     if (kind === 'task.awaiting_review') runs.delete(run);
     if (kind === 'approval.requested' || kind === 'analysis.suspended') runs.set(run, 'waiting');
     if (kind === 'approval.decided') runs.set(run, 'queued');
@@ -518,6 +548,8 @@ function renderEvent(event) {
   }
   if (kind === 'run.failed') $('status').textContent = payload.error || '运行失败';
   else if (kind === 'approval.requested') $('status').textContent = '等待审批';
+  else if (kind === 'work.plan.waiting') $('status').textContent = payload.reason;
+  else if (kind === 'work.idle') $('status').textContent = '工作计划已暂停';
   else if (kind === 'analysis.suspended') $('status').textContent = '分析已保存，等待继续…';
   else if (kind === 'run.started') $('status').textContent = '处理中…';
   else if (TERMINAL.has(kind) && !activeRun()) $('status').textContent = '';

@@ -4,8 +4,9 @@ from artorias_shared.ids import uid
 from deepagents import create_deep_agent
 from deepagents.middleware.filesystem import FilesystemMiddleware
 from artorias_server.model_provider.factory import create_model
-from .budget import RequestBudget
+from .budget import RequestBudget, RequestTooLarge
 from .model_activity import ModelActivity
+from artorias_server.work.budget import WorkBudget, WorkBudgetExhausted, EndOfAttempt
 from .checkpoints import SQLiteCheckpointProvider
 from .tool_errors import ToolErrorBoundary
 from .step_repair import repair_submission
@@ -27,6 +28,8 @@ class DeepAgentRuntime:
         def emit(kind,payload):
             if kind=='tool.result' and payload.get('call_id'):
                 detailed_results.add(payload['call_id'])
+            if run.get('work_attempt'):
+                payload = dict(payload,plan_id=run['work_plan_id'],unit_id=run['work_unit_id'],attempt_id=run['work_attempt'])
             self.store.emit(run['session'],run['id'],kind,{**payload,'task_id':run.get('task_id')})
         model=self.model_factory()
         # Run-specific graph thread: context is deliberately assembled from completed semantic messages.
@@ -93,15 +96,31 @@ class DeepAgentRuntime:
         analysis = None
         middleware = [RequestBudget(), ModelActivity(), ToolErrorBoundary()]
         analysis_plan = run.get('analysis_plan')
-        analysis_enabled = os.environ.get('ARTORIAS_ANALYSIS_MEMORY', '1') != '0'
-        if analysis_plan and not analysis_enabled:
-            has_links = self.store.query("SELECT 1 FROM sqlite_master WHERE name='analysis_step_links'")
-            analysis_enabled = bool(has_links and self.store.query(
-                'SELECT 1 FROM analysis_step_links WHERE run_id=? AND step_key=?',
-                (run['id'], run.get('step_key')),
-            ))
+        step_identity = (run['id'],run.get('step_key'))
+        existing_plan = analysis_plan and self.store.query(
+            'SELECT id FROM work_plans WHERE run=? AND step_key=?', step_identity)
+        legacy_link = analysis_plan and not existing_plan and self.store.query(
+            "SELECT 1 FROM sqlite_master WHERE name='analysis_step_links'") and self.store.query(
+            'SELECT 1 FROM analysis_step_links WHERE run_id=? AND step_key=?', step_identity)
+        analysis_enabled = existing_plan or legacy_link or os.environ.get('ARTORIAS_ANALYSIS_MEMORY','1') != '0'
+        plan = unit = attempt = None
+        unit_summaries = []
+        work_budget = None
         if analysis_plan and analysis_enabled:
             from artorias_server.tools.analysis.service import AnalysisContext, AnalysisPrompt, AnalysisSession
+            from artorias_server.tools.analysis import workplan as strategy
+            from artorias_server.tools.analysis.models import DeferredAnalysis
+            from artorias_server.work import repository as work
+            read_only = not set(run.get('allowed_tool_groups') or ()) & {'execution','project_write'}
+            if existing_plan or (read_only and not legacy_link and os.getenv('ARTORIAS_WORK_PLANS','1') != '0'):
+                plan, unit, attempt = work.claim(self.store,run,ws.describe()['id'],strategy.initial_units(analysis_plan))
+                inputs = json.loads(unit['inputs'])
+                run = dict(run,work_kind=unit['kind'],work_inputs=inputs,work_plan_id=plan['id'],work_unit_id=unit['id'],work_attempt=attempt)
+                if unit['kind'] != 'direct':
+                    run['analysis_key'] = 'work:' + unit['id']
+                if inputs.get('paths') and unit['kind'] != 'direct':
+                    run['analysis_plan'] = dict(analysis_plan,roots=inputs['paths'])
+                thread_id += ':work:' + attempt
             analysis = AnalysisSession(self.store, run, ws)
             segment = self.store.begin_analysis(run['id'], run['step_key'])
             analysis.segment = segment
@@ -118,6 +137,28 @@ class DeepAgentRuntime:
                 '查阅历史用 read_analysis_notes。记录最后一批再交付，报告覆盖、来源及未核验部分。'
                 '若本步负责预览明确的文件改动，用 project_change_plan 生成 diff，并在交付中记录 plan_id。'
             )
+            if unit and unit['kind'] != 'direct':
+                if unit['kind'] != 'synthesis':
+                    messages[0]['content'] = '本次只执行指定工作单元。'
+                try:
+                    tools,file_guidance = strategy.bind_unit(analysis,plan,unit,tools,unit_summaries)
+                except strategy.DependenciesScheduled:
+                    yield 'work.requeue', {'plan_id':plan['id']}
+                    return
+                except DeferredAnalysis as error:
+                    yield 'analysis.suspended', {'dependency_id':str(error),'step_key':run['step_key']}
+                    return
+                except strategy.ChangedSource as change:
+                    strategy.invalidate(self.store,plan,change.path)
+                    yield 'work.requeue', {'plan_id':plan['id']}
+                    return
+                except (ValueError, OSError) as error:
+                    yield 'work.pause', {'plan_id':plan['id'],'reason':str(error)}
+                    return
+            if plan:
+                work_budget = WorkBudget(self.store,plan['id'],attempt,tools)
+                middleware.insert(-2,work_budget)
+                start_revision = self.store.query('SELECT revision FROM analyses WHERE id=?',(analysis.id,))[0]['revision']
         async with self.checkpoint_provider.open() as saver:
             internal_files=FilesystemMiddleware(
                 tools=['read_file'],
@@ -161,6 +202,7 @@ class DeepAgentRuntime:
             invocation_id = uid()
             metrics = dict(model_requests=0, request_bytes=0, input_tokens=0, output_tokens=0,
                            estimated_requests=0, measured_requests=0, tool_calls=0)
+            from artorias_server.tools.analysis.workplan import ChangedSource, WorkUnitReady
             from langgraph.errors import GraphRecursionError
             from artorias_server.tools.analysis.models import DeferredAnalysis, ExhaustedAnalysis
             try:
@@ -207,6 +249,26 @@ class DeepAgentRuntime:
                             seen_results.add(msg.tool_call_id)
                             if msg.tool_call_id not in detailed_results:
                                 yield 'tool.result',{'call_id':msg.tool_call_id,'name':msg.name,'status':msg.status,'content':msg.content}
+            except WorkUnitReady:
+                strategy.finish_group(self.store,plan,unit,attempt,analysis,'')
+                yield 'work.requeue', {'plan_id':plan['id']}
+                return
+            except (EndOfAttempt, RequestTooLarge, TimeoutError) as error:
+                if not plan:
+                    raise
+                current = self.store.query('SELECT revision FROM analyses WHERE id=?',(analysis.id,))[0]['revision']
+                if current > start_revision:
+                    yield 'work.requeue', {'plan_id':plan['id']}
+                else:
+                    yield 'work.pause', {'plan_id':plan['id'],'reason':f'本次尝试未提交新进度（{type(error).__name__}）'}
+                return
+            except WorkBudgetExhausted:
+                yield 'work.pause', {'plan_id':plan['id'],'reason':'模型预算或单次执行时限已到'}
+                return
+            except ChangedSource as change:
+                strategy.invalidate(self.store,plan,change.path)
+                yield 'work.requeue', {'plan_id':plan['id']}
+                return
             except (DeferredAnalysis, GraphRecursionError) as error:
                 if analysis is None:
                     raise
@@ -251,6 +313,54 @@ class DeepAgentRuntime:
                 for m in reversed(result.get('messages',[])):
                     if getattr(m,'type',None)=='ai' and not getattr(m,'tool_calls',[]):
                         text=text_content(m.content);break
+            if unit and unit['kind'] not in ('direct','synthesis'):
+                if unit['kind'] == 'reduce' and not unit_summaries:
+                    from langchain_core.messages import SystemMessage
+                    history = state.values.get('messages', [])
+                    summary_tool = next(t for t in tools if t.name == 'finish_work_unit')
+                    problem = next(
+                        (str(msg.content)[:500] for msg in reversed(history)
+                         if msg.type == 'tool' and msg.name == summary_tool.name and msg.status == 'error'),
+                        '模型未调用 finish_work_unit',
+                    )
+                    # Include the complete dependency evidence supplied to the original reduction.
+                    try:
+                        await repair_submission(
+                            model, summary_tool, summary_tool.invoke,
+                            [SystemMessage(content=file_guidance), *history], emit, problem,
+                            reserve=work_budget.reserve, attempts=1, stage='work_summary_repair',
+                            instructions=(
+                                '只调用一次 finish_work_unit，提交约五条简洁的综合结论。'
+                                '压缩重复叙述，保留重要发现、来源范围和未决事项。'
+                            ),
+                        )
+                    except (WorkBudgetExhausted, EndOfAttempt, RequestTooLarge, TimeoutError, ValueError) as error:
+                        yield 'work.pause', {'plan_id':plan['id'],'reason':f'分组综合重试未完成：{str(error) or type(error).__name__}'}
+                        return
+                if not unit_summaries:
+                    problem = next((str(msg.content)[:500] for msg in reversed(state.values.get('messages', []))
+                                    if msg.type == 'tool' and msg.status == 'error'), None)
+                    reason = '模型未提交有效分组结果'
+                    if unit['kind'] == 'read_group':
+                        ranges = strategy.next_ranges(analysis)
+                        open_ranges = [
+                            f"{path}（已推进到字节 {span['offset']}，文件总长 {span['total'] or '未知'}）"
+                            for path, span in ranges.items()
+                            if not span.get('skipped') and span['offset'] != span['total']
+                        ]
+                        reason = '读取分组未完成'
+                        pending_batch = analysis.repo.pending(analysis.id)
+                        if pending_batch:
+                            reason += f"。批次 {pending_batch['id']} 的笔记尚未提交"
+                        elif open_ranges:
+                            reason += '。模型未继续调用读取工具。待续读：' + '、'.join(open_ranges[:3])
+                    if problem:
+                        reason += f'。最近工具错误：{problem}'
+                    yield 'work.pause', {'plan_id':plan['id'],'reason':reason}
+                    return
+                strategy.finish_group(self.store,plan,unit,attempt,analysis,unit_summaries[-1])
+                yield 'work.requeue', {'plan_id':plan['id']}
+                return
             if run.get('task_id'):
                 if len(finished) == 1:
                     submission = finished[0]
@@ -265,19 +375,29 @@ class DeepAgentRuntime:
                         from langchain_core.messages import SystemMessage
                         history = [
                             message.model_copy(update={'content': '本次分析已保存的结论见分析快照。', 'artifact': None})
-                            if message.type == 'tool' and message.name in READ_TOOLS | {'read_analysis_notes'}
+                            if message.type == 'tool' and message.name in READ_TOOLS | {'read_analysis_notes','read_work_notes'}
                             else message for message in history
                         ]
                         history.append(SystemMessage(content=json.dumps(analysis.snapshot(), ensure_ascii=False)))
-                    submission = await repair_submission(
-                        model, finish_step, validate_submission, history, emit, problem,
-                    )
+                    try:
+                        submission = await repair_submission(
+                            model, finish_step, validate_submission, history, emit, problem,
+                            reserve=work_budget.reserve if work_budget else None,
+                        )
+                    except (WorkBudgetExhausted, EndOfAttempt, RequestTooLarge, TimeoutError) as error:
+                        if not plan:
+                            raise
+                        yield 'work.pause', {'plan_id':plan['id'],'reason':f'交付修正已暂停（{type(error).__name__}）'}
+                        return
             if analysis:
                 progress = analysis.snapshot()
                 coverage = progress['coverage']
                 incomplete = (progress['pending'] is not None or not progress['committed_batches']
                               or bool(coverage.get('failures') or coverage.get('unavailable_batches'))
                               or (analysis.plan.coverage_policy == 'full' and not coverage['full']))
+                if unit and unit['kind']=='synthesis':
+                    coverage = strategy.coverage(self.store,plan['id'])
+                    incomplete = not coverage['full']
                 text = submission.final_text
                 if incomplete:
                     text = ('部分分析结果。已保存的批次可在后续运行中继续使用。\n\n' + text)[:100000]

@@ -126,7 +126,7 @@ def test_task_revised_event(tmp_path):
     db, r = setup_task(tmp_path)
     repo = TaskRepository(db)
     repo.install(r, Plan(kind='tasks', items=[plan_item(key='a', goal='报告', constraints=['英语'])]), [])
-    task = db.query('SELECT * FROM business_tasks')[0]
+    task = db.query('SELECT * FROM tasks')[0]
     db.finish(r, 'completed', '初稿')
     db.submit(r['session'], '改为中文', 'two'); r2 = db.claim()
     async def planner(payload):

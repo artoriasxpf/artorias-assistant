@@ -68,7 +68,7 @@ class TaskRepository:
                 reused = item.relation in ('continue', 'refine')
                 tid = item.task_id if reused else uid()
                 if reused:
-                    row = c.execute('SELECT * FROM business_tasks WHERE id=? AND session=?', (tid, run['session'])).fetchone()
+                    row = c.execute('SELECT * FROM tasks WHERE id=? AND session=?', (tid, run['session'])).fetchone()
                     if row is None: raise ValueError('Task outside session')
                     task = dict(row)
                     baseline = requirements_for(task)
@@ -97,11 +97,11 @@ class TaskRepository:
                 applied = revision + int(effective != baseline)
                 if reused:
                     if applied != revision:
-                        changed = c.execute("UPDATE business_tasks SET status='open',goal=?,constraints=?,criteria=?,revision=? WHERE id=? AND revision=?",
+                        changed = c.execute("UPDATE tasks SET status='open',goal=?,constraints=?,criteria=?,revision=? WHERE id=? AND revision=?",
                             (goal,constraints,criteria,applied,tid,revision))
                         if changed.rowcount != 1: raise ValueError('Task revision conflict')
                 else:
-                    c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,criteria,status,revision) VALUES(?,?,?,?,?,?,'open',?)",
+                    c.execute("INSERT INTO tasks(id,session,source_task,goal,constraints,criteria,status,revision) VALUES(?,?,?,?,?,?,'open',?)",
                         (tid,run['session'],item.task_id,goal,constraints,criteria,applied))
                     c.execute('INSERT INTO task_workspaces(task,workspace_id) VALUES(?,?)',(tid,default['id']))
                 if not reused or applied != revision:
@@ -129,6 +129,15 @@ class TaskRepository:
     def deliver(self, run, step, result, evidence, verdicts, *, analysis_result=None):
         with self.store.tx() as c:
             status = deliver_result(c, self.search, run, step, result, evidence, verdicts)
+            if step['status']=='waiting':
+                c.execute('DELETE FROM decisions WHERE run=?',(run['id'],))
+            plan = c.execute('SELECT * FROM work_plans WHERE run=? AND step_key=?',(run['id'],step['key'])).fetchone()
+            if plan:
+                from artorias_server.work.repository import complete_unit
+                unit = c.execute("SELECT * FROM work_units WHERE plan=? AND status='running'",(plan['id'],)).fetchone()
+                attempt = c.execute("SELECT id FROM work_attempts WHERE unit=? AND status='running'",(unit['id'],)).fetchone()
+                complete_unit(c,plan,unit,attempt[0],result.final_text[:1000],analysis_result['analysis_id'])
+                c.execute("UPDATE work_plans SET status='completed' WHERE id=?",(plan['id'],))
             if analysis_result:
                 c.execute('UPDATE analyses SET status=? WHERE id=? AND revision=?',
                           ('open' if analysis_result['partial'] else 'completed',

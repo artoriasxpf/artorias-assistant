@@ -173,7 +173,7 @@ def test_invalid_finish_step_repairs_without_reexecuting_tools(tmp_path):
     assert store.query("SELECT status FROM runs")[0]["status"] == "completed"
     step = store.query("SELECT status,result FROM task_steps")[0]
     assert step == {"status": "delivered", "result": "最终正文"}
-    task = store.query("SELECT status,progress,execution_count FROM business_tasks")[0]
+    task = store.query("SELECT status,progress,execution_count FROM tasks")[0]
     assert task["execution_count"] == 1
     assert task["status"] == "needs_review"
     assert json.loads(task["progress"])["assessment_heads"]["C1"]["claim"] == "met"
@@ -200,7 +200,7 @@ def test_exhausted_finish_repairs_preserve_pending_and_summary(tmp_path):
     item = plan_item("a", "生成报告")
     item.initial_requirements.criteria = [Criterion(text="提供正文")]
     runtime.repo.install(run, Plan(kind="tasks", items=[item]), [])
-    query = "SELECT status,progress,summary,execution_count FROM business_tasks"
+    query = "SELECT status,progress,summary,execution_count FROM tasks"
     baseline = store.query(query)
     assert json.loads(baseline[0]["progress"])["assessment_heads"]["C1"]["verdict"] == "pending"
 

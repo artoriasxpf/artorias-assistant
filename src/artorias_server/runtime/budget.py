@@ -16,11 +16,15 @@ def _size(value):
     return len(json.dumps(value, ensure_ascii=False, default=str).encode('utf-8'))
 
 
+class RequestTooLarge(ValueError):
+    pass
+
+
 def check_budget(payload, limit=None):
     limit = _request_limit() if limit is None else limit
     size = _size(payload)
     if size > limit:
-        raise ValueError(f'Model request exceeds byte budget ({size}>{limit}); narrow the task or read shorter results')
+        raise RequestTooLarge(f'Model request exceeds byte budget ({size}>{limit}); narrow the task or read shorter results')
     return size
 
 

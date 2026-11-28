@@ -11,15 +11,15 @@
 ## Task 索引投影
 
 - 集合使用 `tasks`，分区使用当前 `session_id`，文档 ID 为 Task ID。索引覆盖该 Session 所有纳入召回的 Task；不先截最近 200 条。
-- `title` 存 `business_tasks.goal`；`keywords` 存 `constraints` 与 `criterias` 的值；`body` 存有限长度的 `summary`。如未来有结构化交付归纳，可额外索引已验证的产物名称与路径。
+- `title` 存 `tasks.goal`；`keywords` 存 `constraints` 与 `criterias` 的值；`body` 存有限长度的 `summary`。如未来有结构化交付归纳，可额外索引已验证的产物名称与路径。
 - `body` 最多 12,000 字符，超长文本保留头尾各 5,999 字符，中间用两个换行隔开，避免拼接成不存在的词；不改变 Task/Step 的原始交付。原始 Step 全文、工具输出、审批数据、重复的 `progress` 索引和用户私有文件原文不纳入投影。早期交付细节未进入当前 Task 摘要时，关键词召回可能找不到它；后续可建独立的 Step 成果索引。
-- `business_tasks` 仍是权威来源。查询命中后回表，取最新的目标、状态、长期需求及 `revision`，并再次校验 Session。索引不用于授权和版本校验。
+- `tasks` 仍是权威来源。查询命中后回表，取最新的目标、状态、长期需求及 `revision`，并再次校验 Session。索引不用于授权和版本校验。
 
 ## 索引构建与更新
 
 | 时机 | 操作 |
 | --- | --- |
-| 首次启用 | 创建 Task 索引，按批扫描 `business_tasks`，生成投影并写 FTS5。成功后才标记当前索引版本可用。 |
+| 首次启用 | 创建 Task 索引，按批扫描 `tasks`，生成投影并写 FTS5。成功后才标记当前索引版本可用。 |
 | Task 新建 | 与 Task 和执行计划的写入同事务入队投影事件，worker 异步建立远端索引。 |
 | 永久需求变更 | 更新目标、约束、验收标准及索引。临时变更只影响当前 Step。 |
 | Step 交付 | Task 的 `summary` 更新后重算投影。用内容指纹跳过相同内容；只改交付计数或时间戳时不用分词。 |

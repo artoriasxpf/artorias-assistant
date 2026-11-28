@@ -19,7 +19,7 @@ class Decision(BaseModel):
 def wake(c, run):
     # A parked run is rescanned when any gate changes; the executor checks all gates.
     updated = c.execute(
-        "UPDATE runs SET status='queued' WHERE id=? AND status='awaiting_review'",
+        "UPDATE runs SET status='queued' WHERE id=? AND status IN ('awaiting_review','work_waiting')",
         (run,),
     )
     if updated.rowcount:
@@ -99,7 +99,7 @@ def decide(store, search, session, rid, decision):
                 return {"state": state}
             raise ValueError("该确认已关闭：" + row["state"])
         task = c.execute(
-            "SELECT * FROM business_tasks WHERE id=?", (row["task_id"],)
+            "SELECT * FROM tasks WHERE id=?", (row["task_id"],)
         ).fetchone()
         if (
             not row["local"]
@@ -136,7 +136,7 @@ def decide(store, search, session, rid, decision):
                 "assessment_id": aid,
             }
         c.execute(
-            "UPDATE business_tasks SET progress=? WHERE id=?",
+            "UPDATE tasks SET progress=? WHERE id=?",
             (dump(progress), task["id"]),
         )
         changed = c.execute(

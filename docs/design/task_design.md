@@ -102,7 +102,7 @@ Run completed 表示本轮处理结束，不证明 Task 已完成。Step deliver
 
 以下列出逻辑完整字段，类型与约束以源码和迁移为准。JSON 当前序列化为 SQLite TEXT。所有业务表有 created_at、updated_at。
 
-### 4.1 business_tasks
+### 4.1 tasks
 
 |字段|类型/语义|
 |---|---|
