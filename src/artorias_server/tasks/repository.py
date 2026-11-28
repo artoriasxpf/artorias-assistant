@@ -136,7 +136,11 @@ class TaskRepository:
                 from artorias_server.work.repository import complete_unit
                 unit = c.execute("SELECT * FROM work_units WHERE plan=? AND status='running'",(plan['id'],)).fetchone()
                 attempt = c.execute("SELECT id FROM work_attempts WHERE unit=? AND status='running'",(unit['id'],)).fetchone()
-                complete_unit(c,plan,unit,attempt[0],result.final_text[:1000],analysis_result['analysis_id'])
+                evidence_id = analysis_result['analysis_id'] if analysis_result else None
+                complete_unit(c,plan,unit,attempt[0],result.final_text[:1000],evidence_id)
+                if unit['kind'] == 'locate_file' and result.step_outcome == 'blocked':
+                    c.execute("UPDATE work_units SET status='obsolete' WHERE plan=? AND status NOT IN ('completed','obsolete')",
+                              (plan['id'],))
                 c.execute("UPDATE work_plans SET status='completed' WHERE id=?",(plan['id'],))
             if analysis_result:
                 c.execute('UPDATE analyses SET status=? WHERE id=? AND revision=?',

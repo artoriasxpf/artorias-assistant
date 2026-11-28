@@ -126,7 +126,8 @@ class AnalysisSession:
                 try:
                     value = registered[operation].invoke(options)
                 except (ValueError, OSError) as error:
-                    value = {'status': 'unreadable', 'detail': str(error)[:500]}
+                    missing = isinstance(error, (FileNotFoundError, NotADirectoryError))
+                    value = {'status': 'not_found' if missing else 'unreadable', 'detail': str(error)[:500]}
                     if operation == 'project_read_many':
                         value = {'items': [dict(value) for _ in options['items']]}
             finally:
@@ -319,9 +320,18 @@ class AnalysisContext(AgentMiddleware):
         if unresolved and unresolved.get('status')=='stale' and self.session.run.get('work_kind')=='read_group':
             from .workplan import ChangedSource
             raise ChangedSource(json.loads(pending['plan_json'])['args']['path'])
+        run = self.session.run
+        if (unresolved and unresolved.get('status') == 'not_found'
+                and run.get('work_kind') == 'read_group'
+                and self.session.plan.analysis_type == 'document_file'
+                and self.session.plan.coverage_policy == 'full'
+                and hasattr(self.session.workspace, '_resolve')
+                and not run['work_inputs'].get('relocated')):
+            from .location import MissingSourcePath
+            raise MissingSourcePath(json.loads(pending['plan_json'])['args']['path'])
         if unresolved:
             self.session.repo.presented(self.session.id, unresolved)
-        store, run = self.session.repo.store, self.session.run
+        store = self.session.repo.store
 
         async def invoke(model_request):
             if not run.get('work_attempt'):

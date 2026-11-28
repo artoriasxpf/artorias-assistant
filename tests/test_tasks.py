@@ -32,7 +32,7 @@ def test_resume_dependencies_and_original_input(tmp_path):
     assert calls[1]['task_context']['dependency_results']==[{'key':'a','preview':'框架','result_ref':{'run_id':r['id'],'step_key':'a'}}]
     db.finish(r,'waiting');db.decide(r['id'],'approve')
     second=asyncio.run(collect(db.claim()))
-    assert second[-1][1]['text']=='框架\n\n说明'
+    assert second[-1][1]['text']=='说明'
     assert len(calls)==3
     assert all(x['status']=='needs_review' for x in db.query('SELECT * FROM tasks'))
     assert len(db.query('SELECT * FROM context_snapshots'))==2
@@ -61,9 +61,10 @@ def test_two_tasks_with_actual_deepagents(tmp_path, monkeypatch):
         def bind_tools(self, tools, **kwargs):return self
     model=Model(disable_streaming=True,messages=iter([
         AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'a.txt','content':'A'},'id':'a','type':'tool_call'}]),
-        finish_message('A written'),
+        finish_message('A written. This step cannot write B.'),
         AIMessage(content='',tool_calls=[{'name':'project_write','args':{'path':'b.txt','content':'B'},'id':'b','type':'tool_call'}]),
-        finish_message('B written')]))
+        finish_message('B written'),
+        AIMessage(content='已写入 a.txt 和 b.txt。')]))
     monkeypatch.setattr(module,'create_model',lambda:model)
     db,r=setup(tmp_path)
     async def planner(payload):return Plan(kind='tasks',items=[plan_item(key='a',goal='写 A'),plan_item(key='b',goal='写 B',depends_on=['a'])])
@@ -71,7 +72,13 @@ def test_two_tasks_with_actual_deepagents(tmp_path, monkeypatch):
     runtime=TaskRuntime(tmp_path,db,engine=create_engine(tmp_path,db),planner=planner)
     async def collect():return [event async for event in runtime.execute(r)]
     events=asyncio.run(collect())
-    assert events[-1][1]['text']=='A written\n\nB written'
+    assert events[-1][1]['text']=='已写入 a.txt 和 b.txt。'
+    assert [p['text'] for kind, p in events if kind=='task.delivered']==[
+        'A written. This step cannot write B.', 'B written',
+    ]
+    assert [p['stage'] for kind, p in (
+        (row['kind'], json.loads(row['payload'])) for row in db.events(r['session'],0)
+    ) if kind == 'model.started'][-1] == 'final_reply'
     ws=LocalWorkspace(tmp_path/'blobs',SQLiteWorkspaceJournal(db.path),r['session'],r['id'])
     assert ws.read('a.txt')=='A' and ws.read('b.txt')=='B'
 
@@ -186,3 +193,34 @@ def test_planner_accepts_single_fenced_json_and_reports_truncation(tmp_path, mon
     assert asyncio.run(module.TaskPlanner(db).plan(run, [])).kind == 'chat'
     assert '模型输出达到长度上限' in calls[1][0]['content']
     assert len(calls) == 2
+
+
+def test_single_step_internal_references_are_composed_for_user(tmp_path, monkeypatch):
+    from langchain_core.messages import AIMessage
+    from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+    import artorias_server.runtime.service as module
+
+    draft = '## 设计目标（C1）\nR1：避免重复执行。根据 K3 完成读取。'
+
+    class Model(GenericFakeChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    model = Model(disable_streaming=True, messages=iter([
+        finish_message(draft),
+        AIMessage(content='方案按回合保存执行状态，恢复时可避免重复执行。'),
+    ]))
+    monkeypatch.setattr(module, 'create_model', lambda: model)
+    db, run = setup(tmp_path)
+
+    async def planner(_):
+        return Plan(kind='tasks', items=[plan_item(key='explain', goal='解释设计')])
+
+    runtime = TaskRuntime(tmp_path, db, planner=planner)
+
+    async def collect():
+        return [item async for item in runtime.execute(run)]
+
+    events = asyncio.run(collect())
+    assert events[-1] == ('assistant.final', {'text': '方案按回合保存执行状态，恢复时可避免重复执行。'})
+    assert db.query('SELECT result FROM task_steps')[0]['result'] == draft

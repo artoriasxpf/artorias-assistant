@@ -488,3 +488,236 @@ def test_full_notes_are_partitioned_without_truncation(tmp_path, monkeypatch):
         )
         == 1
     )
+
+
+def test_named_document_uses_prior_user_directory_with_read_approval(tmp_path, monkeypatch):
+    data, current = tmp_path / 'app', tmp_path / 'current'
+    data.mkdir()
+    current.mkdir()
+    prior = tmp_path / 'previous-project' / 'agent-docs'
+    target = prior / 'design' / 'task_design.md'
+    target.parent.mkdir(parents=True)
+    target.write_text('目标文档正文', encoding='utf-8')
+    monkeypatch.setenv('ARTORIAS_WORKSPACE', str(current))
+    store = Store(data / 'app.sqlite')
+    sid = store.session()
+    store.submit(sid, f'总结这个目录：{prior}', 'previous')
+    first = store.claim()
+    store.finish(first, 'completed', '已完成目录总结')
+    store.submit(sid, '帮我精读 task_design', 'new')
+
+    async def planner(_):
+        return Plan(kind='tasks', items=[
+            plan_item('read', '通读设计文档', analysis={
+                'analysis_type': 'document_file', 'goal': '通读', 'intent': '解释',
+                'roots': ['agent-docs/design/task_design.md'], 'coverage_policy': 'full',
+            }),
+        ])
+
+    model = PartitionModel(messages=iter([]), disable_streaming=True)
+    runtime = TaskRuntime(data, store, engine=create_engine(data, store, model_factory=lambda: model),
+                          planner=planner)
+    scheduler = Scheduler(store, runtime)
+
+    async def scenario():
+        run = store.claim()
+        rid = run['id']
+        await scheduler.execute(run)
+        requests = store.query("SELECT seq,payload FROM events WHERE run=? AND kind='approval.requested'", (rid,))
+        assert len(requests) == 1
+        request = json.loads(requests[0]['payload'])['requests'][0]
+        assert (request['path'], request['access']) == (str(prior), 'read')
+        assert store.query("SELECT kind,status FROM work_units") == [
+            {'kind': 'locate_file', 'status': 'running'}
+        ]
+        store.decide(rid, {request['request_id']: 'approve'}, requests[0]['seq'])
+        for _ in range(8):
+            step_run = store.claim()
+            if not step_run:
+                break
+            await scheduler.execute(step_run)
+        rows = store.query("SELECT payload FROM events WHERE run=? AND kind='tool.call'", (rid,))
+        reads = [json.loads(row['payload']) for row in rows]
+        assert [item['args']['path'] for item in reads if item['name']=='project_read'] == [str(target)]
+        assert store.query("SELECT status FROM runs WHERE id=?", (rid,))[0]['status'] == 'completed'
+
+    asyncio.run(scenario())
+
+
+def test_document_missing_during_read_is_relocated_once(tmp_path, monkeypatch):
+    data, root = tmp_path / 'app', tmp_path / 'project'
+    data.mkdir()
+    root.mkdir()
+    original = root / 'task_design.md'
+    original.write_text('文档正文', encoding='utf-8')
+    replacement = root / 'archived' / original.name
+    replacement.parent.mkdir()
+    monkeypatch.setenv('ARTORIAS_WORKSPACE', str(root))
+    store = Store(data / 'app.sqlite')
+    sid = store.session()
+    store.submit(sid, '精读 task_design.md', 'start')
+
+    async def planner(_):
+        return Plan(kind='tasks', items=[
+            plan_item('read', '通读文档', analysis={
+                'analysis_type': 'document_file', 'goal': '通读', 'intent': '解释',
+                'roots': ['task_design.md'], 'coverage_policy': 'full',
+            }),
+        ])
+
+    class MovingModel(PartitionModel):
+        def _generate(self, messages, *args, **kwargs):
+            response = super()._generate(messages, *args, **kwargs)
+            if original.exists() and any(call['name'] == 'project_read'
+                                         for call in response.generations[0].message.tool_calls):
+                original.rename(replacement)
+            return response
+
+    model = MovingModel(messages=iter([]), disable_streaming=True)
+    runtime = TaskRuntime(data, store, engine=create_engine(data, store, model_factory=lambda: model),
+                          planner=planner)
+    scheduler = Scheduler(store, runtime)
+
+    async def scenario():
+        for _ in range(10):
+            run = store.claim()
+            if not run:
+                return
+            await scheduler.execute(run)
+
+    asyncio.run(scenario())
+    rows = store.query("SELECT payload FROM events WHERE kind='tool.call' AND json_extract(payload,'$.name')='project_read'")
+    assert [json.loads(row['payload'])['args']['path'] for row in rows] == [
+        'task_design.md', 'archived/task_design.md',
+    ]
+    assert store.query("SELECT status FROM runs")[0]['status'] == 'completed'
+    units = store.query("SELECT status FROM work_units WHERE kind='read_group' ORDER BY ordinal")
+    assert units == [{'status': 'obsolete'}, {'status': 'completed'}]
+    assert store.query("SELECT status FROM work_units WHERE kind='locate_file'") == [
+        {'status': 'completed'}
+    ]
+
+
+@pytest.mark.parametrize('outcome', ['approve', 'reject', 'ambiguous'])
+def test_file_location_work_unit_searches_after_directory_move(tmp_path, monkeypatch, outcome):
+    data, projects = tmp_path / 'app', tmp_path / 'projects'
+    current = projects / 'current'
+    current.mkdir(parents=True)
+    data.mkdir()
+    previous = projects / 'old-project' / 'agent-docs'
+    target = projects / 'renamed-project' / 'agent-docs' / 'design' / 'task_workplan.md'
+    target.parent.mkdir(parents=True)
+    target.write_text('目标文档正文', encoding='utf-8')
+    duplicate = projects / 'other-project' / target.name
+    if outcome == 'ambiguous':
+        duplicate.parent.mkdir()
+        duplicate.write_text('另一份文档', encoding='utf-8')
+    monkeypatch.setenv('ARTORIAS_WORKSPACE', str(current))
+    store = Store(data / 'app.sqlite')
+    sid = store.session()
+    store.submit(sid, f'总结这个目录：{previous}', 'previous')
+    store.finish(store.claim(), 'completed', '已完成目录总结')
+    store.submit(sid, f'精读 {target.name}', 'new')
+
+    async def planner(_):
+        return Plan(kind='tasks', items=[
+            plan_item('read', '通读设计文档', analysis={
+                'analysis_type': 'document_file', 'goal': '通读', 'intent': '解释',
+                'roots': [target.name], 'coverage_policy': 'full',
+            }),
+        ])
+
+    class LocationModel(PartitionModel):
+        def _generate(self, messages, *args, **kwargs):
+            context = next(
+                (m.text for m in messages if isinstance(m, SystemMessage)
+                 and m.text.startswith('定位数据见以下 JSON。')),
+                None,
+            )
+            if context is None:
+                return super()._generate(messages, *args, **kwargs)
+            observations = json.loads(context.split('。', 1)[1])
+            assert observations['reference'] == target.name
+            assert str(projects) in observations['suggested_roots']
+            recent_search = next(
+                (m for m in reversed(messages) if isinstance(m, ToolMessage)
+                 and m.name == 'search_for_file'),
+                None,
+            )
+            if recent_search is None:
+                name, arguments = 'search_for_file', {'root': str(projects)}
+            else:
+                result = json.loads(recent_search.content)
+                assert result['status'] == ('denied' if outcome == 'reject' else 'searched')
+                name = 'finish_file_location'
+                candidates = result.get('candidates', [])
+                expected = {
+                    'approve': {str(target)}, 'reject': set(),
+                    'ambiguous': {str(target), str(duplicate)},
+                }[outcome]
+                assert set(candidates) == expected
+                # An invented path, or a guess from ambiguous evidence, must fail.
+                last = messages[-1]
+                if isinstance(last, ToolMessage) and last.name == 'finish_file_location':
+                    assert last.status == 'error'
+                    arguments = {'path': candidates[0]} if len(candidates) == 1 else {}
+                else:
+                    arguments = {'path': str(target) if len(candidates) > 1 else str(target) + '.bak'}
+            message = AIMessage(content='', tool_calls=[dict(name=name, args=arguments, id=uuid4().hex)])
+            return ChatResult(generations=[ChatGeneration(message=message)])
+
+    def scheduler():
+        model = LocationModel(messages=iter([]), disable_streaming=True)
+        return Scheduler(store, TaskRuntime(data, store, engine=create_engine(
+            data, store, model_factory=lambda: model), planner=planner))
+
+    async def scenario():
+        run = store.claim()
+        rid = run['id']
+        await scheduler().execute(run)
+        for expected_path, decision in [(previous, 'approve'), (projects, 'reject' if outcome == 'reject' else 'approve')]:
+            requests = store.query(
+                "SELECT seq,payload FROM events WHERE run=? AND kind='approval.requested' ORDER BY seq",
+                (rid,),
+            )
+            latest = requests[-1]
+            (request,) = json.loads(latest['payload'])['requests']
+            assert (request['path'], request['access']) == (str(expected_path), 'read')
+            assert store.query("SELECT kind,status FROM work_units") == [
+                {'kind': 'locate_file', 'status': 'running'}
+            ]
+            assert not store.query(
+                "SELECT 1 FROM events WHERE run=? AND kind='tool.call' AND json_extract(payload,'$.name')='project_read'",
+                (rid,),
+            )
+            store.decide(rid, {request['request_id']: decision}, latest['seq'])
+            await scheduler().execute(store.claim())
+
+        for _ in range(8):
+            pending = store.claim()
+            if not pending:
+                break
+            await scheduler().execute(pending)
+        assert store.query('SELECT status FROM runs WHERE id=?', (rid,)) == [{'status': 'completed'}]
+        units = store.query('SELECT id,kind,status,inputs,dependencies FROM work_units ORDER BY ordinal')
+        locate = units[0]
+        assert locate['kind'] == 'locate_file' and locate['status'] == 'completed'
+        state = json.loads(locate['inputs'])
+        assert state['searches'][0]['status'] == ('denied' if outcome == 'reject' else 'searched')
+        assert len(store.query(
+            "SELECT 1 FROM events WHERE run=? AND kind='approval.requested'", (rid,),
+        )) == 2
+        if outcome == 'approve':
+            assert [u['kind'] for u in units] == ['locate_file', 'read_group', 'synthesis']
+            assert json.loads(units[1]['inputs'])['paths'] == [str(target)]
+            assert json.loads(units[1]['dependencies']) == [locate['id']]
+        else:
+            assert len(units) == 1
+            error = state['selection']['error']
+            if outcome == 'ambiguous':
+                assert str(target) in error and str(duplicate) in error
+            else:
+                assert '未获读取权限' in error
+                assert str(target) not in error
+
+    asyncio.run(scenario())
