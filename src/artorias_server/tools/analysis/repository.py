@@ -63,11 +63,13 @@ class AnalysisRepository:
                 return dict(linked)
             # Reuse unfinished work only under the same Task, workspace and plan.
             prior = db.execute("""SELECT a.* FROM analyses a WHERE session_id=? AND task_id=? AND workspace_id=?
-                AND plan_json=? AND status='open' AND NOT EXISTS (
+                AND plan_json=? AND status='open' AND origin_step_key NOT LIKE 'work:%' AND NOT EXISTS (
                     SELECT 1 FROM analysis_step_links l JOIN runs r ON r.id=l.run_id
-                    WHERE l.analysis_id=a.id AND r.status IN ('queued','running','waiting','analysis_waiting'))
+                    WHERE l.analysis_id=a.id AND r.status IN ('queued','running','waiting','analysis_waiting','work_waiting'))
                 ORDER BY a.rowid DESC LIMIT 1""",
                 (run['session'], run['task_id'], workspace_id, plan_json)).fetchone()
+            if run.get('analysis_key'):
+                prior = None
             analysis_id = prior['id'] if prior else uid()
             if not prior:
                 db.execute("""INSERT INTO analyses(id,session_id,task_id,origin_run,origin_step_key,workspace_id,plan_json)
@@ -129,7 +131,7 @@ class AnalysisRepository:
             existing = db.execute('SELECT * FROM analysis_batches WHERE analysis_id=? AND call_id=?',
                                   (analysis_id, call_id)).fetchone()
             pending = db.execute("""SELECT * FROM analysis_batches WHERE analysis_id=?
-                AND state!='committed' ORDER BY ordinal LIMIT 1""", (analysis_id,)).fetchone()
+                AND state NOT IN ('committed','obsolete') ORDER BY ordinal LIMIT 1""", (analysis_id,)).fetchone()
             if existing or pending:
                 return dict(existing or pending)
             number = db.execute('SELECT COALESCE(MAX(ordinal),0)+1 FROM analysis_batches WHERE analysis_id=?',
@@ -156,5 +158,5 @@ class AnalysisRepository:
 
     def pending(self, analysis_id):
         rows = self.store.query("""SELECT id,ordinal,state,plan_json FROM analysis_batches WHERE analysis_id=?
-            AND state!='committed' ORDER BY ordinal LIMIT 1""", (analysis_id,))
+            AND state NOT IN ('committed','obsolete') ORDER BY ordinal LIMIT 1""", (analysis_id,))
         return rows[0] if rows else None

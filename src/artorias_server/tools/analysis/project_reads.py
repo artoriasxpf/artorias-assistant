@@ -45,10 +45,14 @@ def receipts(name, args, value, target):
         entries = item.get('entries', item.get('hits', item.get('samples', [])))
         sources = []
         for entry in entries:
+            if 'path' not in entry:
+                continue
             child = entry['path']
             if name != 'project_search' or args.get('snapshot_page'):
                 child = resource_path(path, child)
             source = dict(target(child, entry.get('type') == 'directory'), kind=kind)
+            if 'size_bytes' in entry:
+                source['size_bytes'] = entry['size_bytes']
             if kind == 'snippet':
                 source.update(line=entry.get('line'), version=entry.get('observation'))
             sources.append(source)

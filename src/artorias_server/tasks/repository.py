@@ -129,6 +129,15 @@ class TaskRepository:
     def deliver(self, run, step, result, evidence, verdicts, *, analysis_result=None):
         with self.store.tx() as c:
             status = deliver_result(c, self.search, run, step, result, evidence, verdicts)
+            if step['status']=='waiting':
+                c.execute('DELETE FROM decisions WHERE run=?',(run['id'],))
+            plan = c.execute('SELECT * FROM work_plans WHERE run=? AND step_key=?',(run['id'],step['key'])).fetchone()
+            if plan:
+                from artorias_server.work.repository import complete_unit
+                unit = c.execute("SELECT * FROM work_units WHERE plan=? AND status='running'",(plan['id'],)).fetchone()
+                attempt = c.execute("SELECT id FROM work_attempts WHERE unit=? AND status='running'",(unit['id'],)).fetchone()
+                complete_unit(c,plan,unit,attempt[0],result.final_text[:1000],analysis_result['analysis_id'])
+                c.execute("UPDATE work_plans SET status='completed' WHERE id=?",(plan['id'],))
             if analysis_result:
                 c.execute('UPDATE analyses SET status=? WHERE id=? AND revision=?',
                           ('open' if analysis_result['partial'] else 'completed',

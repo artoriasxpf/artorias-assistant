@@ -160,12 +160,17 @@ def search_text(workspace, relative, *, query, mode, context_lines, max_hits,
     return dict(result, hits=hits)
 
 
+def observation(info):
+    return f'{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}'
+
+def file_observation(workspace, relative):
+    with _open_relative(workspace.root, workspace.path(relative), directory=False) as fd:
+        return observation(os.fstat(fd))
+
+
 def read_range(workspace, relative, *, offset, limit, expected_version=None):
     """Read bounded UTF-8 byte ranges, binding continuations to the observation."""
     import codecs
-
-    def observation(info):
-        return f'{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}:{info.st_ctime_ns}'
 
     with _open_relative(workspace.root, workspace.path(relative), directory=False) as fd:
         info = os.fstat(fd)

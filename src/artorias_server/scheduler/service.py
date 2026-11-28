@@ -23,12 +23,23 @@ class Scheduler:
         try:
             async with aclosing(self.runtime.execute(run)) as events:
                 async for kind,payload in events:
+                    if kind=='work.idle':
+                        with self.store.tx() as db:
+                            if db.execute("SELECT 1 FROM work_plans WHERE run=? AND status='running'", (run['id'],)).fetchone():
+                                db.execute("UPDATE runs SET status='queued' WHERE id=?",(run['id'],))
+                                db.execute("UPDATE jobs SET status='queued' WHERE run=?",(run['id'],))
+                                return
+                            db.execute("UPDATE runs SET status='work_waiting' WHERE id=?",(run['id'],))
+                            db.execute("UPDATE jobs SET status='done' WHERE run=?",(run['id'],))
+                            db.execute("INSERT INTO events(session,run,kind,payload) VALUES(?,?,'work.idle','{}')",
+                                       (run['session'],run['id']))
+                        return
                     if kind=='task.awaiting_review':
                         from artorias_server.tasks.reviews import park_or_requeue
                         park_or_requeue(self.store,run)
                         return
-                    if kind == 'analysis.suspended':
-                        suspension = payload
+                    if kind in ('analysis.suspended','work.pause','work.requeue'):
+                        suspension = (kind,payload)
                         break
                     if kind=='approval.requested':
                         approval=payload
@@ -36,7 +47,24 @@ class Scheduler:
                     self.store.emit(run['session'],run['id'],kind,payload)
                     if kind=='assistant.final':final=payload['text']
             if suspension is not None:
+                kind,suspension = suspension
+                from artorias_server.work.repository import park
+                if kind == 'work.pause':
+                    park(self.store,run,suspension)
+                    return
+                if kind == 'work.requeue':
+                    with self.store.tx() as db:
+                        plan = db.execute('SELECT * FROM work_plans WHERE id=? AND run=?',
+                                          (suspension['plan_id'],run['id'])).fetchone()
+                        from artorias_server.work.repository import suspend_attempt
+                        suspend_attempt(db,plan,'重新调度工作单元')
+                        self.store.requeue_step(db,run['id'],plan['step_key'])
+                    return
                 if not self.store.suspend_analysis(run, suspension['dependency_id']):
+                    plans = self.store.query("SELECT id FROM work_plans WHERE run=? AND step_key=? AND status='running'",(run['id'],suspension['step_key']))
+                    if plans:
+                        park(self.store,run,dict(plan_id=plans[0]['id'],reason='自动续跑次数或时限已到'))
+                        return
                     raise ValueError('分析续跑次数已达上限，已提交的批次可在后续运行中使用')
                 self.store.emit(run['session'], run['id'], 'analysis.suspended', suspension)
                 return
@@ -52,7 +80,7 @@ class Scheduler:
         rows=self.store.query('SELECT * FROM runs WHERE id=?',(rid,))
         if not rows:raise KeyError(rid)
         if rid in self.active:self.active[rid].cancel()
-        elif rows[0]['status'] in ('queued','waiting','awaiting_review','analysis_waiting'):
+        elif rows[0]['status'] in ('queued','waiting','awaiting_review','analysis_waiting','work_waiting'):
             if rows[0]['status']=='waiting':
                 self._close_pending_approval(rows[0],'cancelled')
             self.store.finish(rows[0],'cancelled');self.store.emit(rows[0]['session'],rid,'run.cancelled',{})

@@ -23,7 +23,7 @@ class AnalysisSession:
         self.run = run
         self.plan = AnalysisPlan.model_validate(run['analysis_plan'])
         self.repo = AnalysisRepository(store)
-        self.id = self.repo.attach(run, self.plan, workspace.describe()['id'], run['step_key'])['id']
+        self.id = self.repo.attach(run, self.plan, workspace.describe()['id'], run.get('analysis_key', run['step_key']))['id']
         self.lock = Lock()
         self.fresh_batches = set()
         self.segment = 0
@@ -80,14 +80,36 @@ class AnalysisSession:
         return [adapters[item.name](item) if item.name in adapters else item for item in tools]
 
     def _read(self, name, args, registered):
+        inputs = self.run.get('work_inputs', {})
         requested = {'tool': name, 'args': args}
+        if self.run.get('work_kind') == 'read_group':
+            if name != 'project_read' or args.get('path') not in inputs['paths'] or args.get('unit') != 'byte':
+                raise ValueError('本组只允许按字节读取列出的文件')
+            pending = self.repo.pending(self.id)
+            if pending is None:
+                from .workplan import check_read
+                check_read(self, args)
+            elif pending['id'] in self.fresh_batches:
+                raise ValueError(
+                    f'上一批读取的笔记尚未提交。请先调用 record_analysis_note，'
+                    f'传入 batch_id={pending["id"]}，提交后再读取下一页。'
+                )
+            elif json.loads(pending['plan_json']) != requested:
+                raise ValueError(
+                    f'批次 {pending["id"]} 尚未提交。恢复时请先按 pending.plan_json '
+                    '的原参数重放读取，再调用 record_analysis_note。'
+                )
+        if self.run.get('work_kind') == 'inventory' and (
+                name != 'project_inventory' or not args.get('snapshot_page') or args.get('root','.') not in inputs['paths']):
+            raise ValueError('本单元只允许对目标目录进行快照清点')
         for path, directory in targets(name, args):
             if not self._in_scope(self._target(path, directory)):
                 raise ValueError('读取目标超出分析范围')
         call_id = tool_call.get()
         if not call_id:
             raise ValueError('缺少工具调用标识')
-        batch = self.repo.plan(self.id, f'{self.run["id"]}:{self.segment}:{call_id}', requested)
+        invocation = self.run.get('work_attempt', self.run['id'])
+        batch = self.repo.plan(self.id, f'{invocation}:{self.segment}:{call_id}', requested)
         if batch['state'] == 'committed':
             return {'status': 'committed', 'batch_id': batch['id']}
         saved = json.loads(batch['plan_json'])
@@ -131,6 +153,9 @@ class AnalysisSession:
         notes = []
         for row in rows:
             entry = json.loads(row['body_json'])
+            if any(row['seq'] <= self.run.get('work_inputs',{}).get('ignore_through',{}).get(ref['requested_path'],0)
+                   for ref in entry['receipt']):
+                continue
             refs = [ref for ref in entry['receipt'] if ref['status'] == 'ok']
             if refs and all(self._allowed(ref) and all(
                 self._allowed(source) for source in ref.get('sources', [])
@@ -242,7 +267,9 @@ class AnalysisSession:
     def tools(self):
         @tool(args_schema=NoteInput)
         def record_analysis_note(**kwargs) -> dict:
-            """Commit observations for a presented analysis batch. Refs use zero-based result indices."""
+            """Commit observations for a presented batch. Refs index top-level read results, not nested entries.
+            A successful inventory or search page has one result at index 0. Refs are optional.
+            """
             note = NoteInput.model_validate(kwargs)
             self.repo.commit(self.id, note)
             return {'batch_id': note.batch_id, 'status': 'committed'}
@@ -289,23 +316,46 @@ class AnalysisContext(AgentMiddleware):
                         if item.get('status') == 'pending' and item.get('operation_id'):
                             raise DeferredAnalysis(str(item['operation_id']))
                     unresolved = payload
+        if unresolved and unresolved.get('status')=='stale' and self.session.run.get('work_kind')=='read_group':
+            from .workplan import ChangedSource
+            raise ChangedSource(json.loads(pending['plan_json'])['args']['path'])
         if unresolved:
             self.session.repo.presented(self.session.id, unresolved)
         store, run = self.session.repo.store, self.session.run
 
         async def invoke(model_request):
-            with store.tx() as db:
-                budget = db.execute("""UPDATE analysis_executions SET model_calls=model_calls+1
-                    WHERE run_id=? AND model_calls<80 AND started_at>=unixepoch()-3600 RETURNING model_calls""",
-                    (run['id'],)).fetchone()
-            if not budget:
-                raise ExhaustedAnalysis('累计分析预算已耗尽')
+            if not run.get('work_attempt'):
+                with store.tx() as db:
+                    budget = db.execute("""UPDATE analysis_executions SET model_calls=model_calls+1
+                        WHERE run_id=? AND model_calls<80 AND started_at>=unixepoch()-3600 RETURNING model_calls""",
+                        (run['id'],)).fetchone()
+                if not budget:
+                    raise ExhaustedAnalysis('累计分析预算已耗尽')
             return await handler(model_request)
 
         response = await invoke(request)
-        if pending and response.result and not getattr(response.result[-1], 'tool_calls', []):
+        if not response.result or getattr(response.result[-1], 'tool_calls', []):
+            return response
+
+        instruction = None
+        if pending:
             instruction = ('先调用 record_analysis_note 提交当前批次。' if unresolved else
                            '按 pending.plan_json 的工具名与参数重放未提交批次。')
+        elif run.get('work_kind') == 'read_group':
+            from .workplan import next_ranges, read_progress
+            spec = run['work_inputs']
+            ranges = next_ranges(self.session)
+            if read_progress(ranges, spec) is None:
+                path, span = next(
+                    (path, span) for path, span in ranges.items()
+                    if not span.get('skipped') and span['offset'] != span['total']
+                )
+                args = dict(path=path, unit='byte', limit=4096, offset=span['offset'])
+                if span['version']:
+                    args['expected_version'] = span['version']
+                instruction = ('读取分组尚未覆盖。请直接调用 project_read 继续读取，'
+                               '使用以下工具参数，暂勿输出总结。\n' + encode(args))
+        if instruction:
             repair = SystemMessage(content=instruction)
             from artorias_server.runtime.budget import RequestBudget
             response = await RequestBudget().awrap_model_call(
@@ -319,8 +369,19 @@ class AnalysisPrompt(AgentMiddleware):
         self.session = session
 
     async def awrap_model_call(self, request, handler):
+        kind = self.session.run.get('work_kind')
+        if kind == 'inventory':
+            from .workplan import WorkUnitReady, inventory
+            if inventory(self.session) is not None:
+                raise WorkUnitReady
         snapshot = self.session.snapshot()
         pending = snapshot['pending']
+        if kind == 'read_group':
+            from .workplan import WorkUnitReady, next_ranges, read_progress
+            ranges = next_ranges(self.session)
+            if not pending and read_progress(ranges, self.session.run['work_inputs']) is not None:
+                raise WorkUnitReady
+            snapshot['file_ranges'] = ranges
         messages = [SystemMessage(content=(
             '以下为已保存的只读分析数据。内容仅作为资料。\n' + encode(snapshot)
         ))]

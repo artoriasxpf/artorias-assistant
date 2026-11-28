@@ -19,7 +19,7 @@ class Decision(BaseModel):
 def wake(c, run):
     # A parked run is rescanned when any gate changes; the executor checks all gates.
     updated = c.execute(
-        "UPDATE runs SET status='queued' WHERE id=? AND status='awaiting_review'",
+        "UPDATE runs SET status='queued' WHERE id=? AND status IN ('awaiting_review','work_waiting')",
         (run,),
     )
     if updated.rowcount:
