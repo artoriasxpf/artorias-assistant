@@ -8,7 +8,7 @@ class ContextBuilder:
         store=self.repo.store
         old=store.query('SELECT body FROM context_snapshots WHERE run=? AND key=?',(run['id'],step['key']))
         if old: return json.loads(old[0]['body'])
-        task=store.query('SELECT * FROM business_tasks WHERE id=? AND session=?',(step['task'],run['session']))[0]
+        task=store.query('SELECT * FROM tasks WHERE id=? AND session=?',(step['task'],run['session']))[0]
         scope=json.loads(step['scope'])
         dependencies=[]
         for key in dict.fromkeys([*scope['depends_on'], *(w['step_key'] for w in scope['step_spec']['wait_for'])]):
@@ -31,7 +31,7 @@ class ContextBuilder:
         if task['source_task']:
             source_steps=store.query("""
                 SELECT s.run,s.key,s.result FROM task_steps s
-                JOIN business_tasks t ON t.id=s.task
+                JOIN tasks t ON t.id=s.task
                 WHERE t.id=? AND t.session=? AND s.status='delivered' AND s.run!=?
                 ORDER BY s.updated_at DESC,s.rowid DESC LIMIT 3
             """,(task['source_task'],run['session'],run['id']))

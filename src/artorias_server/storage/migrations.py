@@ -3,6 +3,20 @@
 NOW = "strftime('%Y-%m-%dT%H:%M:%fZ','now')"
 
 
+def rename_business_tasks(connection):
+    tables = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('business_tasks', 'tasks')"
+    )}
+    if 'business_tasks' not in tables:
+        return
+    if 'tasks' in tables:
+        raise RuntimeError("Both business_tasks and tasks exist. Resolve the table name conflict before migrating.")
+    connection.execute('ALTER TABLE business_tasks RENAME TO tasks')
+    # ensure_timestamps installs the renamed triggers before the transaction commits.
+    connection.execute('DROP TRIGGER IF EXISTS business_tasks_timestamps_insert')
+    connection.execute('DROP TRIGGER IF EXISTS business_tasks_timestamps_update')
+
+
 def ensure_timestamps(connection):
     # FTS5 virtual tables and their shadow tables are owned by SQLite. Adding
     # application columns/triggers to them corrupts the index schema.

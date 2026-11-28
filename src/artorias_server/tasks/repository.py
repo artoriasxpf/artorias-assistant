@@ -68,7 +68,7 @@ class TaskRepository:
                 reused = item.relation in ('continue', 'refine')
                 tid = item.task_id if reused else uid()
                 if reused:
-                    row = c.execute('SELECT * FROM business_tasks WHERE id=? AND session=?', (tid, run['session'])).fetchone()
+                    row = c.execute('SELECT * FROM tasks WHERE id=? AND session=?', (tid, run['session'])).fetchone()
                     if row is None: raise ValueError('Task outside session')
                     task = dict(row)
                     baseline = requirements_for(task)
@@ -97,11 +97,11 @@ class TaskRepository:
                 applied = revision + int(effective != baseline)
                 if reused:
                     if applied != revision:
-                        changed = c.execute("UPDATE business_tasks SET status='open',goal=?,constraints=?,criteria=?,revision=? WHERE id=? AND revision=?",
+                        changed = c.execute("UPDATE tasks SET status='open',goal=?,constraints=?,criteria=?,revision=? WHERE id=? AND revision=?",
                             (goal,constraints,criteria,applied,tid,revision))
                         if changed.rowcount != 1: raise ValueError('Task revision conflict')
                 else:
-                    c.execute("INSERT INTO business_tasks(id,session,source_task,goal,constraints,criteria,status,revision) VALUES(?,?,?,?,?,?,'open',?)",
+                    c.execute("INSERT INTO tasks(id,session,source_task,goal,constraints,criteria,status,revision) VALUES(?,?,?,?,?,?,'open',?)",
                         (tid,run['session'],item.task_id,goal,constraints,criteria,applied))
                     c.execute('INSERT INTO task_workspaces(task,workspace_id) VALUES(?,?)',(tid,default['id']))
                 if not reused or applied != revision:

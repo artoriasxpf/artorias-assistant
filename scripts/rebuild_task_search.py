@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Rebuild the lexical Task index from business_tasks; no model or file reads."""
+"""Rebuild the lexical Task index from tasks; no model or file reads."""
 import argparse
 import os
 from pathlib import Path

@@ -7,7 +7,7 @@
 Assistant 通过 `artorias_server/integrations/search/` 调用，默认运行不安装搜索引擎。
 进程内实现通过 `search` extra 按需安装，供测试和显式兼容模式使用。
 
-业务数据仍由 business_tasks 管理。原本的跨表本地事务改成：业务写入与 outbox
+业务数据仍由 tasks 管理。原本的跨表本地事务改成：业务写入与 outbox
 同事务；同步 worker 提交 HTTP 请求；服务端索引与消费位置同事务；收到确认后删除
 本地事件。网络调用不在业务数据库事务内。允许短暂索引延迟，不承诺跨服务强一致。
 

@@ -76,8 +76,8 @@ CREATE TABLE IF NOT EXISTS resource_changes(change_id TEXT PRIMARY KEY, task_id 
         return self.get(self.store.query('SELECT workspace_id FROM session_workspaces WHERE session=?',(session,))[0]['workspace_id'])
     def select(self, session, wid):
         self.store.require(session);w=self.get(wid)
-        if self.store.query("SELECT name FROM sqlite_master WHERE type='table' AND name='business_tasks'"):
-            for task in self.store.query('SELECT id FROM business_tasks WHERE session=?',(session,)):
+        if self.store.query("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'"):
+            for task in self.store.query('SELECT id FROM tasks WHERE session=?',(session,)):
                 self.task_binding(task['id'],session)
         previous=self.store.query('SELECT workspace_id FROM session_workspaces WHERE session=?',(session,))
         with self.store.tx() as c:c.execute('INSERT INTO session_workspaces(session,workspace_id) VALUES(?,?) ON CONFLICT(session) DO UPDATE SET workspace_id=excluded.workspace_id',(session,wid))

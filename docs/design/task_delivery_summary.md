@@ -16,8 +16,8 @@
 | `task_steps.delivery_seq` | 同一 Task 的交付序号。在交付事务内由 `execution_count + 1` 得到。为历史排序和后台幂等提供依据。 |
 | `task_steps.handoff` | 严格校验的 JSON。包含简短成果、决定、未完成事项、已验证的产物引用及证据缺口。 |
 | `task_steps.handoff_status` | `pending`、`running`、`ready` 或 `failed`，与 Step 的业务状态独立。重试次数和租约时间也记录在 Step 上。 |
-| `business_tasks.progress` | 保持交付索引，只保留最近 20 条。完整结果或总结需要时按 Run ID 和 Step Key 获取。 |
-| `business_tasks.summary` | 有大小上限的结构化 Task 状态，建议使用现有 TEXT 列保存 JSON，由查询或界面渲染。存当前进展、仍有效的决定、关键产物引用和待办，以及处理到哪个交付序号。 |
+| `tasks.progress` | 保持交付索引，只保留最近 20 条。完整结果或总结需要时按 Run ID 和 Step Key 获取。 |
+| `tasks.summary` | 有大小上限的结构化 Task 状态，建议使用现有 TEXT 列保存 JSON，由查询或界面渲染。存当前进展、仍有效的决定、关键产物引用和待办，以及处理到哪个交付序号。 |
 
 每次交付不重新复制历史正文。建议首版每个 `handoff` 限制为 2 KB，Task 的 `summary` 限制为 4 KB，均按序列化后的 UTF-8 字节计。未完成事项和关键产物优先保留，较旧内容可通过 Step 引用回查。估算上，100 个 Step 的归纳正文上限约 200 KB，另有数据库索引和存储开销。
 

@@ -17,8 +17,8 @@ def result_tool(store, session_id, task_id, consumer_run=None, consumer_key=None
         declared=scope.get('depends_on',[])+[w['step_key'] for w in scope.get('step_spec',{}).get('wait_for',[])]
         dependency=consumer_run==run_id and step_key in declared
         rows = store.query(
-            "SELECT s.result FROM task_steps s JOIN business_tasks t ON t.id=s.task "
-            "JOIN business_tasks current ON current.id=? AND current.session=t.session "
+            "SELECT s.result FROM task_steps s JOIN tasks t ON t.id=s.task "
+            "JOIN tasks current ON current.id=? AND current.session=t.session "
             "WHERE t.session=? AND (t.id=current.id OR t.id=current.source_task OR ?) "
             "AND s.run=? AND s.key=? AND s.status='delivered'",
             (task_id, session_id, dependency, run_id, step_key),

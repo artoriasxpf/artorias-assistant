@@ -85,7 +85,7 @@ Task 仍代表用户目标，Task Step 仍代表该轮执行范围。**执行段
 
 ### 存储设计
 
-下表是拟新增的 Assistant SQLite 表；TEXT 为 ID、枚举、路径、哈希、UTC 时间及带版本 JSON 的默认类型，计数和序号为 INTEGER。各表沿用 created_at、updated_at。FK 指向实际 sessions、business_tasks 和 task_steps(run,key)。不可从模型输入接受这些归属字段。
+下表是拟新增的 Assistant SQLite 表；TEXT 为 ID、枚举、路径、哈希、UTC 时间及带版本 JSON 的默认类型，计数和序号为 INTEGER。各表沿用 created_at、updated_at。FK 指向实际 sessions、tasks 和 task_steps(run,key)。不可从模型输入接受这些归属字段。
 
 | 表及主键 | 核心列与约束 | 读写时机及索引 |
 |---|---|---|

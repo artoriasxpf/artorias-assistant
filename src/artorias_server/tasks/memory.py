@@ -22,7 +22,7 @@ def event(c, session, run, kind, payload):
 
 
 def refresh(c, task_id, search):
-    task = c.execute("SELECT * FROM business_tasks WHERE id=?", (task_id,)).fetchone()
+    task = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     progress = json.loads(task["progress"])
     rules = json.loads(task["criteria"])
     heads = progress["assessment_heads"]
@@ -78,14 +78,14 @@ def refresh(c, task_id, search):
     summary = "；".join(parts)[:1000]
     if fingerprint != task["summary_input_hash"]:
         c.execute(
-            "UPDATE business_tasks SET status=?,progress=?,summary=?,summary_input_hash=? WHERE id=?",
+            "UPDATE tasks SET status=?,progress=?,summary=?,summary_input_hash=? WHERE id=?",
             (status, dump(progress), summary, fingerprint, task_id),
         )
         index_hash = digest(dump([task["goal"], inputs[1], rules, summary]))
         if index_hash != task["search_input_hash"]:
             search.update(c, task_id)
             c.execute(
-                "UPDATE business_tasks SET search_input_hash=? WHERE id=?",
+                "UPDATE tasks SET search_input_hash=? WHERE id=?",
                 (index_hash, task_id),
             )
     return status
@@ -109,10 +109,10 @@ def deliver_result(c, search, run, step, result, evidence, verdicts):
         ):
             raise ValueError("Conflicting step replay")
         return c.execute(
-            "SELECT status FROM business_tasks WHERE id=?", (step["task"],)
+            "SELECT status FROM tasks WHERE id=?", (step["task"],)
         ).fetchone()[0]
     task = c.execute(
-        "SELECT * FROM business_tasks WHERE id=?", (step["task"],)
+        "SELECT * FROM tasks WHERE id=?", (step["task"],)
     ).fetchone()
     later_delivery = c.execute(
         """SELECT 1 FROM task_steps newer JOIN task_steps current
@@ -243,7 +243,7 @@ def deliver_result(c, search, run, step, result, evidence, verdicts):
         (result.final_text, dump(envelope), run["id"], step["key"]),
     )
     c.execute(
-        "UPDATE business_tasks SET execution_count=execution_count+1,progress=? WHERE id=?",
+        "UPDATE tasks SET execution_count=execution_count+1,progress=? WHERE id=?",
         (dump(progress), step["task"]),
     )
     c.execute("DELETE FROM decisions WHERE run=?", (run["id"],))

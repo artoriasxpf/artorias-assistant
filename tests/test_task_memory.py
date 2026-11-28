@@ -128,7 +128,7 @@ def test_final_review_http_and_evidence(tmp_path):
             == 409
         )
         assert (
-            store.query("SELECT status FROM business_tasks WHERE goal='其他工作'")[0][
+            store.query("SELECT status FROM tasks WHERE goal='其他工作'")[0][
                 "status"
             ]
             == "done"
@@ -158,12 +158,12 @@ def test_self_assessment_updates_task(tmp_path, claim, expected):
     assert runtime.repo.deliver(run, step, result, evidence, verdicts) == expected
     assert list(evidence) == ["response"]
     assert not store.query("SELECT id FROM task_review_requests")
-    progress = json.loads(store.query("SELECT progress FROM business_tasks")[0]["progress"])
+    progress = json.loads(store.query("SELECT progress FROM tasks")[0]["progress"])
     head = progress["assessment_heads"]["C1"]
     assert head["claim"] == claim
     assert head["verdict"] == "pending"
     assert head["method"] == "self" and head["reason"] == "根据本步正文自评"
-    summary = store.query("SELECT summary FROM business_tasks")[0]["summary"]
+    summary = store.query("SELECT summary FROM tasks")[0]["summary"]
     assert f"完成分析 自评 {claim}" in summary
 
 

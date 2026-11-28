@@ -221,7 +221,7 @@ def resume(db, session, text, key, workspace, plan_id=None, generation=None, ext
         "SELECT workspace_id FROM run_workspace_bindings WHERE run=? AND task=''", (plan["run"],)
     ).fetchone()
     task_revision = db.execute(
-        "SELECT revision FROM business_tasks WHERE id=?", (plan["task_id"],)
+        "SELECT revision FROM tasks WHERE id=?", (plan["task_id"],)
     ).fetchone()
     if (
         not binding

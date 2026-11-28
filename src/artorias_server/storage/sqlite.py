@@ -4,6 +4,8 @@ from pathlib import Path
 
 from artorias_shared.ids import uid
 
+from .migrations import ensure_timestamps, rename_business_tasks
+
 class Store:
     def __init__(self, path):
         self.path = str(path)
@@ -22,6 +24,9 @@ class Store:
             """)
         with self.tx() as c:
             c.executescript((Path(__file__).parents[1]/"work"/"schema.sql").read_text())
+        with self.tx() as c:
+            rename_business_tasks(c)
+
     @contextmanager
     def tx(self):
         c=sqlite3.connect(self.path,timeout=5);c.row_factory=sqlite3.Row
@@ -30,7 +35,6 @@ class Store:
             yield c
             version = c.execute('PRAGMA schema_version').fetchone()[0]
             if version != self._schema_version:
-                from .migrations import ensure_timestamps
                 ensure_timestamps(c)
             c.commit()
             self._schema_version = c.execute('PRAGMA schema_version').fetchone()[0]

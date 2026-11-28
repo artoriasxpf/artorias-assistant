@@ -16,10 +16,10 @@ repository.install 在事务中绑定 Task 与 Workspace、应用持久需求变
 
 | 表 | 字段和类型 | 新版语义与写入者 |
 |---|---|---|
-| business_tasks | id、session、source_task、goal TEXT；revision INTEGER | 身份与来源沿用原值。revision 只对有效的持久要求变更递增。goal、constraints、criteria 由 Plan 安装事务维护 |
-| business_tasks | constraints、criteria TEXT | 有效条目字典。数据库与协议统一使用 criteria。删除的条目从有效集合退出，历史保存在 Step 的修订快照 |
-| business_tasks | progress TEXT；status TEXT；execution_count INTEGER | progress 改为有界的当前进展对象。status 由程序推导。execution_count 每个首次交付的 Step 只增加一次 |
-| business_tasks | summary TEXT；新增 summary_input_hash TEXT NULL、memory_version INTEGER NOT NULL DEFAULT 2 | summary 是面向召回及上下文的短摘要。hash 对应渲染输入。memory_version 标识存储格式，当前格式为 2 |
+| tasks | id、session、source_task、goal TEXT；revision INTEGER | 身份与来源沿用原值。revision 只对有效的持久要求变更递增。goal、constraints、criteria 由 Plan 安装事务维护 |
+| tasks | constraints、criteria TEXT | 有效条目字典。数据库与协议统一使用 criteria。删除的条目从有效集合退出，历史保存在 Step 的修订快照 |
+| tasks | progress TEXT；status TEXT；execution_count INTEGER | progress 改为有界的当前进展对象。status 由程序推导。execution_count 每个首次交付的 Step 只增加一次 |
+| tasks | summary TEXT；新增 summary_input_hash TEXT NULL、memory_version INTEGER NOT NULL DEFAULT 2 | summary 是面向召回及上下文的短摘要。hash 对应渲染输入。memory_version 标识存储格式，当前格式为 2 |
 | task_plans | run、plan TEXT | plan 内含 schema_version；存程序校验后的计划。按 run 重入时读取已安装版本 |
 | task_steps | scope、task_patch、baseline_requirements、effective_requirements、base_revision、applied_revision、source_message_id | scope 保存本步计划。快照记录当时的要求、条目版本和局部覆盖，支持重放、审计与旧结果核对 |
 | task_steps | status、result TEXT；新增 result_json TEXT NULL | result 保留用户可读交付正文和分页语义；result_json 存 Step 结束时的结构化事实，首次提交后不可变 |
