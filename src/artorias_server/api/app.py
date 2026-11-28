@@ -1,7 +1,7 @@
 import asyncio, contextlib, hashlib, json, os, secrets
 from pathlib import Path
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -103,6 +103,18 @@ def create_http_app(data,store,scheduler=None, *, workspace_registry=None, web_r
         text = f'追加 {body.additional_calls} 次模型调用并继续' if body.additional_calls else '继续'
         with store.tx() as db:
             return resume(db,sid,text,body.request_key,workspace['id'],pid,body.generation,body.additional_calls)
+
+    @app.get('/api/sessions/{sid}/timeline')
+    def timeline(sid: str, before: int | None = Query(default=None, ge=1),
+                 limit: int = Query(default=1, ge=1, le=10)):
+        from artorias_server.sse.timeline import page
+        return page(store, sid, before, limit)
+
+    @app.get('/api/sessions/{sid}/timeline/{rid}/events')
+    def turn_events(sid: str, rid: str, through: int = Query(ge=0),
+                    after: int = Query(default=0, ge=0), limit: int = Query(default=200, ge=1, le=500)):
+        from artorias_server.sse.timeline import process_page
+        return process_page(store, sid, rid, after, through, limit)
 
     @app.get('/api/sessions/{sid}/events')
     async def events(sid:str,request:Request,after:int=0):

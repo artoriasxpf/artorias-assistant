@@ -20,6 +20,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,run TEXT,status TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
             CREATE TABLE IF NOT EXISTS events(seq INTEGER PRIMARY KEY AUTOINCREMENT,session TEXT,run TEXT,kind TEXT,payload TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
             CREATE INDEX IF NOT EXISTS event_session ON events(session,seq);
+            CREATE INDEX IF NOT EXISTS event_run_seq ON events(session,run,seq);
             CREATE TABLE IF NOT EXISTS changes(id TEXT PRIMARY KEY,session TEXT,run TEXT,path TEXT,before_hash TEXT,after_hash TEXT,reverts TEXT, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '');
             """)
         with self.tx() as c:

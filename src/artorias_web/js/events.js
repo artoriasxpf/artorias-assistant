@@ -2,8 +2,8 @@ import { headers } from './api.js';
 
 // Capture the session and cursor in this subscription; an old stream cannot
 // advance a newly selected session's cursor.
-export async function watch(sessionId, signal, onEvent, onReconnect) {
-  let cursor = 0;
+export async function watch(sessionId, signal, onEvent, onReconnect, after = 0) {
+  let cursor = after;
   while (!signal.aborted) {
     let reader;
     try {

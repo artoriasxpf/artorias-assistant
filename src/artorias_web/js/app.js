@@ -10,6 +10,12 @@ const handle = action => async (...args) => {
 
 let sessions = [];
 let sessionId, controller;
+let olderBefore = null;
+let fetchingOlder = false;
+let nextTurnNumber = 1;
+let lastTimelineTop = 0;
+let liveCursor = 0;
+const sessionEventSeqs = new Set();
 let sending = false;
 let composing = false;
 const drafts = new Map();
@@ -69,12 +75,16 @@ function format(value) {
   return String(value);
 }
 
-function turnFor(run) {
+function turnFor(run, snapshot) {
   if (turns.has(run)) return turns.get(run);
   const section = element('section', undefined, 'turn');
-  const heading = element('h2', `回合 ${turns.size + 1}`, 'turn-title');
-  heading.id = `turn-${turns.size + 1}`;
+  const number = snapshot?.number ?? nextTurnNumber++;
+  nextTurnNumber = Math.max(nextTurnNumber, number + 1);
+  const heading = element('h2', `回合 ${number}`, 'turn-title');
+  heading.id = `turn-${run}`;
   section.setAttribute('aria-labelledby', heading.id);
+  section.dataset.turnNumber = number;
+  if (snapshot?.first_seq) section.dataset.firstSeq = snapshot.first_seq;
   const state = element('span', '', 'turn-state');
   const header = element('header', undefined, 'turn-header');
   header.append(heading, state);
@@ -92,7 +102,11 @@ function turnFor(run) {
   const loadingLabel = element('span');
   loading.append(dots, loadingLabel);
   section.append(header, request, activity, reply, loading);
-  $('log').append(section);
+  const later = [...$('log').children].find(node => snapshot?.first_seq
+    ? Number(node.dataset.firstSeq) > snapshot.first_seq
+    : Number(node.dataset.turnNumber) > number);
+  if (later) later.before(section);
+  else $('log').append(section);
   const turn = { section, request, activity, steps, reply, state, loading, loadingLabel, modelRequest: null };
   turns.set(run, turn);
   return turn;
@@ -547,6 +561,11 @@ function eventCard(event, container) {
   const entry = bubble('event', label, kind, run, undefined, container);
   entry.article.classList.add('entry-event-' + eventCategory(kind));
   if (run) entry.article.dataset.run = run;
+  else if (event.seq) {
+    entry.article.dataset.firstSeq = event.seq;
+    const later = [...$('log').children].find(node => Number(node.dataset.firstSeq) > event.seq);
+    if (later) later.before(entry.article);
+  }
 
   setStepStatus(entry.sub, payload.step_outcome || payload.status || EVENT_STATUSES[kind]);
   const fields = kind.startsWith('task.') && !payload.reason ? [] : prominentFields(kind, payload);
@@ -576,7 +595,7 @@ function eventCard(event, container) {
     reviews.get(payload.id)?.remove();
     reviews.delete(payload.id);
     if (kind === 'review.requested') {
-      const actions = element('div', undefined, 'event-actions');
+      const actions = element('div', undefined, 'event-actions review-actions');
       const sid = sessionId;
       actions.append(element('p', payload.question), element('p', payload.preview));
       const inspect = element('button','查看完整交付');
@@ -645,11 +664,17 @@ function updateComposer() {
   $('cancel').hidden = !activeRun();
 }
 
-function renderEvent(event) {
+function renderEvent(event, replay = false) {
   const timeline = $('timeline');
-  const follow = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 80;
+  const follow = !replay && timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 80;
   const { kind, run, payload } = event;
+  if (!run) {
+    if (sessionEventSeqs.has(event.seq)) return;
+    sessionEventSeqs.add(event.seq);
+  }
   if (kind === 'message.accepted') {
+    const turn = turnFor(run);
+    if (!turn.section.dataset.firstSeq) turn.section.dataset.firstSeq = event.seq;
     userBubble(run, payload.text);
     if (!runs.has(run)) runs.set(run, 'queued');
     const session = sessions.find(item => item.id === sessionId);
@@ -704,6 +729,7 @@ function renderEvent(event) {
   if (run && (turns.has(run) || kind === 'model.started')) {
     updateTurnLoading(turnFor(run), kind, payload);
   }
+  if (replay) return;
   if (kind === 'run.failed') $('status').textContent = payload.error || '运行失败';
   else if (kind === 'approval.requested') $('status').textContent = '等待审批';
   else if (kind === 'work.plan.waiting') $('status').textContent = payload.reason;
@@ -713,6 +739,155 @@ function renderEvent(event) {
   else if (TERMINAL.has(kind) && !activeRun()) $('status').textContent = '';
   updateComposer();
   if (follow) timeline.scrollTop = timeline.scrollHeight;
+  updateLatestButton();
+}
+
+const SNAPSHOT_STATES = {
+  queued: ['已排队', 'queued'], running: ['处理中', 'running'], waiting: ['等待审批', 'waiting'],
+  work_waiting: ['等待继续', 'waiting'], awaiting_review: ['等待验收'],
+  analysis_waiting: ['等待继续', 'waiting'], completed: ['已完成'],
+  failed: ['失败'], cancelled: ['已取消'], interrupted: ['已中断'],
+};
+
+function fillSnapshot(snapshot, cursor) {
+  if (turns.has(snapshot.id)) return;
+  const turn = turnFor(snapshot.id, snapshot);
+  userBubble(snapshot.id, snapshot.input);
+  for (const event of snapshot.events) renderEvent(event, true);
+  if (snapshot.reply && !turn.reply.childElementCount) assistantBubble(snapshot.id, snapshot.reply);
+  const [label, active] = SNAPSHOT_STATES[snapshot.status] || [snapshot.status];
+  turn.state.textContent = label;
+  if (active) runs.set(snapshot.id, active);
+  else runs.delete(snapshot.id);
+  turn.history = { cursor, snapshot };
+  const progress = element('div', undefined, 'history-process');
+  progress.setAttribute('role', 'status');
+  turn.activity.prepend(progress);
+  turn.activity.hidden = false;
+  return { run: snapshot.id, turn, progress };
+}
+
+function fillTimelinePage(page) {
+  const inserted = page.turns.map(snapshot => fillSnapshot(snapshot, page.cursor)).filter(Boolean);
+  for (const event of page.events) renderEvent(event, true);
+  return inserted;
+}
+
+function hydrateTimelinePage(inserted, followLatest = false) {
+  return Promise.all(inserted.map(item => loadProcess(item, followLatest)));
+}
+
+function clearTurnReplay(run, events) {
+  closeApproval(run);
+  streams.delete(run);
+  workProgress.delete(run);
+  for (const state of [toolCards, approvalRows, approvalBatches]) {
+    for (const key of state.keys()) if (JSON.parse(key)[0] === run) state.delete(key);
+  }
+  for (const event of events) {
+    if (event.kind.startsWith('review.')) reviews.delete(event.payload.id);
+  }
+}
+
+async function loadProcess(item, followLatest) {
+  const { run, turn, progress } = item;
+  const id = sessionId;
+  const signal = controller.signal;
+  const { cursor, snapshot } = turn.history;
+  const through = Math.max(cursor, liveCursor);
+  const live = [];
+  turn.history.loading = { through, live };
+  progress.textContent = '正在加载处理过程…';
+  try {
+    const events = [];
+    let after = 0;
+    do {
+      const path = `sessions/${id}/timeline/${run}/events?through=${through}&after=${after}&limit=500`;
+      const page = await api(path, undefined, signal);
+      if (signal.aborted) return;
+      events.push(...page.events);
+      after = page.after;
+    } while (after !== null);
+
+    const timeline = $('timeline');
+    const savedScroll = timeline.scrollTop;
+    const next = turn.section;
+    const keepBottom = followLatest && timeline.scrollHeight - savedScroll - timeline.clientHeight < 80;
+    const bounds = next.getBoundingClientRect();
+    const aboveViewport = bounds.bottom <= timeline.getBoundingClientRect().top;
+    const active = runs.get(run);
+    const label = turn.state.textContent;
+    clearTurnReplay(run, [...events, ...live]);
+    turns.delete(run);
+    const rebuilt = turnFor(run, snapshot);
+    next.replaceWith(rebuilt.section);
+    if (!events.some(event => event.kind === 'message.accepted')) userBubble(run, snapshot.input);
+    for (const event of events) renderEvent(event, true);
+    if (!rebuilt.reply.childElementCount && snapshot.reply) assistantBubble(run, snapshot.reply);
+    for (const event of live) renderEvent(event, true);
+    rebuilt.state.textContent = label;
+    if (active) runs.set(run, active);
+    else runs.delete(run);
+    const addedHeight = aboveViewport ? rebuilt.section.getBoundingClientRect().height - bounds.height : 0;
+    timeline.scrollTop = keepBottom ? timeline.scrollHeight : savedScroll + addedHeight;
+    lastTimelineTop = timeline.scrollTop;
+    updateComposer();
+    updateLatestButton();
+  } catch (error) {
+    if (signal.aborted) return;
+    progress.textContent = '';
+    const retry = element('button', '处理过程加载失败，重试');
+    retry.type = 'button';
+    retry.title = error.message;
+    retry.onclick = () => { void loadProcess(item, followLatest); };
+    progress.append(retry);
+  } finally {
+    turn.history.loading = null;
+  }
+}
+
+function updateLatestButton() {
+  const timeline = $('timeline');
+  $('backToLatest').hidden = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 80;
+  $('pendingTurn').hidden = !pendingAction();
+}
+
+function pendingAction() {
+  return $('log').querySelector('.approval-buttons, .review-actions, button[data-work-plan]:not(:disabled)');
+}
+
+async function loadOlder() {
+  if (olderBefore === null || fetchingOlder || !controller) return;
+  const id = sessionId;
+  const signal = controller.signal;
+  const button = $('loadOlder');
+  fetchingOlder = true;
+  button.disabled = true;
+  button.textContent = '正在加载…';
+  try {
+    const page = await api(`sessions/${id}/timeline?before=${olderBefore}&limit=3`, undefined, signal);
+    if (signal.aborted) return;
+    const timeline = $('timeline');
+    const top = timeline.getBoundingClientRect().top;
+    const anchor = [...$('log').children].find(node => node.getBoundingClientRect().bottom > top);
+    const previous = anchor?.getBoundingClientRect().top;
+    const inserted = fillTimelinePage(page);
+    olderBefore = page.next_before;
+    button.hidden = olderBefore === null;
+    if (anchor) timeline.scrollTop += anchor.getBoundingClientRect().top - previous;
+    lastTimelineTop = timeline.scrollTop;
+    updateComposer();
+    updateLatestButton();
+    await hydrateTimelinePage(inserted);
+  } catch (error) {
+    if (!signal.aborted) throw error;
+  } finally {
+    if (!signal.aborted) {
+      fetchingOlder = false;
+      button.disabled = false;
+      button.textContent = '加载更早的回合';
+    }
+  }
 }
 
 async function selectSession(id) {
@@ -730,6 +905,16 @@ async function selectSession(id) {
   reviews.clear();
   toolCards.clear();
   workProgress.clear();
+  sessionEventSeqs.clear();
+  olderBefore = null;
+  fetchingOlder = false;
+  nextTurnNumber = 1;
+  liveCursor = 0;
+  $('loadOlder').hidden = true;
+  $('loadOlder').disabled = false;
+  $('loadOlder').textContent = '加载更早的回合';
+  $('backToLatest').hidden = true;
+  $('pendingTurn').hidden = true;
   $('log').replaceChildren();
   $('empty').hidden = false;
   $('status').textContent = '';
@@ -737,12 +922,52 @@ async function selectSession(id) {
   $('workspace').textContent = '选择工作空间';
   renderSessions();
   updateComposer();
-  controller = new AbortController();
-  void watch(id, controller.signal, renderEvent, () => {
-    $('status').textContent = '正在重新连接';
-  });
-  await showWorkspace(id, () => sessionId);
+  const { signal } = controller = new AbortController();
+  try {
+    void showWorkspace(id, () => signal.aborted ? undefined : sessionId)
+      .catch(error => { if (!signal.aborted) report(error); });
+    const page = await api(`sessions/${id}/timeline`, undefined, signal);
+    if (signal.aborted) return;
+    const inserted = fillTimelinePage(page);
+    olderBefore = page.next_before;
+    $('loadOlder').hidden = olderBefore === null;
+    updateComposer();
+    $('timeline').scrollTop = $('timeline').scrollHeight;
+    lastTimelineTop = $('timeline').scrollTop;
+    updateLatestButton();
+    liveCursor = page.cursor;
+    void watch(id, signal, event => {
+      liveCursor = event.seq;
+      const history = turns.get(event.run)?.history;
+      if (history?.loading && event.seq > history.loading.through) history.loading.live.push(event);
+      if (!history || event.seq > history.cursor) renderEvent(event);
+    }, () => {
+      $('status').textContent = '正在重新连接';
+    }, page.cursor);
+    void hydrateTimelinePage(inserted, true);
+  } catch (error) {
+    if (!signal.aborted) {
+      sessionId = undefined;
+      renderSessions();
+      updateComposer();
+      throw error;
+    }
+  }
 }
+
+$('loadOlder').onclick = handle(loadOlder);
+$('backToLatest').onclick = () => { $('timeline').scrollTop = $('timeline').scrollHeight; };
+$('pendingTurn').onclick = () => pendingAction()?.scrollIntoView({ block: 'center' });
+$('timeline').addEventListener('scroll', handle(async () => {
+  const top = $('timeline').scrollTop;
+  const goingUp = top < lastTimelineTop;
+  lastTimelineTop = top;
+  updateLatestButton();
+  if (goingUp && top < 64) await loadOlder();
+}), { passive: true });
+$('timeline').addEventListener('wheel', handle(async event => {
+  if (event.deltaY < 0 && $('timeline').scrollTop < 8) await loadOlder();
+}), { passive: true });
 
 $('new').onclick = handle(async () => {
   $('new').disabled = true;

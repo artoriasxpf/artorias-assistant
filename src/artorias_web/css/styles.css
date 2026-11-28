@@ -111,11 +111,26 @@ h1 { margin: 0; font-size: 1.02rem; font-weight: 650; overflow: hidden; white-sp
 #timeline {
   min-height: 0;
   overflow: hidden auto;
+  overflow-anchor: none;
   overscroll-behavior: contain;
   padding-block: 24px 16px;
 }
 #log { display: grid; gap: 22px; }
 #empty { color: var(--muted); text-align: center; margin: 12vh 0 0; }
+.timeline-navigation {
+  display: block;
+  margin: 0 auto 8px;
+  padding: 3px 10px;
+  color: var(--muted);
+  font-size: .8rem;
+}
+.timeline-shortcuts { display: flex; justify-content: center; gap: 8px; }
+.timeline-shortcuts .timeline-navigation { margin-inline: 0; }
+.history-process {
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: .78rem;
+}
 
 .turn { display: grid; gap: 14px; min-width: 0; }
 .turn-header {
