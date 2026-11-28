@@ -4,9 +4,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Artorias Assistant</title>
-    <link rel="stylesheet" href="/static/css/styles.css">
+    <link rel="stylesheet" href="/static/css/styles.css?v=auto-turn-process">
     <script type="module" src="/static/js/reload.js"></script>
-    <script type="module" src="/static/js/app.js"></script>
+    <script type="module" src="/static/js/app.js?v=auto-turn-process"></script>
   </head>
   <body>
     <aside class="sidebar" aria-label="会话">
@@ -25,11 +25,16 @@
         </div>
       </header>
       <div id="timeline" tabindex="0" aria-label="消息与事件">
+        <button id="loadOlder" class="timeline-navigation" type="button" hidden>加载更早的回合</button>
         <section id="log" class="content-column" role="log" aria-label="会话记录"></section>
         <p id="empty">发送一条消息开始会话。</p>
       </div>
       <div class="composer-area">
         <div class="content-column">
+          <div class="timeline-shortcuts">
+            <button id="pendingTurn" class="timeline-navigation" type="button" hidden>待处理事项</button>
+            <button id="backToLatest" class="timeline-navigation" type="button" hidden>回到最新 ↓</button>
+          </div>
           <form id="composer">
             <textarea id="input" aria-label="消息" rows="3" placeholder="给 Artorias 发消息"></textarea>
             <div class="composer-actions">

@@ -12,10 +12,10 @@ export function headers() {
   return { 'x-artorias-token': token, 'Content-Type': 'application/json' };
 }
 
-export async function api(path, body) {
+export async function api(path, body, signal) {
   const response = await fetch('/api/' + path, {
     method: body === undefined ? 'GET' : 'POST',
-    headers: headers(),
+    headers: headers(), signal,
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!response.ok) {
