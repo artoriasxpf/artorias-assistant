@@ -253,6 +253,9 @@ function taskField(p) { return p.task_id ? [['Task ID', p.task_id]] : []; }
 function execFields(p) {
   const fields = [];
   if (p.execution_id) fields.push(['Execution ID', p.execution_id]);
+  if (p.working_directory) fields.push(['执行目录', p.working_directory]);
+  if (p.mode) fields.push(['执行模式', p.mode]);
+  if (p.effects === 'workspace_may_have_changed') fields.push(['文件变更', '原目录可能已有修改']);
   if (p.execution_status) fields.push(['执行状态', p.execution_status]);
   if (p.publish_status) fields.push(['发布状态', p.publish_status]);
   if (p.exit_code !== undefined && p.exit_code !== null) fields.push(['退出码', p.exit_code]);
@@ -439,6 +442,11 @@ function eventCard(event) {
     const controls = new Map();
     for (const request of requests) {
       const label = element('label', request.path || request.kind || '审批');
+      if (request.tool && request.kind === 'code_execution') {
+        actions.append(element('p', [request.tool, request.execution_location, request.working_directory,
+          request.mode, request.notice].filter(Boolean).join(' · ')));
+        actions.append(element('pre', request.argv ? JSON.stringify(request.argv) : request.code || request.path));
+      }
       const select = element('select');
       const defaultLabel = request.approve_scope === 'run' ? '本轮允许' : '允许此次';
       select.add(new Option('拒绝', 'reject'));

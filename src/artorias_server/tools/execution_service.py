@@ -58,9 +58,11 @@ def scan(root):
 
 
 class ExecutionService:
-    def __init__(self, data, store, backend: PythonExecutionBackend | None = None, *, cloud_backend: PythonExecutionBackend | None = None, docker_backend: PythonExecutionBackend | None = None):
+    def __init__(self, data, store, backend: PythonExecutionBackend | None = None, *, cloud_backend: PythonExecutionBackend | None = None, docker_backend: PythonExecutionBackend | None = None, runners=None):
         self.root=Path(data).resolve()/'executions';self.root.mkdir(parents=True,exist_ok=True)
         self.repo=ExecutionRepository(store);self.backend=backend
+        from .workspace_execution import configured_runners
+        self.runners = configured_runners() if runners is None else dict(runners)
         self.backends=ExecutorRegistry()
         self.docker_backend = docker_backend
         if backend is not None:
@@ -95,6 +97,16 @@ class ExecutionService:
         rows=self.repo.store.query("SELECT id,status FROM python_executions WHERE status IN ('running','collected')")
         for item in rows:
             row=self.repo.get(item['id']);plan=row['plan']
+            if 'runner' in plan:
+                runner = self.runners.get((plan['kind'], plan['location_id']))
+                if runner:
+                    try:
+                        result = await runner.status(plan['id'])
+                        if result['execution_status'] not in ('running','prepared','unknown'):
+                            self.repo.save(plan['id'],'completed',result)
+                    except Exception:
+                        pass  # The runner retains the execution receipt until reconnect.
+                continue
             if item['status']=='running':
                 stopped=False
                 try:
@@ -118,15 +130,22 @@ class ExecutionService:
         req=PythonRequest.model_validate(request).model_dump()
         if not req['dependencies']:
             req.pop('dependencies')  # Keep existing approval request hashes stable.
+        if req['code'] is None:
+            req.pop('code')  # Existing path-based approvals use the original request shape.
         context={'session':ws.session,'run':ws.run,'task':ws.task,'step':getattr(ws,'step',None),'call':call_id}
         eid='exec_'+hashed(context)[:40];rh=hashed(req)
+        inline_code = req.pop('code', None)
         existing=self.repo.get(eid)
         if existing:
             if existing['request_hash']!=rh:raise ValueError('同一工具调用参数发生变化')
             return existing['plan']
+        if req['mode'] in ('workspace_ro','workspace_rw'):
+            raise ValueError('就地执行需要使用 workspace 执行器')
         location=req['execution_hint']
         if location=='auto':
             location={'device_fs':'device','cloud_storage':'cloud'}[ws.describe()['kind']]
+        if location != {'device_fs':'device','cloud_storage':'cloud'}[ws.describe()['kind']]:
+            raise ValueError('执行位置与 workspace 不匹配')
         backend=self._backend(location)
         profile = backend.profile()
         if req.get('dependencies') and profile.get('backend') != 'macos-venv':
@@ -149,8 +168,16 @@ class ExecutionService:
             entries.append({'resource':resource,'version':version,'sha256':hashed(data),'staged':destination})
             if baseline is not None:baseline[destination.removeprefix('seed/')]=version
         try:
-            stage(req['path'],'app/__entry__.py')
-            if not req['path'].endswith('.py'):raise ValueError('入口必须为 Python 脚本')
+            entrypoint = 'app/__entry__.py'
+            if inline_code is None:
+                if not req['path'].endswith('.py'):
+                    raise ValueError('入口必须为 Python 脚本')
+                stage(req['path'], entrypoint)
+            else:
+                script_bytes = inline_code.encode()
+                (root / entrypoint).write_bytes(script_bytes)
+                destinations.add(entrypoint)
+                total += len(script_bytes)
             if req['code_directory']:
                 for name in ws.files_under(req['code_directory']):
                     if not excluded(name):stage(join(req['code_directory'],name),'app/'+safe_relative(name))
@@ -177,6 +204,8 @@ class ExecutionService:
                   'baseline':baseline,'target':target,'targets':targets,'profile':profile,
                   'execution_location':location,
                   'network':'none','input_bytes':total}
+            if inline_code is not None:
+                plan['inline_script'] = {'sha256': hashed(script_bytes), 'staged': entrypoint}
             plan['plan_hash']=hashed(plan)
             self.repo.install(plan)
             return plan
@@ -189,6 +218,9 @@ class ExecutionService:
         target = plan['target'] if request['output']['target'] else 'managed_execution_artifacts'
         code = [(entry['resource'], entry['staged'], entry['sha256']) for entry in plan['inputs']
                 if entry['staged'].startswith('app/')]
+        if 'inline_script' in plan:
+            inline = plan['inline_script']
+            code.insert(0, ('inline', inline['staged'], inline['sha256']))
         # Exact input mappings keep a directory permission from implicitly authorizing new inputs.
         inputs = [(entry['resource'], entry['staged']) for entry in plan['inputs']]
         return dict(
@@ -201,9 +233,11 @@ class ExecutionService:
 
     def approval(self,plan):
         req=plan['request']
-        return {'kind':'code_execution','execution_id':plan['id'],'path':req['path'],'plan_hash':plan['plan_hash'],
+        inline = plan.get('inline_script')
+        return {'kind':'code_execution','execution_id':plan['id'],
+                'path':'内联 Python 代码' if inline else req['path'],'plan_hash':plan['plan_hash'],
                 'mode':req['mode'],'inputs':[x['resource'] for x in plan['inputs']],
-                'script_sha256':plan['inputs'][0]['sha256'],'execution_location':self._plan_location(plan),
+                'script_sha256':(inline or plan['inputs'][0])['sha256'],'execution_location':self._plan_location(plan),
                 'environment':plan['profile'],'dependencies':req.get('dependencies', []),'dependency_network':'PyPI' if req.get('dependencies') else 'none','network':'none','timeout_seconds':req['timeout_seconds'],
                 'output':dict(req['output'],target=plan['target']),'working_directory':req['working_directory'],
                 'allow_delete':req['allow_delete'],'notice':'仅提交已批准范围内的产物；覆盖需匹配执行前版本。'}
@@ -222,6 +256,9 @@ class ExecutionService:
             return {'execution_id':eid,'execution_status':'unknown','publish_status':'not_requested','error':'执行状态不确定，禁止自动重跑；请检查设备容器与日志'}
         # Bind approval to the staged bytes and current resource permissions/versions.
         try:
+            inline = plan.get('inline_script')
+            if inline and hashed((root / inline['staged']).read_bytes()) != inline['sha256']:
+                raise ValueError('审批后的内联代码发生变化，请重新发起调用')
             for entry in plan['inputs']:
                 data,version=ws.read_binary_version(entry['resource'])
                 if version!=entry['version'] or hashed(data)!=entry['sha256'] or hashed((root/entry['staged']).read_bytes())!=entry['sha256']:

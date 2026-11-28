@@ -139,3 +139,50 @@ def test_planner_stops_after_two_invalid_outputs(tmp_path, monkeypatch):
     error=json.loads(event['payload'])['error']
     assert 'items[0].task_patch.expected_revision' in error
     assert 'items[0].task_patch.unexpected' in error
+
+
+def test_deepseek_planner_requests_json_and_retries_blank_content(tmp_path, monkeypatch):
+    from langchain_core.messages import AIMessage
+    from artorias_server.model_provider.deepseek import DeepSeekChatModel
+    from artorias_server.tasks import planner as module
+
+    db, run = setup(tmp_path)
+    model = DeepSeekChatModel(model='deepseek-flash', api_key='test-key',
+                              base_url='https://api.deepseek.com')
+    replies = iter([
+        AIMessage(content='   ', response_metadata={'finish_reason': 'stop'}),
+        AIMessage(content='{"kind":"clarify","question":"要处理哪个目录？"}'),
+    ])
+    calls = []
+
+    async def invoke(self, messages, config=None, **kwargs):
+        calls.append((messages, kwargs))
+        return next(replies)
+
+    monkeypatch.setattr(DeepSeekChatModel, 'ainvoke', invoke)
+    monkeypatch.setattr(module, 'create_model', lambda: model)
+    assert asyncio.run(module.TaskPlanner(db).plan(run, [])).kind == 'clarify'
+    assert [kwargs['response_format'] for _, kwargs in calls] == [{'type': 'json_object'}] * 2
+    assert '模型返回的正文为空' in calls[1][0][0]['content']
+
+
+def test_planner_accepts_single_fenced_json_and_reports_truncation(tmp_path, monkeypatch):
+    from langchain_core.messages import AIMessage
+    from artorias_server.tasks import planner as module
+
+    db, run = setup(tmp_path)
+    calls = []
+    replies = iter([
+        AIMessage(content='{"kind":"tasks",', response_metadata={'finish_reason': 'length'}),
+        AIMessage(content='规划如下\n```json\n{"kind":"chat"}\n```\n'),
+    ])
+
+    class Model:
+        async def ainvoke(self, messages):
+            calls.append(messages)
+            return next(replies)
+
+    monkeypatch.setattr(module, 'create_model', Model)
+    assert asyncio.run(module.TaskPlanner(db).plan(run, [])).kind == 'chat'
+    assert '模型输出达到长度上限' in calls[1][0]['content']
+    assert len(calls) == 2

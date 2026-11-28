@@ -213,6 +213,8 @@ class WorkspaceToolExecutor:
     async def run_python(self, call_id, request: PythonRequest, approve, emit):
         service = self.execution_service
         if service is None:
+            if request.code is not None:
+                raise ValueError('此执行器不支持 code，请使用 path')
             if (request.args or request.inputs or request.output != OutputPolicy()
                     or request.mode != 'isolated' or request.working_directory or request.code_directory
                     or request.dependencies or request.allow_delete or request.execution_hint != 'auto'):

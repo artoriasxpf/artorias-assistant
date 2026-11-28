@@ -3,7 +3,7 @@ READ_TOOLS = frozenset({'project_tree', 'project_list', 'project_read', 'project
                         'project_search', 'project_read_many'})
 WRITE_TOOLS = frozenset({'project_write', 'project_edit', 'project_delete', 'project_move',
                          'project_mkdir', 'project_change_apply'})
-EXECUTION_TOOLS = frozenset({'run_python'})
+EXECUTION_TOOLS = frozenset({'run_python', 'run_command'})
 
 
 def step_tools(tools, groups, analysis):

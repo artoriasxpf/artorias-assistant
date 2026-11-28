@@ -11,4 +11,5 @@ class ManagedCloudConnector:
         if logical.is_absolute() or '..' in logical.parts:
             raise ValueError('非法云端逻辑路径')
         routed = dict(workspace, root=str(Path(workspace['location_root'])/logical))
+        routed['execution_root'] = str(Path(workspace['location_root'])/workspace.get('execution_root',logical))
         return self.filesystem.open(routed, context)

@@ -8,7 +8,7 @@ from langgraph.types import interrupt
 from artorias_server.permissions import tool_call
 from pydantic import BaseModel, ConfigDict, Field
 
-from artorias_shared.execution.models import InputResource, OutputPolicy, PythonRequest
+from artorias_shared.execution.models import CommandRequest, InputResource, OutputPolicy, PythonRequest
 from .executor import WorkspaceToolExecutor
 from .change_plans import ChangePlans, PlanArguments
 from .project_analysis import (
@@ -18,6 +18,13 @@ from .files import json_bytes
 
 
 class RunPythonArguments(PythonRequest):
+    tool_call_id: Annotated[str, InjectedToolCallId]
+    output: OutputPolicy | None = Field(
+        default=None, description='Artifact publication policy for isolated or workspace_copy only.',
+    )
+
+
+class CommandArguments(CommandRequest):
     tool_call_id: Annotated[str, InjectedToolCallId]
 
 
@@ -198,15 +205,17 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
 
     @tool(args_schema=RunPythonArguments)
     async def run_python(
-        path: str, tool_call_id: Annotated[str, InjectedToolCallId],
-        args: list[str] | None = None, mode: str = 'isolated',
+        tool_call_id: Annotated[str, InjectedToolCallId], path: str | None = None,
+        code: str | None = None, args: list[str] | None = None, mode: str = 'isolated',
         inputs: list[InputResource] | None = None, output: OutputPolicy | None = None,
         working_directory: str | None = None, code_directory: str | None = None,
         allow_delete: bool = False, execution_hint: str = 'auto',
         environment: str = 'python-default', timeout_seconds: int = 120,
         dependencies: list[str] | None = None,
     ) -> dict:
-        """Run an authorized Python script after approval. Auto uses the linked
+        """Run Python from exactly one of path (workspace script) or code (inline source).
+        workspace_ro reads the live workspace; workspace_rw writes it immediately. Use relative paths.
+        Execution requires approval. Auto uses the linked
         workspace's execution environment. Inputs are staged under /inputs,
         code under /app, and outputs under /outputs. workspace_copy requires
         working_directory. Prefer ARTORIAS_INPUT_DIR, ARTORIAS_OUTPUT_DIR and
@@ -214,17 +223,57 @@ def build_tools(ws, emit, *, sandbox=None, execution_service=None):
         declared as package names or package==version. Existing output overwrites require if_unchanged
         and expected_files. Returns execution and publication statuses.
         """
+        in_place = mode in ('workspace_ro', 'workspace_rw')
+        publication = {}
+        if output is not None:
+            if in_place:
+                raise ValueError('就地执行不接受 output 发布策略，请省略 output')
+            publication['output'] = output
         request = PythonRequest(
-            path=path, args=args or [], mode=mode, inputs=inputs or [],
-            output=output or OutputPolicy(), working_directory=working_directory,
+            path=path, code=code, args=args or [], mode=mode, inputs=inputs or [],
+            working_directory=working_directory,
             code_directory=code_directory, allow_delete=allow_delete, execution_hint=execution_hint,
             environment=environment, timeout_seconds=timeout_seconds, dependencies=dependencies or [],
+            **publication,
         )
+        if in_place:
+            return await run_bound(tool_call_id,request,'run_python')
+        from .workspace_execution import RunnerClient, runner_for
+        if execution_service and getattr(execution_service,'runners',{}) and isinstance(runner_for(execution_service,ws),RunnerClient):
+            return await run_bound(tool_call_id, request, 'run_python')
         return await executor.run_python(tool_call_id, request, interrupt, emit)
+
+    async def run_bound(call_id, request, name):
+        from .workspace_execution import workspace_execution
+        if execution_service is None:
+            raise ValueError('未配置 workspace 执行器')
+        return await workspace_execution(execution_service,ws,call_id,request,interrupt,emit,name)
+
+    @tool(args_schema=CommandArguments)
+    async def run_command(tool_call_id: Annotated[str, InjectedToolCallId], argv: list[str],
+                          mode: str = 'workspace_ro', working_directory: str | None = None,
+                          inputs: list[InputResource] | None = None, timeout_seconds: int = 120):
+        """Run argv in the bound workspace sandbox after approval. Supports installed rg, git status
+        and ruff format. Use workspace_ro to inspect, workspace_rw for immediate changes, or
+        isolated with declared inputs at /inputs/name. No shell syntax or interactive stdin."""
+        request = CommandRequest(argv=argv,mode=mode,working_directory=working_directory,
+                                 inputs=inputs or [],timeout_seconds=timeout_seconds)
+        return await run_bound(tool_call_id, request, 'run_command')
 
     tools = [project_tree, project_list, project_read, project_write, project_edit,
              project_delete, project_move, project_mkdir, project_change_plan,
              project_change_apply, project_authorize, run_python]
+    from .workspace_execution import runner_for
+    if execution_service is not None and getattr(execution_service,'runners',{}):
+        bound = runner_for(execution_service,ws)
+        if bound:
+            if hasattr(bound,'capabilities'):
+                available = bound.capabilities()['commands']
+                run_command.description += ' Installed commands: ' + ', '.join(available)
+                if available:
+                    tools.append(run_command)
+            else:
+                tools.append(run_command)
     if os.getenv('ARTORIAS_PROJECT_ANALYSIS', '1') == '1':
         tools[:0] = [project_inventory, project_search, project_read_many]
     return tools

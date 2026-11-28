@@ -1,4 +1,5 @@
 """Client-side file moves, including journal recovery across volumes."""
+from contextlib import nullcontext
 import ctypes
 import errno
 import hashlib
@@ -87,7 +88,8 @@ def move_file(workspace, source, other, destination, *, expected_version=None, r
     if (workspace.blobs != other.blobs or workspace.journal is not other.journal
             or (workspace.session, workspace.run) != (other.session, other.run)):
         raise ValueError('移动的两端必须由同一客户端和运行处理')
-    with workspace._locked():
+    other_gate = other.execution_access() if other.execution_gate != workspace.execution_gate else nullcontext()
+    with workspace._locked(), other_gate:
         source_path = workspace.root / workspace.path(source)
         destination_path = other.root / other.path(destination)
         if source_path == destination_path:

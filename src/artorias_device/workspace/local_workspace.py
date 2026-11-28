@@ -25,11 +25,12 @@ class LocalWorkspace:
     """The disk is authoritative. The first argument remains the backup directory."""
 
     def __init__(self, root, journal: WorkspaceJournal, session, run, workspace_root=None, *,
-                 bind_session=True, create_root=True, resource_meta=None):
+                 bind_session=True, create_root=True, resource_meta=None, execution_gate=None):
         self.blobs = Path(root).expanduser().resolve()
         self.blobs.mkdir(parents=True, exist_ok=True)
         self.journal, self.session, self.run = journal, session, run
         self.resource_meta = resource_meta
+        self.execution_gate = execution_gate
         bound = journal.binding(session) if bind_session else None
         requested = workspace_root or os.getenv('ARTORIAS_WORKSPACE')
         candidate = Path(requested).expanduser().resolve() if requested else self.blobs.parent/'workspaces'/session
@@ -45,14 +46,31 @@ class LocalWorkspace:
                 raise ValueError('会话已绑定其他工作目录')
         if create_root:
             self.root.mkdir(parents=True, exist_ok=True)
-        with self._locked():
+        with self._locked(shared=True):
             self._recover()
 
     @contextmanager
-    def _locked(self):
+    def execution_access(self, *, shared=False):
+        if self.execution_gate is None:
+            yield
+            return
+        import fcntl
+        self.execution_gate.parent.mkdir(parents=True,exist_ok=True)
+        with self.execution_gate.open('a') as gate:
+            try:
+                # File tools run synchronously in the agent event loop. Blocking here
+                # would prevent a running sandbox from releasing the same lease.
+                mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+                fcntl.flock(gate,mode | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ValueError('工作空间正在执行脚本或命令，请在执行结束后重试') from exc
+            yield
+
+    @contextmanager
+    def _locked(self, *, shared=False):
         # Local macOS/Linux processes sharing this data directory serialize mutations.
         import fcntl
-        with _LOCK, (self.blobs/'.workspace.lock').open('a+b') as lock:
+        with self.execution_access(shared=shared), _LOCK, (self.blobs/'.workspace.lock').open('a+b') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             try:
                 yield

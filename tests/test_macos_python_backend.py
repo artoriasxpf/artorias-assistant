@@ -14,6 +14,7 @@ def test_seatbelt_profile_keeps_runtime_offline_and_environment_read_only(tmp_pa
     rules = policy.splitlines()
     assert '(deny default)' in rules
     assert f'(allow file-read* (subpath "{runtime.resolve()}"))' in rules
+    assert '(allow file-read-data (literal "/"))' in rules
     assert [rule for rule in rules if 'file-write*' in rule] == [
         f'(allow file-write* (subpath "{outputs.resolve()}"))',
     ]
@@ -48,6 +49,18 @@ def test_native_backend_stages_output_without_direct_write(tmp_path):
     assert result['execution_status'] == 'succeeded', result
     assert external.read_text() == 'original'
     assert (root / 'outputs' / 'result.txt').read_text() == 'candidate'
+
+
+@pytest.mark.skipif(sys.platform != 'darwin' or not shutil.which('uv'), reason='requires macOS Seatbelt and uv')
+def test_native_backend_executes_inline_code(tmp_path):
+    from test_python_execution import execute, setup
+
+    backend = MacOSVenvPythonBackend(tmp_path / 'envs')
+    workspace, service, _ = setup(tmp_path, backend)
+    plan = service.prepare(workspace, 'inline', {'code': 'print("INLINE_OK", sum(range(1, 11)))'})
+    result = execute(service, workspace, plan)
+    assert result['execution_status'] == 'succeeded', result
+    assert result['stdout_tail'].strip() == 'INLINE_OK 55'
 
 
 @pytest.mark.parametrize(
