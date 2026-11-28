@@ -23,6 +23,7 @@
   --orange: #f0a05a;
   --content: 820px;
   --gutter: 24px;
+  --message-inset: 14px;
   font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif;
   color: var(--text);
   background: var(--bg);
@@ -135,7 +136,7 @@ h1 { margin: 0; font-size: 1.02rem; font-weight: 650; overflow: hidden; white-sp
 .turn-request { display: flex; flex-direction: column; align-items: flex-end; }
 .turn-request:empty, .turn-reply:empty { display: none; }
 .turn-stage { margin-bottom: 7px; }
-.turn-steps { display: grid; gap: 8px; }
+.turn-steps { display: grid; gap: 12px; container-type: inline-size; }
 .turn-loading {
   display: inline-flex;
   align-items: center;
@@ -163,14 +164,13 @@ h1 { margin: 0; font-size: 1.02rem; font-weight: 650; overflow: hidden; white-sp
   max-width: 100%;
   min-width: 0;
   border-radius: 12px;
-  padding: 11px 14px;
+  padding: 11px var(--message-inset);
   overflow-wrap: anywhere;
   text-align: left;
 }
 .entry-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
 .entry-label { font-size: .8rem; font-weight: 650; }
 .entry-sub { font-size: .72rem; color: var(--muted); }
-.entry-meta { font-size: .72rem; color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, monospace; margin: 2px 0 8px; }
 .message-text { white-space: pre-wrap; line-height: 1.6; }
 
 /* 用户消息：右对齐、强调色 */
@@ -209,29 +209,111 @@ h1 { margin: 0; font-size: 1.02rem; font-weight: 650; overflow: hidden; white-sp
   .turn-loading-dots i, .entry-assistant-stream .entry-sub::before { animation: none; }
 }
 
-/* 按类型区分事件背景。 */
-.entry-event {
-  width: 100%;
-  background: rgba(22, 26, 34, 0.55);
-  font-size: .92rem;
+/* Connect the model bubbles with one inset rail for each group of steps. */
+.timeline-segment, .timeline-step {
+  --step-columns: minmax(7.25rem, 1.05fr) minmax(4rem, .62fr) minmax(0, 1.8fr) 3.1rem;
+  --step-inset: 22px;
 }
-.entry-event .entry-label { color: var(--text); }
-.entry-event-tool { background: rgba(98, 169, 255, 0.11); }
-.entry-event-tool .entry-label { color: #9ec5ff; }
-.entry-event-approval { background: rgba(245, 184, 75, 0.11); }
-.entry-event-approval .entry-label { color: #ffd58a; }
-.entry-event-task { background: rgba(56, 211, 159, 0.11); }
-.entry-event-task .entry-label { color: #7fe6c4; }
-.entry-event-run { background: rgba(140, 148, 167, 0.11); }
-.entry-event-run .entry-label { color: #b6bdcb; }
-.entry-event-workspace { background: rgba(167, 139, 250, 0.11); }
-.entry-event-workspace .entry-label { color: #cdbdff; }
-.entry-event-execution { background: rgba(79, 195, 232, 0.11); }
-.entry-event-execution .entry-label { color: #97dff4; }
-.entry-event-file { background: rgba(240, 160, 90, 0.11); }
-.entry-event-file .entry-label { color: #ffc894; }
-.entry-event-misc { background: rgba(140, 148, 167, 0.11); }
-.entry-event-misc .entry-label { color: #b6bdcb; }
+.timeline-segment {
+  position: relative;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin-inline-start: calc(var(--message-inset) - 4px);
+  padding-block: 7px;
+}
+.timeline-segment::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 4px;
+  width: 1px;
+  background: var(--muted);
+  opacity: .52;
+  pointer-events: none;
+}
+.entry-assistant-stream + .timeline-segment::before { top: -12px; }
+.timeline-segment:has(+ .entry-assistant-stream)::before { bottom: -12px; }
+.turn:has(.turn-reply:not(:empty)) .timeline-segment:last-child::before { bottom: -14px; }
+
+.timeline-step {
+  position: relative;
+  min-width: 0;
+  padding: 5px 0 5px var(--step-inset);
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  overflow-wrap: anywhere;
+}
+.timeline-step::before {
+  content: "";
+  position: absolute;
+  top: 12px;
+  left: 1px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 0 4px var(--bg);
+}
+.work-progress-events > .timeline-step::before { width: 4px; height: 4px; top: 13px; left: 2px; }
+.timeline-step .entry-head { margin-bottom: 0; }
+.timeline-step > .step-details { margin-top: 0; }
+.step-columns, .timeline-step .step-summary {
+  display: grid;
+  grid-template-columns: var(--step-columns);
+  align-items: baseline;
+  column-gap: clamp(8px, 2cqi, 18px);
+  min-width: 0;
+}
+.step-columns {
+  padding-inline-start: var(--step-inset);
+  color: var(--muted);
+  font-size: .69rem;
+}
+.timeline-step .step-summary {
+  min-height: 22px;
+  color: inherit;
+  cursor: pointer;
+  list-style: none;
+}
+.step-summary::-webkit-details-marker { display: none; }
+.step-summary .entry-label { color: inherit; font-size: .86rem; }
+.step-summary .entry-label, .step-summary .entry-sub, .step-note {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.step-summary .entry-sub { font-size: .78rem; font-weight: 550; }
+.step-note { color: var(--muted); font-size: .78rem; }
+.step-summary [data-tone="success"] { color: var(--green); }
+.step-summary [data-tone="warning"] { color: var(--amber); }
+.step-summary [data-tone="error"] { color: var(--red); }
+.step-link { justify-self: end; color: var(--muted); font-size: .76rem; white-space: nowrap; }
+.step-link::before { content: '›'; display: inline-block; margin-inline-end: 4px; }
+details[open] > .step-summary .step-link::before { transform: rotate(90deg); }
+.step-summary:hover .step-link { color: var(--text); }
+.step-summary:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+.timeline-step > button { margin-top: 6px; }
+.timeline-step.entry-event-tool { color: #9ec5ff; }
+.timeline-step.entry-event-approval { color: #ffd58a; }
+.timeline-step.entry-event-task { color: #7fe6c4; }
+.timeline-step.entry-event-run { color: #b6bdcb; }
+.timeline-step.entry-event-workspace { color: #cdbdff; }
+.timeline-step.entry-event-execution { color: #97dff4; }
+.timeline-step.entry-event-file { color: #ffc894; }
+.timeline-step .event-block, .timeline-step .event-fields, .approval-controls { color: var(--text); }
+.approval-controls { display: grid; justify-items: start; gap: 8px; margin-top: 8px; }
+.approval-controls p { margin: 0; font-size: .8rem; }
+.approval-controls pre { margin: 0; max-height: 16rem; max-width: 100%; overflow: auto; }
+.approval-batch-hint { color: var(--muted); }
+.approval-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+.approval-buttons button { padding: 4px 10px; font-size: .82rem; }
+.approval-buttons .approval-allow, .approval-buttons [aria-pressed="true"] { border-color: var(--accent); }
+.approval-buttons [aria-pressed="true"] { color: var(--accent-strong); }
+.plan-goals { margin: 4px 0 0; padding-inline-start: 1.35rem; }
 
 .event-fields {
   display: grid;
@@ -257,7 +339,17 @@ h1 { margin: 0; font-size: 1.02rem; font-weight: 650; overflow: hidden; white-sp
 .event-json summary { cursor: pointer; color: var(--muted); font-size: .8rem; }
 .event-json summary:hover { color: var(--text); }
 .event-json pre { max-height: min(52dvh, 440px); overflow: auto; }
-.event-error-summary { margin: 8px 0 0; color: #ffb0a6; font-size: .84rem; }
+.tool-details .event-block + .event-block { padding-top: 8px; border-top: 1px solid var(--line); }
+.work-progress-events { display: grid; gap: 8px; margin-top: 10px; }
+@container (max-width: 490px) {
+  .step-columns { display: none; }
+  .timeline-step .step-summary {
+    grid-template-columns: minmax(0, 1fr) minmax(3.25rem, max-content) max-content;
+  }
+  .step-note { grid-column: 1 / -1; grid-row: 2; }
+  .step-note:empty { display: none; }
+  .step-link { grid-column: 3; grid-row: 1; }
+}
 pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -305,7 +397,7 @@ dialog h2 { margin: 0 0 16px; font-size: 1.1rem; }
 #panel > button { margin: 0 6px 6px 0; }
 
 @media (max-width: 680px) {
-  :root { --gutter: 8px; }
+  :root { --gutter: 8px; --message-inset: 10px; }
   body { grid-template-columns: 112px minmax(0, 1fr); }
   .sidebar { padding: 12px 6px; }
   .brand { margin: 0 4px 16px; }
@@ -314,7 +406,7 @@ dialog h2 { margin: 0 0 16px; font-size: 1.1rem; }
   .header-actions { gap: 4px; }
   .header-actions button { padding: 4px 7px; }
   #timeline, .composer-area { padding-block: 8px; }
-  .entry { padding: 8px 10px; }
+  .entry { padding-block: 8px; }
   .entry-user { max-width: 95%; }
   .workspace-bar small { display: none; }
 }
